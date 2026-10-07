@@ -285,7 +285,7 @@ fn with_create_info<R>(
         .into_iter()
         .map(|n| CString::new(n).expect("an extension name has no interior NUL"))
         .collect();
-    let pointers: Vec<*const i8> = names.iter().map(|n| n.as_ptr()).collect();
+    let pointers: Vec<*const std::ffi::c_char> = names.iter().map(|n| n.as_ptr()).collect();
 
     let priorities = [1.0f32];
     let queue_info = [vk::DeviceQueueCreateInfo::default()
