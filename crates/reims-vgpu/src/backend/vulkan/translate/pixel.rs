@@ -767,6 +767,10 @@ mod tests {
                 // decline it and this rail is where that decline appears. The
                 // NVIDIA host it was measured on advertises it.
                 p::MTL_FORMAT_BGR10A2_UNORM,
+                // Its red/blue twin, which Vulkan does mandate as a colour
+                // attachment (`A2B10G10R10_UNORM_PACK32`): the macOS 26 iOS
+                // simulator renders into linear `RGB10A2Unorm` targets.
+                p::MTL_FORMAT_RGB10A2_UNORM,
                 // The first **integer** colour attachment, and the one that
                 // could not be admitted by adding a table entry. A macos-15
                 // guest renders into linear `RG16Uint` targets, and every pass
