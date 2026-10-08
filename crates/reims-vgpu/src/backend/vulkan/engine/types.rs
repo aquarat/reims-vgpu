@@ -661,13 +661,14 @@ pub struct DrawRequest {
     /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
     /// bound a non-trivial `MTLDepthStencilState` (see `runtime::draw`).
     pub depth: Option<DepthState>,
-    /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
-    /// an `air.render_target` INPUT param, translated as a `SubpassData` image
-    /// at [`COLOR_INPUT_BINDING`]). The engine then references attachment 0 as
-    /// a subpass input (GENERAL layout, BY_REGION self-dependency) and writes
-    /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
-    /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
-    pub color_input: bool,
+    /// Colour attachments the fragment shader reads at its own pixel (Metal
+    /// framebuffer fetch: an `air.render_target` INPUT param `dest_N`,
+    /// translated as a `SubpassData` image at [`COLOR_INPUT_BINDING`]` + N`).
+    /// Bit N set ⇒ the engine references attachment N as subpass input N
+    /// (GENERAL layout, BY_REGION self-dependency) and writes an
+    /// INPUT_ATTACHMENT descriptor pointing at that attachment's view. `0`
+    /// (default) keeps the pass byte-identical to the pre-fetch engine.
+    pub color_inputs: u8,
     /// The preceding engine request belongs to this draw's Metal render
     /// encoder. Used only when its Vulkan pass is still open and identical.
     pub continues_render_pass: bool,
@@ -2725,7 +2726,7 @@ mod tests {
         assert!(draw.target_identity.is_none());
         assert!(draw.depth.is_none());
         assert!(!draw.skip_readback);
-        assert!(!draw.color_input);
+        assert_eq!(draw.color_inputs, 0);
 
         let compute = ComputeRequest::default();
         assert_eq!(compute.dispatch, ComputeDispatch::Workgroups([0, 0, 0]));
