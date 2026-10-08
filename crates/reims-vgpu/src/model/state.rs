@@ -4344,6 +4344,19 @@ impl DeviceState {
             .pipeline_retired(pipeline)
     }
 
+    /// Run the work a retirement stranded; see
+    /// [`reims_vgpu_core::session::SessionModel::run_stranded`].
+    pub fn run_stranded(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        stranded: &[reims_vgpu_core::identity::IngressOrdinal],
+    ) -> usize {
+        self.session
+            .lock()
+            .expect("session")
+            .run_stranded(pipeline, stranded)
+    }
+
     /// Step a declared pipeline along its build, from the rail that is
     /// building it.
     ///
