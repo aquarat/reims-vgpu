@@ -6770,6 +6770,14 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         let declared = reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action);
         let load = match declared {
             reims_vgpu_protocol::pass_action::LoadAction::Clear => false,
+            // A memoryless attachment's contents are undefined at the start of
+            // a pass whatever it declares, so its LOAD — the continuation a
+            // later record of one encoder carries — preserves what the resident
+            // holds when it holds anything and is a clear when it does not.
+            // Refusing it would drop a draw over contents nobody can observe.
+            reims_vgpu_protocol::pass_action::LoadAction::Load if c.memoryless => {
+                crate::backend::vulkan::engine::resident_content_ready(&identity)
+            }
             reims_vgpu_protocol::pass_action::LoadAction::Load => true,
             reims_vgpu_protocol::pass_action::LoadAction::DontCare => {
                 crate::backend::vulkan::engine::resident_content_ready(&identity)
