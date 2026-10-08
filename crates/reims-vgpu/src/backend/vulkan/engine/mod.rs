@@ -2553,18 +2553,36 @@ pub fn max_render_target_dimension() -> u32 {
 /// What this Vulkan device can execute, for the GPU-dependent half of the
 /// guest's device-info reply.
 ///
-/// Before a device is resolved the answer is the Vulkan 1.2 floor rather than
-/// the reply table's own values: the served reply is only ever *reduced* by
-/// this, so a boot that answers before the device is up must not be the one
-/// that promises the most.
+/// Brings the device up when nothing has yet. The guest asks for this reply
+/// once per boot, as its driver's first act, and keeps the answer for the life
+/// of the boot. A macOS 26 guest asks about 15 s before its first draw would
+/// have created the device, and answering from the floor then told it one
+/// sample, 128-thread threadgroups, 16 KiB of threadgroup memory and no native
+/// FP16 on a host offering 4, 1024, 32 KiB and FP16. The single-sample answer
+/// is fatal to an iOS simulator: Metal on the macOS side validates every
+/// texture the simulated app creates against this device, a 4x MSAA target
+/// fails `supportsTextureSampleCount:`, SimMetalHost aborts, and its iOS
+/// clients die with `OS_REASON_METAL` code 102.
+///
+/// Only a failed bring-up answers the Vulkan 1.2 floor rather than the reply
+/// table's own values: the served reply is only ever *reduced* by this, so a
+/// host without a device must not be the one that promises the most.
 pub fn device_info_limits() -> crate::model::DeviceInfoLimits {
     use crate::backend::vulkan::caps::device_features::{
         VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES, VULKAN_MIN_COMPUTE_WORKGROUP_SIZE,
     };
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    owner
+        .ensure(counters)
+        .map_err(|error| {
+            crate::observe::Emit::decline("device_info_limits_device", &error).fail_once(1);
+        })
+        .ok()
         .map(|ctx| crate::model::DeviceInfoLimits {
             max_sample_count: ctx.features.max_sample_count,
             d24_stencil8: ctx.features.d24_unorm_s8_attachment,
