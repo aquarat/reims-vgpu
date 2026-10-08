@@ -98,11 +98,114 @@ pub fn heap_texture_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAl
     })
 }
 
+/// Heap placement where no Metal driver exists to ask.
+///
+/// A heap texture is executed as a host residency identity of its own (see
+/// `runtime::compute_exec`): the device never reads or writes its bytes through
+/// the heap's guest pages. For a **private** heap the guest cannot address
+/// those bytes either, so the only thing the answer decides is how much of the
+/// heap the guest reserves for the texture, and any answer that covers the
+/// texture's own extent keeps two placements apart. This answers with the
+/// texture's linear extent — every mip level at a 256-byte row pitch, every
+/// slice, face and sample — rounded up to, and aligned at, one guest page.
+///
+/// Shared and managed heaps expose the bytes to the guest CPU, where Apple's
+/// real layout is the contract; those are still refused, by name.
 #[cfg(not(target_os = "macos"))]
-pub fn heap_texture_size_and_align(_desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
-    // The Linux Vulkan pathway does not yet have a verified equivalence between
-    // VkImage memory requirements and Apple's guest heap placement contract.
-    Err(QueryError::NoMetalDevice)
+pub fn heap_texture_size_and_align(desc: &TextureDescriptor) -> Result<SizeAndAlign, QueryError> {
+    use crate::protocol::storage_mode::{from_resource_options, StorageMode};
+    use crate::protocol::texture_shape::TextureKind;
+    /// Row pitch the extent is computed at; at least what any GPU rounds to.
+    const ROW_ALIGN: u64 = 256;
+    /// One arm64e guest page: the placement granule the extent is rounded to.
+    const PLACEMENT_ALIGN: u64 = 1 << 14;
+    match from_resource_options(u32::from(desc.resource_options)) {
+        Ok(StorageMode::Private) => {}
+        _ => return Err(QueryError::UnsupportedStorageMode),
+    }
+    if desc.protection_options != 0 {
+        return Err(QueryError::UnsupportedProtectionOptions);
+    }
+    let kind = TextureKind::from_ordinal(u32::from(desc.texture_type))
+        .ok_or(QueryError::UnknownTextureType)?;
+    let faces: u64 = match kind {
+        TextureKind::Cube | TextureKind::CubeArray => 6,
+        _ => 1,
+    };
+    let layers = u64::from(desc.array_length.max(1)) * faces;
+    let samples = u64::from(desc.sample_count.max(1));
+    let levels = u32::from(desc.mipmap_level_count.max(1));
+    let mut total: u64 = 0;
+    for level in 0..levels {
+        let w = (desc.width >> level).max(1);
+        let h = (desc.height >> level).max(1);
+        let d = u64::from((desc.depth >> level).max(1));
+        let row = crate::protocol::pixel_format::tight_row_bytes(w, desc.pixel_format)
+            .ok_or(QueryError::UnknownPixelFormat)?;
+        let rows = crate::protocol::pixel_format::tight_row_count(h, desc.pixel_format)
+            .ok_or(QueryError::UnknownPixelFormat)?;
+        let pitch = u64::from(row).div_ceil(ROW_ALIGN) * ROW_ALIGN;
+        total = pitch
+            .checked_mul(u64::from(rows))
+            .and_then(|v| v.checked_mul(d))
+            .and_then(|v| total.checked_add(v))
+            .ok_or(QueryError::ZeroRequirement)?;
+    }
+    let size = total
+        .checked_mul(layers)
+        .and_then(|v| v.checked_mul(samples))
+        .map(|v| v.div_ceil(PLACEMENT_ALIGN) * PLACEMENT_ALIGN)
+        .filter(|&v| v != 0)
+        .ok_or(QueryError::ZeroRequirement)?;
+    Ok(SizeAndAlign {
+        size,
+        align: PLACEMENT_ALIGN,
+    })
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    fn private(fmt: u16, w: u32, h: u32) -> TextureDescriptor {
+        TextureDescriptor {
+            texture_type: 2,
+            framebuffer_only: false,
+            is_drawable: false,
+            allow_gpu_optimized_contents: true,
+            usage: 5,
+            pixel_format: fmt,
+            width: w,
+            height: h,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0x20,
+            protection_options: 0,
+            swizzle: None,
+        }
+    }
+
+    /// The live query from a macOS 26 guest: 278x117 RGBA16Float in a private
+    /// heap. 278 * 8 = 2224 bytes pitched to 2304, times 117 rows, is 269 568
+    /// bytes, which is seventeen 16 KiB pages.
+    #[test]
+    fn a_private_heap_texture_reserves_its_linear_extent_in_whole_pages() {
+        let got = heap_texture_size_and_align(&private(0x73, 278, 117)).unwrap();
+        assert_eq!(got.align, 16384);
+        assert_eq!(got.size, 17 * 16384);
+    }
+
+    #[test]
+    fn a_shared_heap_texture_is_still_refused() {
+        let mut desc = private(0x73, 64, 64);
+        desc.resource_options = 0x00;
+        assert_eq!(
+            heap_texture_size_and_align(&desc),
+            Err(QueryError::UnsupportedStorageMode)
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

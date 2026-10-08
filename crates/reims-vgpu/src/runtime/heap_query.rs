@@ -82,6 +82,9 @@ pub enum QueryError {
     UnknownResourceOptions,
     UnsupportedProtectionOptions,
     NoMetalDevice,
+    /// No Metal driver to ask, and the heap's storage mode exposes the bytes
+    /// to the guest, so the layout the answer implies would be a contract.
+    UnsupportedStorageMode,
     ZeroRequirement,
     /// The request names a task id that resolves to no active task, so there is
     /// nowhere to write the reply. Checked by the caller in `runtime/drain/mod.rs`
@@ -114,6 +117,7 @@ impl crate::observe::Decline for QueryError {
             Self::UnknownResourceOptions => "heap_query_unknown_resource_options",
             Self::UnsupportedProtectionOptions => "heap_query_unsupported_protection_options",
             Self::NoMetalDevice => "heap_query_no_metal_device",
+            Self::UnsupportedStorageMode => "heap_query_unsupported_storage_mode",
             Self::ZeroRequirement => "heap_query_zero_requirement",
             Self::BadTask => "heap_query_bad_task",
         }
