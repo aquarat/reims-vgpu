@@ -517,10 +517,22 @@ pub struct ColorRtRequest {
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
-    /// A memoryless texture (object tag 9): `mapping_id` and `target_gva` are
-    /// both zero, there is no seed and no store, and the attachment's contents
-    /// live for this pass only.
-    pub memoryless: bool,
+    /// An attachment the device holds on the host alone: `mapping_id` and
+    /// `target_gva` are both zero, there is no seed and no guest store. See
+    /// [`HostTarget`].
+    pub host_only: Option<HostTarget>,
+}
+
+/// A colour attachment with no guest storage this device writes, held as a
+/// host resident keyed by the `(task, ref)` the guest named it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostTarget {
+    /// A memoryless texture (object tag 9): its contents live for one pass.
+    Memoryless,
+    /// A texture placed in a heap (opcode `0x15`/wide). Executed as host-only
+    /// storage, as the compute rail already does: its contents persist across
+    /// passes and are what a later sample of the same ref reads.
+    Heap,
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -2127,15 +2139,14 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         row_stride: bpr,
         format: fmt,
         sample_count: _,
-        memoryless,
+        host_only,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
     };
-    if memoryless {
-        // A memoryless attachment has no guest pages to land a chain in, and
-        // the contract gives its contents no life past the pass.
-        return lost("memoryless_target");
+    if host_only.is_some() {
+        // A host-only attachment has no guest pages to land a chain in.
+        return lost("host_only_target");
     }
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() < need {
@@ -2348,10 +2359,10 @@ pub fn color_target_request<M: HostMemory + HostOps>(
 ) -> Option<DrawEncodeRequest> {
     let color_texture_ref = color.texture_ref;
     let rt = lookup_render_target(state, host, task_id, color)?;
-    if rt.memoryless {
-        // The single-target request is colour 0, which is read back and
-        // published; see `mrt_draw_request` for the same refusal.
-        crate::runtime::drain::note_store_route("mrt_memoryless_primary");
+    if rt.host_only.is_some() {
+        // The single-target request is read back and published into guest
+        // pages, which a host-only attachment does not have.
+        crate::runtime::drain::note_store_route("single_target_host_only");
         return None;
     }
     let attachment_sample_count = crate::backend::selected()
@@ -2372,7 +2383,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         clear_color: [0.0; 4],
         target_seed_rgba: None,
         multisample_source_ref: 0,
-        memoryless: false,
+        host_only: None,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -2510,7 +2521,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             row_stride: bpr,
             format: mfmt,
             sample_count: target_sample_count,
-            memoryless,
+            host_only,
         } = target;
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
         note_attachment_sample_count_override(
@@ -2558,32 +2569,25 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             }
             continue;
         }
-        if memoryless {
-            // No guest storage: nothing to seed from, nothing to store to. The
-            // attachment exists for this pass alone, so the only load actions
-            // that mean anything are a clear and "undefined"; Metal refuses a
-            // load from a memoryless texture outright.
+        if let Some(kind) = host_only {
+            // No guest storage: nothing to seed from and nothing to store to.
+            // A memoryless attachment's only meaningful load actions are a
+            // clear and "undefined" (Metal refuses a load from one); a heap
+            // texture keeps what it declared, and the engine degrades a LOAD
+            // over a resident that holds nothing to a clear, which is what an
+            // unwritten heap texture's undefined contents allow.
             let cleared = clears.iter().find(|a| a.texture_ref == att.texture_ref);
             let load_action = if cleared.is_some() || att.load_action == MTL_LOAD_ACTION_CLEAR {
                 MTL_LOAD_ACTION_CLEAR
-            } else {
+            } else if kind == HostTarget::Memoryless {
                 reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE
+            } else {
+                att.load_action
             };
-            if colors.is_empty() {
-                // Colour 0 is the one whose image the engine reads back and
-                // publishes; a memoryless one has nowhere to publish to. Not
-                // seen on any guest yet, so refused by name rather than built.
-                crate::runtime::drain::note_store_route("mrt_memoryless_primary");
-                if crate::observe::first_sight("mrt_memoryless_primary", u64::from(slot)) {
-                    crate::observe::fail(format!(
-                        "mrt_memoryless_primary task={task_id} slot={slot} ref={} {mw}x{mh} \
-                         fmt={mfmt:#x} (colour 0 is memoryless; the draw is refused)",
-                        att.texture_ref
-                    ));
-                }
-                return None;
-            }
-            crate::runtime::drain::note_store_route("mrt_slot_memoryless");
+            crate::runtime::drain::note_store_route(match kind {
+                HostTarget::Memoryless => "mrt_slot_memoryless",
+                HostTarget::Heap => "mrt_slot_heap",
+            });
             colors.push(ColorRtRequest {
                 slot,
                 texture_ref: target_ref,
@@ -2599,7 +2603,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 clear_color: cleared.map_or(att.clear_color, |cl| cl.clear_color),
                 target_seed_rgba: None,
                 multisample_source_ref,
-                memoryless: true,
+                host_only: Some(kind),
             });
             continue;
         }
@@ -2808,7 +2812,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             clear_color,
             target_seed_rgba: seed,
             multisample_source_ref,
-            memoryless: false,
+            host_only: None,
         });
     }
     if colors.is_empty() {
