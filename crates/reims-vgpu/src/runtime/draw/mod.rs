@@ -41,8 +41,8 @@ use crate::runtime::decode::resource::{
     decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
     decode_render_pipeline_descriptor, decode_texture_descriptor, texture_view_opcode,
     BufferTextureDescriptor, DecodeStatus, RenderPipelineDescriptor,
-    OBJECT_TYPE_MAPPER_REF_TEXTURE, OBJECT_TYPE_SERIALIZER_OBJECT, OBJECT_TYPE_TEXTURE,
-    OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS, OBJECT_TYPE_TEXTURE_VIEW,
+    OBJECT_TYPE_MAPPER_REF_TEXTURE, OBJECT_TYPE_MEMORYLESS_TEXTURE, OBJECT_TYPE_SERIALIZER_OBJECT,
+    OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS, OBJECT_TYPE_TEXTURE_VIEW,
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::gva_mem;
@@ -517,6 +517,10 @@ pub struct ColorRtRequest {
     /// Multisample attachment discarded into this request's single-sample
     /// target at pass end. Zero for an ordinary colour attachment.
     pub multisample_source_ref: u32,
+    /// A memoryless texture (object tag 9): `mapping_id` and `target_gva` are
+    /// both zero, there is no seed and no store, and the attachment's contents
+    /// live for this pass only.
+    pub memoryless: bool,
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -2117,10 +2121,16 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
         row_stride: bpr,
         format: fmt,
         sample_count: _,
+        memoryless,
     }) = lookup_render_target(state, host, task_id, *att)
     else {
         return lost("render_target_unresolved");
     };
+    if memoryless {
+        // A memoryless attachment has no guest pages to land a chain in, and
+        // the contract gives its contents no life past the pass.
+        return lost("memoryless_target");
+    }
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() < need {
         return lost("readback_short");
@@ -2332,6 +2342,12 @@ pub fn color_target_request<M: HostMemory + HostOps>(
 ) -> Option<DrawEncodeRequest> {
     let color_texture_ref = color.texture_ref;
     let rt = lookup_render_target(state, host, task_id, color)?;
+    if rt.memoryless {
+        // The single-target request is colour 0, which is read back and
+        // published; see `mrt_draw_request` for the same refusal.
+        crate::runtime::drain::note_store_route("mrt_memoryless_primary");
+        return None;
+    }
     let attachment_sample_count = crate::backend::selected()
         .pipeline_raster_sample_count(state, host, task_id, pipeline_ref)
         .unwrap_or(rt.sample_count);
@@ -2350,6 +2366,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
         clear_color: [0.0; 4],
         target_seed_rgba: None,
         multisample_source_ref: 0,
+        memoryless: false,
     };
     Some(DrawEncodeRequest {
         task_id,
@@ -2487,6 +2504,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             row_stride: bpr,
             format: mfmt,
             sample_count: target_sample_count,
+            memoryless,
         } = target;
         let attachment_sample_count = pipeline_sample_count.unwrap_or(target_sample_count);
         note_attachment_sample_count_override(
@@ -2532,6 +2550,51 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                     att.texture_ref
                 ));
             }
+            continue;
+        }
+        if memoryless {
+            // No guest storage: nothing to seed from, nothing to store to. The
+            // attachment exists for this pass alone, so the only load actions
+            // that mean anything are a clear and "undefined"; Metal refuses a
+            // load from a memoryless texture outright.
+            let cleared = clears.iter().find(|a| a.texture_ref == att.texture_ref);
+            let load_action = if cleared.is_some() || att.load_action == MTL_LOAD_ACTION_CLEAR {
+                MTL_LOAD_ACTION_CLEAR
+            } else {
+                reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE
+            };
+            if colors.is_empty() {
+                // Colour 0 is the one whose image the engine reads back and
+                // publishes; a memoryless one has nowhere to publish to. Not
+                // seen on any guest yet, so refused by name rather than built.
+                crate::runtime::drain::note_store_route("mrt_memoryless_primary");
+                if crate::observe::first_sight("mrt_memoryless_primary", u64::from(slot)) {
+                    crate::observe::fail(format!(
+                        "mrt_memoryless_primary task={task_id} slot={slot} ref={} {mw}x{mh} \
+                         fmt={mfmt:#x} (colour 0 is memoryless; the draw is refused)",
+                        att.texture_ref
+                    ));
+                }
+                return None;
+            }
+            crate::runtime::drain::note_store_route("mrt_slot_memoryless");
+            colors.push(ColorRtRequest {
+                slot,
+                texture_ref: target_ref,
+                mapping_id: 0,
+                target_gva: 0,
+                row_stride: 0,
+                width: mw,
+                height: mh,
+                format: mfmt,
+                sample_count: attachment_sample_count,
+                load_action,
+                store_action: att.store_action,
+                clear_color: cleared.map_or(att.clear_color, |cl| cl.clear_color),
+                target_seed_rgba: None,
+                multisample_source_ref,
+                memoryless: true,
+            });
             continue;
         }
         let mut load_action = att.load_action;
@@ -2739,6 +2802,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             clear_color,
             target_seed_rgba: seed,
             multisample_source_ref,
+            memoryless: false,
         });
     }
     if colors.is_empty() {

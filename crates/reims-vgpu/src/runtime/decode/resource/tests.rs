@@ -3912,3 +3912,42 @@ fn an_absurd_level_count_refuses_as_a_bad_count_not_as_a_short_body() {
         .iter()
         .any(|l| l.starts_with("dual_plane_levels_over_cap")));
 }
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// A tag-9 descriptor exactly as a macOS 26.4 compositor wrote it: the
+/// opcode-1 creation record for a 1920x1080 `RGBA16Float` memoryless texture
+/// whose ref is the slot it sits in (11).
+#[test]
+fn a_memoryless_texture_entry_decodes_from_its_creation_record() {
+    let bytes = hex_bytes(
+        "010000002c0000000b0000004205730080070000380400000100000001000100010030000000000000000000",
+    );
+    let m = decode_memoryless_texture_descriptor(&bytes).expect("decodes");
+    assert_eq!(m.object_ref, 11);
+    assert_eq!(m.descriptor.texture_type, 2);
+    assert_eq!(m.descriptor.pixel_format, 0x73);
+    assert_eq!((m.descriptor.width, m.descriptor.height), (1920, 1080));
+    assert_eq!(m.descriptor.depth, 1);
+    assert_eq!(m.descriptor.sample_count, 1);
+    assert_eq!(m.descriptor.mipmap_level_count, 1);
+    assert_eq!(m.descriptor.resource_options, 0x30);
+}
+
+/// The same record declaring private storage is not a memoryless texture, and
+/// a truncated one is not a record.
+#[test]
+fn a_tag_9_record_that_is_not_memoryless_or_is_short_is_refused() {
+    let mut bytes = hex_bytes(
+        "010000002c0000000b0000004205730080070000380400000100000001000100010030000000000000000000",
+    );
+    bytes[34] = 0x20;
+    assert!(decode_memoryless_texture_descriptor(&bytes).is_err());
+    bytes[34] = 0x30;
+    assert!(decode_memoryless_texture_descriptor(&bytes[..40]).is_err());
+}
