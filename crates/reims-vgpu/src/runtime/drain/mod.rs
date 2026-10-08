@@ -445,6 +445,24 @@ fn apply_delete_object<H: HostMemory + HostOps>(
             {
                 let ended = state.retire_pipeline(name);
                 note_store_route_n("pipeline_retire_released", ended.stranded.len() as u64);
+                if !ended.stranded.is_empty() {
+                    // Work the guest encoded against this pipeline before
+                    // deleting it. Left waiting it holds its channel forever —
+                    // and the translation pump re-walks it on every pass, which
+                    // a macOS 26 boot measured as a drain pinned at full duty
+                    // from twenty seconds in with nothing else executing. It
+                    // runs instead; a draw that can no longer resolve the
+                    // pipeline refuses by name.
+                    let ran = state.run_stranded(name, &ended.stranded);
+                    note_store_route_n("pipeline_retire_stranded_run", ran as u64);
+                    crate::observe::fail(format!(
+                        "pipeline_retired_with_parked_work task={task_id} ref={object_ref} \
+                         stranded={} now_ready={ran} (the guest deleted a pipeline that \
+                         parked work still binds; that work runs rather than waiting \
+                         for a build that cannot land)",
+                        ended.stranded.len()
+                    ));
+                }
                 // Whether the table had an entry to retire, which is not the
                 // same question as whether the guest sent a delete. A driven
                 // `macos-26` boot sent 170 and the table took 116: the other 54
