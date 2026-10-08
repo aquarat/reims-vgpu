@@ -1085,6 +1085,12 @@ pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
             "pipeline_refuse_stranded",
             ended.stranded.len() as u64,
         );
+        // Run rather than hold them: a draw binding a pipeline this device
+        // cannot build refuses by name when the work executes, and the work
+        // still completes — which is what the guest is waiting for. Left
+        // parked, nothing could ever release them.
+        let ran = state.run_stranded(name, &ended.stranded);
+        crate::runtime::drain::note_store_route_n("pipeline_refuse_stranded_run", ran as u64);
     }
     if ended.took {
         crate::runtime::drain::note_store_route(reason.slug());

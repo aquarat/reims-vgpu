@@ -1027,6 +1027,26 @@ impl SessionModel {
         }
     }
 
+    /// Run the work a retirement stranded instead of withdrawing it.
+    ///
+    /// A pipeline the guest deletes after encoding work that binds it is a
+    /// pipeline that work still owns: Metal retains every object an encoded
+    /// command buffer references, so the delete ends the guest's name and not
+    /// the encoded work. Withdrawing the work would leave its completion word
+    /// unpublished, and the guest waits on that word forever. So the
+    /// transactions [`Self::pipeline_retired`] named stop waiting for the
+    /// pipeline and run; a draw that can no longer resolve the pipeline then
+    /// refuses by name, as any draw binding a pipeline this device cannot
+    /// build does, and the transaction completes.
+    ///
+    /// Answers how many became ready.
+    pub fn run_stranded(&mut self, pipeline: ResourceId, stranded: &[IngressOrdinal]) -> usize {
+        stranded
+            .iter()
+            .filter(|&&ingress| self.scheduler.drop_pipeline_wait(ingress, pipeline))
+            .count()
+    }
+
     /// A completion word became readable: record the value the timeline now
     /// stands at, and release whatever was waiting for it.
     ///
@@ -1590,6 +1610,31 @@ mod tests {
         // says which of the two it is, rather than answering an empty list for
         // both.
         assert_eq!(s.pipeline_retired(pipeline), Ended::default());
+    }
+
+    /// The stranded work can be run instead of withdrawn, and then it is ready
+    /// exactly once.
+    #[test]
+    fn work_stranded_by_a_delete_runs_when_the_caller_releases_it() {
+        let mut s = session();
+        let pipeline = ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(1),
+        };
+        let gen = s.generation();
+        s.pipelines().declare(pipeline, gen);
+        s.pipelines()
+            .advance(pipeline, crate::pipeline::PipelineState::Translating);
+        let mut leased = packet(0x37);
+        let Payload::Exec(work) = &mut leased.payload else {
+            panic!("an EXEC");
+        };
+        work.pipeline_leases.push(pipeline);
+        let admitted = s.admit(&leased).expect("accepted");
+        let ended = s.pipeline_retired(pipeline);
+        assert_eq!(s.run_stranded(pipeline, &ended.stranded), 1);
+        assert_eq!(s.take_ready(), vec![admitted.transaction.identity.ingress]);
+        assert_eq!(s.run_stranded(pipeline, &ended.stranded), 0);
     }
 
     /// A reset ends the pipeline's *name*, and a transaction waiting for one
