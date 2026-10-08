@@ -116,14 +116,84 @@ pub fn fail_log_path() -> &'static str {
     #[cfg(any(test, feature = "testing"))]
     return FAIL_PATH.get_or_init(|| test_path("fail"));
     #[cfg(not(any(test, feature = "testing")))]
-    FAIL_PATH.get_or_init(|| "/tmp/reims-vgpu-fail.log".to_string())
+    FAIL_PATH
+        .get_or_init(|| product_path(reims_vgpu_config::FAIL_LOG_PATH, "/tmp/reims-vgpu-fail.log"))
+}
+
+/// The operator's path for one product sink, the compiled default, or the empty
+/// string for a sink switched off — which the writer's open refuses, so a
+/// disabled sink costs a channel send and nothing else.
+#[cfg(not(any(test, feature = "testing")))]
+fn product_path(var: &str, default: &str) -> String {
+    match reims_vgpu_config::sink_path(var) {
+        reims_vgpu_config::SinkPath::Default => default.to_string(),
+        reims_vgpu_config::SinkPath::Disabled => String::new(),
+        reims_vgpu_config::SinkPath::At(path) => path,
+    }
+}
+
+/// The cap a sink takes when the operator names a file and no cap.
+#[cfg(not(any(test, feature = "testing")))]
+const OVERRIDE_DEFAULT_CAP: u64 = 64 << 20;
+
+/// The byte cap for one sink: the operator's count, else
+/// [`OVERRIDE_DEFAULT_CAP`] when the sink's path was overridden, else none —
+/// the compiled default path keeps the unbounded behaviour it always had.
+#[cfg(not(any(test, feature = "testing")))]
+fn sink_cap(path_var: &str, cap_var: &str) -> Option<u64> {
+    match reims_vgpu_config::count(cap_var, u64::MAX) {
+        reims_vgpu_config::Count::Narrowed(n) => Some(n),
+        reims_vgpu_config::Count::Unset | reims_vgpu_config::Count::Refused(_) => {
+            match reims_vgpu_config::sink_path(path_var) {
+                reims_vgpu_config::SinkPath::At(_) => Some(OVERRIDE_DEFAULT_CAP),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// What a capped sink does with one line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, not(feature = "testing")))]
+enum CapStep {
+    Write,
+    /// The line would cross the cap: write the one notice instead, then drop.
+    Notice,
+    Drop,
+}
+
+/// Byte accounting for one sink. Pure, so the cap is testable without a file.
+#[cfg(any(test, not(feature = "testing")))]
+struct Cap {
+    limit: Option<u64>,
+    written: u64,
+    tripped: bool,
+}
+
+#[cfg(any(test, not(feature = "testing")))]
+impl Cap {
+    fn step(&mut self, len: u64) -> CapStep {
+        if self.tripped {
+            return CapStep::Drop;
+        }
+        let Some(limit) = self.limit else {
+            return CapStep::Write;
+        };
+        if self.written.saturating_add(len) > limit {
+            self.tripped = true;
+            return CapStep::Notice;
+        }
+        self.written = self.written.saturating_add(len);
+        CapStep::Write
+    }
 }
 
 pub fn draw_log_path() -> &'static str {
     #[cfg(any(test, feature = "testing"))]
     return DRAW_PATH.get_or_init(|| test_path("draw"));
     #[cfg(not(any(test, feature = "testing")))]
-    DRAW_PATH.get_or_init(|| "/tmp/reims-vgpu-draw.log".to_string())
+    DRAW_PATH
+        .get_or_init(|| product_path(reims_vgpu_config::DRAW_LOG_PATH, "/tmp/reims-vgpu-draw.log"))
 }
 
 /// Test-harness support: point the always-on sinks at per-process files so a
@@ -325,13 +395,58 @@ mod writer {
         })
     }
 
-    fn open(path: &str) -> Option<BufWriter<std::fs::File>> {
-        std::fs::OpenOptions::new()
+    /// One open sink and the bytes it may still take.
+    pub(super) struct Capped {
+        out: BufWriter<std::fs::File>,
+        cap: super::Cap,
+    }
+
+    impl Capped {
+        /// Write one line plus its newline, or the cap notice, or nothing.
+        /// Never blocks beyond the write itself and never retries.
+        fn line(&mut self, line: &str) {
+            match self.cap.step(line.len() as u64 + 1) {
+                super::CapStep::Write => {
+                    let _ = self.out.write_all(line.as_bytes());
+                    let _ = self.out.write_all(b"\n");
+                }
+                super::CapStep::Notice => {
+                    let _ = writeln!(
+                        self.out,
+                        "log_cap_reached written={} limit={} (further lines are dropped) t={}",
+                        self.cap.written,
+                        self.cap.limit.unwrap_or(0),
+                        super::elapsed_ms()
+                    );
+                }
+                super::CapStep::Drop => {}
+            }
+        }
+
+        fn flush(&mut self) {
+            let _ = self.out.flush();
+        }
+    }
+
+    fn open(path: &str, limit: Option<u64>) -> Option<Capped> {
+        if path.is_empty() {
+            return None;
+        }
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-            .ok()
-            .map(BufWriter::new)
+            .ok()?;
+        // Appending: what is already there counts against the cap.
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Some(Capped {
+            out: BufWriter::new(file),
+            cap: super::Cap {
+                limit,
+                written,
+                tripped: false,
+            },
+        })
     }
 
     /// Messages enqueued and not yet written. `mpsc` has no depth of its own, so
@@ -341,8 +456,20 @@ mod writer {
     static QUEUED: AtomicU64 = AtomicU64::new(0);
 
     fn writer_loop(rx: Receiver<Msg>, fail_path: String, draw_path: String) {
-        let mut fail = open(&fail_path);
-        let mut draw = open(&draw_path);
+        let mut fail = open(
+            &fail_path,
+            super::sink_cap(
+                reims_vgpu_config::FAIL_LOG_PATH,
+                reims_vgpu_config::FAIL_LOG_MAX_BYTES,
+            ),
+        );
+        let mut draw = open(
+            &draw_path,
+            super::sink_cap(
+                reims_vgpu_config::DRAW_LOG_PATH,
+                reims_vgpu_config::DRAW_LOG_MAX_BYTES,
+            ),
+        );
         let mut flood = super::FloodWindow::new(super::elapsed_ms());
         let mut last_beat_ms = super::elapsed_ms();
         let mut wrote_since_beat = 0u64;
@@ -366,21 +493,20 @@ mod writer {
             let now = super::elapsed_ms();
             if super::writer_beat_due(last_beat_ms, now) {
                 if let Some(w) = fail.as_mut() {
-                    let _ = writeln!(
-                        w,
+                    w.line(&format!(
                         "OFF log_writer wrote={wrote_since_beat} queued={} beat_ms={} t={now}",
                         QUEUED.load(Ordering::Relaxed),
                         now.saturating_sub(last_beat_ms),
-                    );
+                    ));
                 }
                 last_beat_ms = now;
                 wrote_since_beat = 0;
             }
             if let Some(w) = fail.as_mut() {
-                let _ = w.flush();
+                w.flush();
             }
             if let Some(w) = draw.as_mut() {
-                let _ = w.flush();
+                w.flush();
             }
         }
     }
@@ -390,8 +516,8 @@ mod writer {
     /// warning per window, written straight to the fail file (not re-queued, so
     /// it never self-counts). All in the writer thread: no producer-side cost.
     fn write_watched(
-        fail: &mut Option<BufWriter<std::fs::File>>,
-        draw: &mut Option<BufWriter<std::fs::File>>,
+        fail: &mut Option<Capped>,
+        draw: &mut Option<Capped>,
         flood: &mut super::FloodWindow,
         m: Msg,
     ) {
@@ -399,31 +525,25 @@ mod writer {
             let flooders = flood.note(s, super::elapsed_ms());
             if let Some(w) = fail.as_mut() {
                 for (prefix, count) in flooders {
-                    let _ = writeln!(
-                        w,
+                    w.line(&format!(
                         "log_flood_detected prefix={prefix} count={count} window_ms={} threshold={} t={}",
                         super::FLOOD_WINDOW_MS,
                         super::FLOOD_THRESHOLD_PER_WINDOW,
                         super::elapsed_ms()
-                    );
+                    ));
                 }
             }
         }
         write_msg(fail, draw, m);
     }
 
-    fn write_msg(
-        fail: &mut Option<BufWriter<std::fs::File>>,
-        draw: &mut Option<BufWriter<std::fs::File>>,
-        m: Msg,
-    ) {
+    fn write_msg(fail: &mut Option<Capped>, draw: &mut Option<Capped>, m: Msg) {
         let (w, line) = match m {
             Msg::Fail(s) => (fail.as_mut(), s),
             Msg::Draw(s) => (draw.as_mut(), s),
         };
         if let Some(w) = w {
-            let _ = w.write_all(line.as_bytes());
-            let _ = w.write_all(b"\n");
+            w.line(&line);
         }
         QUEUED.fetch_sub(1, Ordering::Relaxed);
     }
@@ -1042,6 +1162,24 @@ mod tests {
         assert!(lines[0].starts_with("first t="));
         assert!(lines[1].starts_with("second t="));
         fs::remove_file(moved).unwrap();
+    }
+
+    #[test]
+    fn a_capped_sink_writes_to_its_limit_then_one_notice_then_nothing() {
+        let mut cap = Cap {
+            limit: Some(10),
+            written: 4,
+            tripped: false,
+        };
+        assert_eq!(cap.step(6), CapStep::Write);
+        assert_eq!(cap.step(1), CapStep::Notice);
+        assert_eq!(cap.step(1), CapStep::Drop);
+        let mut open = Cap {
+            limit: None,
+            written: u64::MAX,
+            tripped: false,
+        };
+        assert_eq!(open.step(100), CapStep::Write);
     }
 
     #[test]

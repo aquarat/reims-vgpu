@@ -1207,6 +1207,21 @@ counts! {
 /// `crate::runtime::gpu_hang_trail`'s ring covers every submission still in
 /// flight instead of the last half millisecond of a batch.
 pub const BATCH_DRAWS: &str = "REIMS_VGPU_BATCH_DRAWS";
+
+/// **A count, not a switch.** The most bytes the always-on failure sink may
+/// hold before it writes one `log_cap_reached` line and drops the rest. Bytes
+/// already in the file when the device starts count against it, since the
+/// sink appends.
+///
+/// Unset, the cap is 64 MiB when [`FAIL_LOG_PATH`] names a file and absent for
+/// the compiled default path. A narrowing: it can only stop lines being
+/// written. It exists because the host's `/tmp` is commonly RAM, and an
+/// unbounded log on a long-lived guest is unbounded host memory.
+pub const FAIL_LOG_MAX_BYTES: &str = "REIMS_VGPU_FAIL_LOG_MAX_BYTES";
+
+/// **A count, not a switch.** [`FAIL_LOG_MAX_BYTES`] for the verbose sink, with
+/// the same default keyed on [`DRAW_LOG_PATH`].
+pub const DRAW_LOG_MAX_BYTES: &str = "REIMS_VGPU_DRAW_LOG_MAX_BYTES";
 }
 
 choices! {
@@ -1241,6 +1256,48 @@ choices! {
 /// changed" ambiguous between "the build does not carry that rail" and "the
 /// device declined the ask".
 pub const RAIL: &str = "REIMS_VGPU_RAIL";
+}
+
+/// Where the always-on failure sink writes. Unset keeps the compiled default,
+/// `/tmp/reims-vgpu-fail.log`; an off spelling (`0`, `off`, `false`, `no`) or
+/// `none` writes nothing. Read through [`sink_path`].
+///
+/// It exists because the default is one file per host, appended by every
+/// instance: two devices running at once interleave their lines, and a line
+/// cannot say which guest raised it. A private path per instance is the only
+/// way to read one guest's evidence on a shared host.
+pub const FAIL_LOG_PATH: &str = "REIMS_VGPU_FAIL_LOG";
+
+/// Where the verbose (`REIMS_VGPU_DRAW_LOG=1`) sink writes, with the same
+/// spellings as [`FAIL_LOG_PATH`]. Unset keeps `/tmp/reims-vgpu-draw.log`.
+pub const DRAW_LOG_PATH: &str = "REIMS_VGPU_DRAW_LOG_PATH";
+
+/// Where an operator asked a log sink to write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SinkPath {
+    /// Nothing set: the caller keeps its compiled path.
+    Default,
+    /// Write nowhere. This only narrows what the device does.
+    Disabled,
+    /// Write to this file instead of the compiled path.
+    At(String),
+}
+
+/// Read `name` as a sink path. Pure, like [`read`]: the sink itself asks.
+pub fn sink_path(name: &str) -> SinkPath {
+    let Some(raw) = std::env::var_os(name) else {
+        return SinkPath::Default;
+    };
+    let value = raw.to_string_lossy().into_owned();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return SinkPath::Default;
+    }
+    let folded = trimmed.to_ascii_lowercase();
+    if folded == "none" || OFF_SPELLINGS.contains(&folded.as_str()) {
+        return SinkPath::Disabled;
+    }
+    SinkPath::At(trimmed.to_owned())
 }
 
 /// What one variable says, including the two ways it says nothing usable.
@@ -1465,6 +1522,19 @@ mod tests {
         let out = body();
         unsafe { std::env::remove_var(PROBE) };
         out
+    }
+
+    #[test]
+    fn a_sink_path_is_default_disabled_or_a_file() {
+        let read = |v| with_probe(v, || sink_path("REIMS_VGPU_TEST_PROBE"));
+        assert_eq!(read(None), SinkPath::Default);
+        assert_eq!(read(Some("  ")), SinkPath::Default);
+        assert_eq!(read(Some("off")), SinkPath::Disabled);
+        assert_eq!(read(Some("None")), SinkPath::Disabled);
+        assert_eq!(
+            read(Some(" /run/x/fail.log ")),
+            SinkPath::At("/run/x/fail.log".to_owned())
+        );
     }
 
     fn probe(value: Option<&str>) -> Switch {
