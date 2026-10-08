@@ -658,6 +658,8 @@ fn capture_validates_identity_and_ring() {
     let mut host = FakeHost::new();
     let ring = 0x7000_0000u64;
     state.iosfc.ring_base = ring;
+    // A one-entry ring: the guest always programs the capacity it wraps at.
+    state.iosfc.capacity = 1;
 
     // producer=1 → entry 0: MAP mapping_id=7
     let mut entry = [0u8; 16];
@@ -698,6 +700,8 @@ fn capture_handoff_mismatch_is_fail_visible_and_latched() {
     let mut host = FakeHost::new();
     let ring = 0x7100_0000u64;
     state.iosfc.ring_base = ring;
+    // A one-entry ring: the guest always programs the capacity it wraps at.
+    state.iosfc.capacity = 1;
 
     // producer=1 → entry 0: MAP mapping_id=9
     let mut entry = [0u8; 16];
@@ -1318,6 +1322,8 @@ fn a_macos26_capture_is_corroborated_by_its_own_registers() {
     let mut host = FakeHost::new();
     let ring = 0x7200_0000u64;
     state.iosfc.ring_base = ring;
+    // A one-entry ring: the guest always programs the capacity it wraps at.
+    state.iosfc.capacity = 1;
     let mut entry = [0u8; 16];
     st32(&mut entry[0..], MAPPER_REQUEST_MAP);
     st32(&mut entry[4..], 7);

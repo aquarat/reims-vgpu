@@ -198,7 +198,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     if producer == 0 || state.iosfc.ring_base == 0 {
         return None;
     }
-    let entry_off = mapper_request_published_entry_offset(producer)?;
+    let entry_off = mapper_request_published_entry_offset(producer, state.iosfc.capacity)?;
     let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
     host.read_gpa(state.iosfc.ring_base + entry_off, &mut e)
         .ok()?;
