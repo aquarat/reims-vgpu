@@ -7539,27 +7539,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         };
 
         // Framebuffer fetch (`air.render_target` INPUT param `dest_N` →
-        // reflection `ColorInput` at binding 96+N): the engine supports the
-        // attachment-0 fetch as a Vulkan subpass input. `dest_N>0` (fetching a
-        // secondary MRT attachment) has no engine path yet — fail visibly, never
-        // execute a shader whose destination read would be unbound.
-        let frag_color_input = {
+        // reflection `ColorInput` at binding 96+N): the engine binds attachment
+        // N as Vulkan subpass input N. A fetch of an attachment this draw does
+        // not have is refused — never execute a shader whose destination read
+        // would be unbound. macOS 26's compositor fetches `dest_1`, a memoryless
+        // scratch attachment, in nearly every pass.
+        let frag_color_inputs = {
             use metal2vulkan::reflect::ResourceKind;
-            let mut fetch0 = false;
+            let mut mask = 0u8;
             for rb in &f_shader.reflection.bindings {
                 if rb.kind == ResourceKind::ColorInput {
-                    if rb.metal_index == 0 {
-                        fetch0 = true;
-                    } else {
+                    let index = rb.metal_index;
+                    if index >= u8::BITS || index as usize >= req.colors.len() {
                         return Err(DrawError::DrawPreparation(
                             DrawPreparationDecline::ColorInputMrtUnsupported {
-                                destination_index: rb.metal_index,
+                                destination_index: index,
                             },
                         ));
                     }
+                    mask |= 1 << index;
                 }
             }
-            fetch0
+            mask
         };
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Sampled);
         // The four `sampled_phase` spans below divide this phase's `sampled_us`,
@@ -8842,7 +8843,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.vertex_attributes = attrs;
         resources.storage_buffers = storage;
         resources.sampled_images = images;
-        resources.color_input = frag_color_input;
+        resources.color_inputs = frag_color_inputs;
         resources.continues_render_pass = req.continues_render_pass;
         resources.render_pass_continues = req.render_pass_continues;
         resources.samplers = samplers;

@@ -121,6 +121,12 @@ pub enum DrawReason {
     GuestRunSampledNot2d {
         binding: u32,
     },
+    /// The fragment shader fetches a colour attachment the framebuffer does
+    /// not have. Bit N of `color_inputs` is `[[color(N)]]`.
+    ColorInputAttachmentMissing {
+        color_inputs: u8,
+        attachments: u32,
+    },
     /// More MRT secondary attachments than the render pass can carry.
     SecondaryAttachmentCap {
         requested: usize,
@@ -337,6 +343,7 @@ impl crate::observe::Decline for DrawReason {
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
+            Self::ColorInputAttachmentMissing { .. } => "color_input_attachment_missing",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
             Self::MultisampleAttachmentSampleCountMismatch { .. } => {
@@ -412,6 +419,13 @@ impl std::fmt::Display for DrawReason {
             Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
                 write!(f, " binding={binding}")
             }
+            Self::ColorInputAttachmentMissing {
+                color_inputs,
+                attachments,
+            } => write!(
+                f,
+                " color_inputs={color_inputs:#04x} attachments={attachments}"
+            ),
             Self::SecondaryAttachmentCap { requested, cap } => {
                 write!(f, " requested={requested} cap={cap}")
             }
@@ -673,6 +687,10 @@ mod tests {
             color_targets: 2,
             depth: false,
             color_input: false,
+        },
+        DrawReason::ColorInputAttachmentMissing {
+            color_inputs: 2,
+            attachments: 1,
         },
         DrawReason::VisibilityResultMode(TranslateReason::UnknownVisibilityResultMode(0)),
         DrawReason::SamplerDeclaration(reims_vgpu_core::sampler::SamplerRefusal::BadLodClamp {
