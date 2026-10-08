@@ -1186,6 +1186,56 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         ));
     }
 
+    // A heap-placed texture (opcode 0x15 under the texture-view tag) is
+    // host-only storage keyed by its own name: what a render pass left in its
+    // resident is what this samples. One no pass has written has undefined
+    // contents, and reads as zero rather than refusing the draw.
+    if let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) {
+        if let Some(heap) =
+            super::render_target::heap_texture_descriptor(state, host, task_id, &entry)
+        {
+            let Ok(d) = heap else {
+                crate::runtime::drain::note_store_route("sampled_heap_undecodable");
+                return None;
+            };
+            let identity = host_target_identity(
+                crate::runtime::draw::HostTarget::Heap,
+                task_id,
+                texture_ref,
+                d.width,
+                d.height,
+            );
+            let view = translate::pixel::color_attachment(d.pixel_format)
+                .ok()
+                .map(|(attachment, _)| attachment.vk);
+            if let Some(vk) = view.filter(|_| {
+                may_bind_resident
+                    && crate::backend::vulkan::engine::resident_content_ready(&identity)
+            }) {
+                crate::runtime::drain::note_store_route("sampled_heap_resident");
+                return Some((
+                    d.width,
+                    d.height,
+                    0,
+                    SampledSourceRequest::Target(identity, vk),
+                ));
+            }
+            crate::runtime::drain::note_store_route("sampled_heap_unwritten");
+            let (w, h) = (d.width.max(1), d.height.max(1));
+            return Some((
+                w,
+                h,
+                0,
+                SampledSourceRequest::Bytes(
+                    std::sync::Arc::new(vec![0u8; (w as usize) * (h as usize) * 4]),
+                    None,
+                    SampledByteFormat::synthesised(TexelLayout::Rgba8),
+                    crate::backend::vulkan::engine::SampledByteOrigin::Synthetic,
+                ),
+            ));
+        }
+    }
+
     // The object list names exactly ONE surface for a sampled ref. Which one is
     // decided by the entry's `object_type`, and the cases below are distinct
     // values of that single u8 field, so they cannot both apply:
@@ -6555,27 +6605,41 @@ fn note_mapper_ref_texture_store_route(route: &'static str) {
 /// what Vulkan ought to do: `backend::metal::render` attaches every entry of
 /// this same colour list at its own slot number and has never degraded, so the
 /// two arms disagreed about one wire form and only one of them was silent.
-/// The residency identity of a memoryless colour attachment.
+/// The residency identity of a host-only colour attachment.
 ///
-/// A memoryless texture has no guest address and no mapping, so neither of the
-/// namespaces the other attachments use can name it; it is named by the
-/// `(task, ref)` the guest gave it. The resident it keys holds nothing the guest
-/// can observe — Metal forbids loading, storing, sampling or blitting such a
-/// texture — so reuse across passes only saves an allocation, and a pass that
-/// asks for a clear still gets one. Bit 62 tags the namespace, clear of the
-/// depth chain's bit 63 and of the small counters the engine's own anonymous
-/// slots use.
-pub(super) fn memoryless_identity(
+/// A memoryless or heap-placed texture has no guest address and no mapping, so
+/// neither of the namespaces the other attachments use can name it. It lives in
+/// the texture-ref namespace, named by the ref, with the owning task and its
+/// kind folded into the generation so two tasks' refs never share a resident:
+/// bit 63 tags a heap texture, bit 62 a memoryless one, bits 32.. the task. The
+/// depth chain's texture identities carry generation 0, so they cannot collide.
+///
+/// A memoryless resident holds nothing the guest can observe, so reusing it
+/// across passes only saves an allocation. A heap resident is the texture's
+/// storage: what a pass leaves in it is what a later pass loads or samples
+/// from the same ref. The extent is part of the key, so a ref the guest reuses
+/// at another size is another resident.
+pub(crate) fn host_target_identity(
+    kind: crate::runtime::draw::HostTarget,
     task_id: u32,
     texture_ref: u32,
+    width: u32,
+    height: u32,
 ) -> crate::backend::vulkan::engine::TargetIdentity {
+    const HEAP_TAG_BIT: u32 = 63;
     const MEMORYLESS_TAG_BIT: u32 = 62;
     const TASK_SHIFT: u32 = 32;
     const TASK_MASK: u64 = (1 << (MEMORYLESS_TAG_BIT - TASK_SHIFT)) - 1;
-    crate::backend::vulkan::engine::TargetIdentity::Anonymous {
-        slot: (1u64 << MEMORYLESS_TAG_BIT)
-            | ((u64::from(task_id) & TASK_MASK) << TASK_SHIFT)
-            | u64::from(texture_ref),
+    let tag = match kind {
+        crate::runtime::draw::HostTarget::Heap => 1u64 << HEAP_TAG_BIT,
+        crate::runtime::draw::HostTarget::Memoryless => 1u64 << MEMORYLESS_TAG_BIT,
+    };
+    crate::backend::vulkan::engine::TargetIdentity::Texture {
+        ref_: texture_ref,
+        width,
+        height,
+        generation: tag | ((u64::from(task_id) & TASK_MASK) << TASK_SHIFT),
+        stencil: false,
     }
 }
 
@@ -6663,8 +6727,8 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Without one this attachment is keyed on `(gva, width, height)` alone
         // and two guest allocations reusing that address at that geometry share
         // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let identity = if c.memoryless {
-            memoryless_identity(task_id, c.texture_ref)
+        let identity = if let Some(kind) = c.host_only {
+            host_target_identity(kind, task_id, c.texture_ref, c.width, c.height)
         } else if c.target_gva != 0 {
             TargetIdentity::Gva {
                 gva: c.target_gva,
@@ -6770,12 +6834,12 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         let declared = reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action);
         let load = match declared {
             reims_vgpu_protocol::pass_action::LoadAction::Clear => false,
-            // A memoryless attachment's contents are undefined at the start of
-            // a pass whatever it declares, so its LOAD — the continuation a
-            // later record of one encoder carries — preserves what the resident
-            // holds when it holds anything and is a clear when it does not.
-            // Refusing it would drop a draw over contents nobody can observe.
-            reims_vgpu_protocol::pass_action::LoadAction::Load if c.memoryless => {
+            // A host-only attachment's LOAD preserves what its resident holds
+            // when it holds anything and is a clear when it does not. For a
+            // memoryless one the contents are undefined at pass start whatever
+            // it declares; for a heap texture no pass has written yet, they
+            // are undefined because nothing defined them.
+            reims_vgpu_protocol::pass_action::LoadAction::Load if c.host_only.is_some() => {
                 crate::backend::vulkan::engine::resident_content_ready(&identity)
             }
             reims_vgpu_protocol::pass_action::LoadAction::Load => true,
@@ -8315,6 +8379,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // a second engine transaction for the same command.
             chain_load_from_target = true;
         }
+        // A host-only colour 0 has no guest copy to seed from: its resident is
+        // its only storage. A preserving load is honoured from the resident
+        // when it holds content, and is a clear otherwise.
+        let color0_host_only = req.colors.first().is_some_and(|c| c.host_only.is_some());
+        if color0_host_only && !chain_load_from_target {
+            let preserves = req.colors.first().is_some_and(|c| {
+                reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action)
+                    .preserves_prior_contents()
+            });
+            if preserves
+                && render_chain_identity(state, req)
+                    .is_some_and(|id| crate::backend::vulkan::engine::resident_content_ready(&id))
+            {
+                chain_load_from_target = true;
+            }
+        }
         // Colour0's LOAD seed was skipped by `mrt_draw_request` because the
         // engine still held what the render Store published into its guest
         // pages. Honour that here, or put the seed back.
@@ -8897,10 +8977,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the key the draw registered, and a flag beside `resources` would let a
         // caller derive a second one. See `M2vDrawSpan::ResidentSurfaceStore`.
         let mut gva_resident_store: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
-        if req.chain_from_resident || (store_is_store && !writeback_guest) {
+        if req.chain_from_resident || (store_is_store && !writeback_guest) || color0_host_only {
             if let Some(identity) = render_chain_identity(state, req) {
                 resources.target_identity = Some(identity);
-                if store_is_store && !writeback_guest {
+                // A host-only colour 0 always ends in its resident: there are
+                // no guest pages to read it back into.
+                if (store_is_store && !writeback_guest) || color0_host_only {
                     resources.skip_readback = true;
                     resident_render_chain = true;
                 }
@@ -9957,6 +10039,15 @@ pub(crate) fn render_chain_identity(
     let (width, height) = (c0.width, c0.height);
     if width == 0 || height == 0 {
         return None;
+    }
+    if let Some(kind) = c0.host_only {
+        return Some(host_target_identity(
+            kind,
+            req.task_id,
+            c0.texture_ref,
+            width,
+            height,
+        ));
     }
     if c0.mapping_id != 0 {
         return Some(crate::backend::vulkan::present_identity::surface_identity(

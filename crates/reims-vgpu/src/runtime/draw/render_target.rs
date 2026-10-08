@@ -370,11 +370,97 @@ pub(super) struct ResolvedRenderTarget {
     /// and the pipeline is the one that must; this is what that agreement is
     /// checked against.
     pub(super) sample_count: u32,
-    /// The target is a memoryless texture: it has no guest storage, is never
-    /// loaded from or stored to the guest, and lives for one pass. Both
-    /// `mapping_id` and `target_gva` are zero for it, which is why this is a
-    /// field and not inferred from them.
-    pub(super) memoryless: bool,
+    /// The target has no guest storage this device writes: it is a host
+    /// resident keyed by the ref (see [`HostTarget`]). Both `mapping_id` and
+    /// `target_gva` are zero for it, which is why this is a field and not
+    /// inferred from them.
+    pub(super) host_only: Option<HostTarget>,
+}
+
+/// Resolve a heap-placed texture (a tag-8 child whose record is opcode `0x15`
+/// or its wide form) as a host-only colour attachment.
+///
+/// The placement is executed as host-only storage keyed by the texture's own
+/// name — the reading `objects::note_heap_reference` records and the compute
+/// rail already executes — so the attachment's geometry and format come from
+/// the record's embedded texture descriptor and nothing is read from the heap.
+fn resolve_heap_target<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    entry: &crate::runtime::decode::resource::ListObjectEntry,
+    level: u32,
+    view_fmt_override: Option<u16>,
+) -> Option<Result<ResolvedRenderTarget, RenderTargetCause>> {
+    use RenderTargetCause as C;
+    let d = heap_texture_descriptor(state, host, task_id, entry)?;
+    Some((|| {
+        let d = d?;
+        if level != 0 || d.mipmap_level_count > 1 || d.texture_type != 2 {
+            return Err(C::HeapShape {
+                level,
+                levels: u32::from(d.mipmap_level_count),
+                texture_type: d.texture_type,
+            });
+        }
+        if d.width == 0 || d.height == 0 {
+            return Err(C::ZeroExtent {
+                width: d.width,
+                height: d.height,
+            });
+        }
+        let fmt = effective_view_sample_format(d.pixel_format, view_fmt_override)
+            .unwrap_or(d.pixel_format);
+        if pixel_format::render_target_bpp(fmt).is_none() {
+            return Err(C::HeapFormat { fmt });
+        }
+        Ok(ResolvedRenderTarget {
+            mapping_id: 0,
+            target_gva: 0,
+            width: d.width,
+            height: d.height,
+            row_stride: 0,
+            format: fmt,
+            sample_count: u32::from(d.sample_count.max(1)),
+            host_only: Some(HostTarget::Heap),
+        })
+    })())
+}
+
+/// The texture descriptor a heap placement record embeds, or `None` when the
+/// entry is not a heap placement at all. The inner `Err` is a heap placement
+/// whose record did not decode.
+pub(crate) fn heap_texture_descriptor<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    entry: &crate::runtime::decode::resource::ListObjectEntry,
+) -> Option<Result<crate::runtime::heap_query::TextureDescriptor, RenderTargetCause>> {
+    use crate::runtime::decode::resource::{
+        decode_heap_texture, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
+    };
+    if entry.object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        return None;
+    }
+    let bytes = objects::read_descriptor(state, host, task_id, entry)?;
+    let opcode = texture_view_opcode(&bytes)?;
+    if opcode != HEAP_TEXTURE_OPCODE && opcode != HEAP_TEXTURE_WIDE_OPCODE {
+        return None;
+    }
+    let decoded = decode_heap_texture(&bytes).map_err(|status| C::HeapDecode {
+        decode: crate::observe::Decline::slug(&status),
+    });
+    use RenderTargetCause as C;
+    Some(decoded.and_then(|record| {
+        if record.wide {
+            crate::runtime::heap_query::decode_wide_serialized_texture_descriptor(record.descriptor)
+        } else {
+            crate::runtime::heap_query::decode_serialized_texture_descriptor(record.descriptor)
+        }
+        .map_err(|e| C::HeapDecode {
+            decode: crate::observe::Decline::slug(&e),
+        })
+    }))
 }
 
 /// Resolve a tag-9 (memoryless) colour attachment from its creation record.
@@ -419,7 +505,7 @@ fn resolve_memoryless_target<M: HostMemory + HostOps>(
         row_stride: 0,
         format: fmt,
         sample_count: u32::from(d.sample_count.max(1)),
-        memoryless: true,
+        host_only: Some(HostTarget::Memoryless),
     })
 }
 
@@ -587,6 +673,17 @@ pub(super) enum RenderTargetCause {
     MemorylessMipView { level: u32 },
     /// A memoryless texture in a format this device will not render into.
     MemorylessFormat { fmt: u16 },
+    /// A heap placement record that did not decode.
+    HeapDecode { decode: &'static str },
+    /// A heap-placed texture of a shape this rail does not attach: a mip view,
+    /// a mipmapped texture, or a type other than 2D.
+    HeapShape {
+        level: u32,
+        levels: u32,
+        texture_type: u8,
+    },
+    /// A heap-placed texture in a format this device will not render into.
+    HeapFormat { fmt: u16 },
 }
 
 impl RenderTargetCause {
@@ -645,6 +742,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
             }
             C::MemorylessMipView { .. } => "rt_memoryless_mip_view",
             C::MemorylessFormat { .. } => "rt_memoryless_format",
+            C::HeapDecode { .. } => crate::observe::ladder_slug!("rt_heap", desc_decode),
+            C::HeapShape { .. } => "rt_heap_shape",
+            C::HeapFormat { .. } => "rt_heap_format",
         }
     }
 
@@ -717,9 +817,9 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("fmt", format!("{fmt:#x}")));
             }
             C::WrongType { object_type } => v.push(("object_type", object_type.to_string())),
-            C::LinearDescDecode { decode } | C::MemorylessDescDecode { decode } => {
-                v.push(("decode", decode.to_string()))
-            }
+            C::LinearDescDecode { decode }
+            | C::MemorylessDescDecode { decode }
+            | C::HeapDecode { decode } => v.push(("decode", decode.to_string())),
             C::LinearDescIncomplete {
                 format,
                 width,
@@ -730,7 +830,7 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("dims", format!("{width}x{height}")));
                 v.push(("bpr", row_stride.to_string()));
             }
-            C::LinearFormat { fmt } | C::MemorylessFormat { fmt } => {
+            C::LinearFormat { fmt } | C::MemorylessFormat { fmt } | C::HeapFormat { fmt } => {
                 v.push(("fmt", format!("{fmt:#x}")))
             }
             C::LinearLevelStride { row_stride } => v.push(("bpr", row_stride.to_string())),
@@ -772,6 +872,15 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("tight", tight.to_string()));
             }
             C::ZeroExtent { width, height } => v.push(("dims", format!("{width}x{height}"))),
+            C::HeapShape {
+                level,
+                levels,
+                texture_type,
+            } => {
+                v.push(("level", level.to_string()));
+                v.push(("levels", levels.to_string()));
+                v.push(("texture_type", texture_type.to_string()));
+            }
             C::ViewSwizzled
             | C::ViewBaseUnbound
             | C::MapperRefTextureUnresolved
@@ -847,6 +956,14 @@ fn resolve_render_target<M: HostMemory + HostOps>(
 ) -> Result<ResolvedRenderTarget, RenderTargetRefusal> {
     use RenderTargetCause as C;
     let texture_ref = att.texture_ref;
+    // A heap placement shares the texture-view tag and is not a view: it is a
+    // complete texture, so it is answered before the view chain would refuse
+    // its opcode.
+    if let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) {
+        if let Some(heap) = resolve_heap_target(state, host, task_id, &entry, att.level, None) {
+            return heap.map_err(|cause| cause.at(texture_ref));
+        }
+    }
     // Texture-view view → base (archive resource_resolve_texture view chain).
     let (resolved_ref, view_fmt_override, view_level) =
         if let Some(view) = resolve_texture_view(state, host, task_id, texture_ref) {
@@ -965,7 +1082,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             row_stride: 0,
             format: fmt,
             sample_count: 1,
-            memoryless: false,
+            host_only: None,
         });
     }
     // x86 Ventura/Tahoe backing record/backing (present IOSurface). Object-list
@@ -1046,7 +1163,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
             row_stride: 0,
             format: fmt,
             sample_count: 1,
-            memoryless: false,
+            host_only: None,
         });
     }
     // normal-texture linear GVA (wallpaper/background layers, UI intermediate RTs).
@@ -1211,7 +1328,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
         // not lost, because `decode_trailer_sample_count` emits
         // `texture_desc_trailer_disagrees` on the way to `None`.
         sample_count: tex.sample_count.unwrap_or(1).max(1),
-        memoryless: false,
+        host_only: None,
     })
 }
 
