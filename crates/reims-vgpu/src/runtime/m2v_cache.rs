@@ -816,8 +816,14 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
     let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp)
-            .map_err(|e| translate_decline(stage, e.to_string()))?;
+        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp).map_err(
+            |e| {
+                // A translation that failed produced no module: captured with
+                // a word count of zero, which is what a failure handover needs.
+                capture_air(air, stage, &[]);
+                translate_decline(stage, e.to_string())
+            },
+        )?;
     capture_air(air, stage, &spirv);
     finish_translated(spirv, reflection, stage)
 }
@@ -839,8 +845,11 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
         &tmp,
         opts,
     )
-    .map_err(|e| M2vCacheDecline::KernelTranslate {
-        detail: e.to_string(),
+    .map_err(|e| {
+        capture_air(air, Stage::Kernel, &[]);
+        M2vCacheDecline::KernelTranslate {
+            detail: e.to_string(),
+        }
     })?;
     capture_air(air, Stage::Kernel, &spirv);
     if reflection.local_size != Some(local_size) {
