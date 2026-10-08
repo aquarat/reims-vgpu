@@ -929,6 +929,13 @@ pub(crate) fn linear_native_upload_format(
     if let Some(layout) = pixel_format::block_compressed_layout(sample_format) {
         return native.block_compressed.then_some(layout);
     }
+    // Single-channel half float has no sampled class (nothing reads it as a
+    // byte-copy source) and no CPU loader arm by design, so this is its only
+    // rail: two bytes a texel uploaded as `R16_SFLOAT`, on the same host gate
+    // as the other half-float layouts. macOS 26 samples linear ones.
+    if sample_format == pixel_format::MTL_FORMAT_R16_FLOAT {
+        return native.float16.then_some(TexelLayout::R16Float);
+    }
     // The decode contract's sampled class is the one rule for "which channel
     // order and width is this"; it folds each sRGB format onto its linear
     // sibling's layout, which is right — they share a layout. The qualifier is
@@ -950,6 +957,12 @@ pub(crate) fn linear_native_upload_format(
         // arm for an integer texel and must not gain one, so a `None` here is
         // not a slower rail, it is `RowConvertUnsupported` and a lost sample.
         SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
+        // Ungated: Vulkan mandates `SAMPLED_IMAGE_FILTER_LINEAR` for
+        // `A2B10G10R10_UNORM_PACK32`, and the guest word is already that
+        // format's texel, so the rows are a straight copy. There is no CPU arm
+        // to fall back to (the channels are not byte-aligned). The iOS
+        // simulator samples linear `RGB10A2Unorm` textures.
+        SampledClass::Rgb10a2Unorm => TexelLayout::Rgb10a2Unorm,
         _ => return None,
     })
 }
