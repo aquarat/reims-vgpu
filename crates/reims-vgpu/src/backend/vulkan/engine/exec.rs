@@ -2971,13 +2971,15 @@ pub(crate) unsafe fn execute_draw_inner(
             count: 1,
         });
     }
-    if req.color_input {
-        layout_bindings.push(BindingSig {
-            binding: super::types::COLOR_INPUT_BINDING,
-            ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
-            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
-            count: 1,
-        });
+    for index in 0..u8::BITS {
+        if req.color_inputs & (1 << index) != 0 {
+            layout_bindings.push(BindingSig {
+                binding: super::types::COLOR_INPUT_BINDING + index,
+                ty: vk::DescriptorType::INPUT_ATTACHMENT.as_raw() as u32,
+                stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
+                count: 1,
+            });
+        }
     }
     canonicalize_layout_bindings(layout_bindings)?;
     if let Some(binding) = pools
@@ -3078,7 +3080,7 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     }
     pass_key.secondary_count = req.secondary_targets.len() as u8;
-    pass_key.color_input = req.color_input;
+    pass_key.color_inputs = req.color_inputs;
     for resource in &req.sampled_images {
         if let Some(index) =
             feedback_color_index(req, resource, ctx.features.attachment_feedback_loop_layout)
@@ -3150,12 +3152,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 },
             ));
         }
-        if !req.secondary_targets.is_empty() || req.color_input {
+        if !req.secondary_targets.is_empty() || req.color_inputs != 0 {
             return Err(DrawError::Unsupported(
                 super::reason::DrawReason::MultisampleResolveShapeUnsupported {
                     color_targets: 1u32.saturating_add(req.secondary_targets.len() as u32),
                     depth: req.depth.is_some(),
-                    color_input: req.color_input,
+                    color_input: req.color_inputs != 0,
                 },
             ));
         }
@@ -3620,7 +3622,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // slot's cached framebuffer was built against. One predicate, because the
     // two answers it feeds have to agree: which pass the slot is ensured under,
     // and whether the draw builds (and later disposes) a framebuffer of its own.
-    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let ordinary_ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_inputs != 0;
     let ad_hoc_framebuffer = ordinary_ad_hoc_framebuffer || req.multisample_resolve;
     let (primary_pass, primary_pass_compatibility) = if ad_hoc_framebuffer {
         let mut color_only = PassKey::single(pass_key.color0_load, pass_key.color0_format);
@@ -3656,6 +3658,9 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_sampled_use(identity);
         }
     }
+    // The framebuffer's attachment views in attachment order, kept for the
+    // framebuffer-fetch descriptors: input N is attachment N's view.
+    let mut attachment_views: Vec<vk::ImageView> = Vec::new();
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
@@ -3723,6 +3728,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
+                attachment_views.clone_from(&views);
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
@@ -3759,6 +3765,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
+                attachment_views.clone_from(&views);
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
@@ -4284,7 +4291,29 @@ pub(crate) unsafe fn execute_draw_inner(
     // Framebuffer fetch: the input attachment IS the color target's view;
     // derive the same layout as the subpass reference. A draw that also
     // samples the target upgrades both from GENERAL to the feedback layout.
-    let color_input_layout = pass_key.color_layout(0);
+    if attachment_views.is_empty() {
+        attachment_views.push(target_view);
+    }
+    let color_inputs: Vec<(u32, vk::ImageView, vk::ImageLayout)> = (0..u8::BITS as usize)
+        .filter(|&index| pass_key.color_input(index))
+        .filter_map(|index| {
+            attachment_views.get(index).map(|&view| {
+                (
+                    super::types::COLOR_INPUT_BINDING + index as u32,
+                    view,
+                    pass_key.color_layout(index),
+                )
+            })
+        })
+        .collect();
+    if color_inputs.len() != req.color_inputs.count_ones() as usize {
+        return Err(DrawError::Unsupported(
+            super::reason::DrawReason::ColorInputAttachmentMissing {
+                color_inputs: req.color_inputs,
+                attachments: attachment_views.len() as u32,
+            },
+        ));
+    }
     // This draw's bindings, as this device's own list rather than as Vulkan's
     // write structures.
     //
@@ -4307,7 +4336,7 @@ pub(crate) unsafe fn execute_draw_inner(
         storage_binds,
         &sampled,
         &sampler_handles,
-        req.color_input.then_some((target_view, color_input_layout)),
+        &color_inputs,
     );
     if let Some(dset) = dset {
         // An allocated set is fresh out of the pool and carries nothing, so
@@ -6167,7 +6196,7 @@ fn fill_descriptor_bindings(
     storage_slots: &[(u32, BoundBuffer, u64)],
     sampled: &[PreparedSampled],
     sampler_handles: &[(u32, vk::Sampler)],
-    color_input: Option<(vk::ImageView, vk::ImageLayout)>,
+    color_inputs: &[(u32, vk::ImageView, vk::ImageLayout)],
 ) {
     out.extend(storage_slots.iter().map(|(binding, bound, len)| {
         super::pools::PushDescriptorBinding::Buffer {
@@ -6201,16 +6230,16 @@ fn fill_descriptor_bindings(
             layout: vk::ImageLayout::UNDEFINED,
         }
     }));
-    if let Some((view, layout)) = color_input {
-        out.push(super::pools::PushDescriptorBinding::Image {
-            binding: super::types::COLOR_INPUT_BINDING,
+    out.extend(color_inputs.iter().map(|&(binding, view, layout)| {
+        super::pools::PushDescriptorBinding::Image {
+            binding,
             array_element: 0,
             ty: vk::DescriptorType::INPUT_ATTACHMENT,
             sampler: vk::Sampler::null(),
             view,
             layout,
-        });
-    }
+        }
+    }));
 }
 
 /// Derive Vulkan's write structures from `bindings` and hand them to `f`.
