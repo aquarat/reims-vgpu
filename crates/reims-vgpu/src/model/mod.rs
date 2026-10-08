@@ -691,6 +691,57 @@ mod tests {
         );
     }
 
+    /// The mapper ring wraps at the entry count the guest programs.
+    ///
+    /// The guest writes request `n` into slot `n % capacity` and blocks until
+    /// the consumer passes it; requests past the first wrap must therefore be
+    /// read back from their wrapped slot, not from beyond the ring. The bytes
+    /// just past this ring are a well-formed request on purpose, so a reader that
+    /// overruns acts on the wrong one and the test cannot pass by accident.
+    #[test]
+    fn mapper_requests_past_the_capacity_are_read_from_their_wrapped_slot() {
+        use crate::protocol::iosurface_pages::{MAPPER_REQUEST_MAP, MAPPER_REQUEST_UNMAP};
+        let mut d = dev();
+        let mut h = FakeHost::new();
+        let base = 0x8000_0000u64;
+        h.map_range(base, 0x1000, 0);
+        d.iosfc_write(&mut h, IOSFC_REG_RING_BASE, base, MMIO_U64);
+        d.iosfc_write(&mut h, IOSFC_REG_CAPACITY, 4, MMIO_U32);
+        let put = |h: &mut FakeHost, slot: u64, request_type: u32, mapping_id: u32| {
+            let _ = h.write_gpa(base + slot * 16, &request_type.to_le_bytes());
+            let _ = h.write_gpa(base + slot * 16 + 4, &mapping_id.to_le_bytes());
+        };
+        // A MAP of 99 right after the four-entry ring: what an overrun would read.
+        put(&mut h, 4, MAPPER_REQUEST_MAP, 99);
+        for (n, id) in [(0u32, 11u32), (1, 12), (2, 13), (3, 14)] {
+            put(&mut h, u64::from(n), MAPPER_REQUEST_MAP, id);
+            d.iosfc_write(&mut h, IOSFC_REG_PRODUCER, u64::from(n + 1), MMIO_U32);
+        }
+        // Requests 4 and 5 reuse slots 0 and 1.
+        put(&mut h, 0, MAPPER_REQUEST_UNMAP, 11);
+        d.iosfc_write(&mut h, IOSFC_REG_PRODUCER, 5, MMIO_U32);
+        put(&mut h, 1, MAPPER_REQUEST_MAP, 15);
+        d.iosfc_write(&mut h, IOSFC_REG_PRODUCER, 6, MMIO_U32);
+
+        assert_eq!(d.state.iosfc.consumer, 6);
+        assert!(
+            !d.state.mappings[&11].mapped,
+            "the UNMAP published in wrapped slot 0 must reach mapping 11"
+        );
+        assert!(
+            d.state.mappings.get(&15).is_some_and(|m| m.mapped),
+            "the MAP published in wrapped slot 1 must reach mapping 15"
+        );
+        assert!(
+            !d.state.mappings.contains_key(&99),
+            "nothing past the ring may be read as a request"
+        );
+        assert!(!d
+            .fails()
+            .iter()
+            .any(|f| matches!(f, FailEvent::UnknownChildOpcode { .. })));
+    }
+
     #[test]
     fn present_and_cursor_model() {
         let mut d = dev();

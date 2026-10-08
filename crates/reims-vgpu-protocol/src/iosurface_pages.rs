@@ -666,15 +666,41 @@ pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
     Some(((entry >> PAGE_ENTRY_PFN_SHIFT) as u64) << page_shift)
 }
 
-pub fn mapper_request_entry_offset(index: u32) -> u64 {
-    (index as u64) * MAPPER_REQUEST_ENTRY_LEN as u64
+/// Byte offset, from the ring base, of mapper request `index`.
+///
+/// The guest's `IOSurfaceParavirtMapperDevice` keeps a free-running request
+/// counter and writes request `n` into slot `n % capacity` of a ring of
+/// `capacity` [`MAPPER_REQUEST_ENTRY_LEN`]-byte entries, where `capacity` is the
+/// entry count it programs into the capacity register at setup — the very
+/// value its `do_host_mapping_gated` divides by (`udiv`/`msub`). So a request's
+/// place in the ring is its index *modulo* the capacity, and a reader that
+/// skips the wrap reads past the ring once the counter passes `capacity`.
+///
+/// That is what this used to do. Every request after the first wrap was read
+/// from guest memory beyond the ring — zeros, mostly, so it was dropped as an
+/// unknown request — and the real MAP and UNMAP in the wrapped slot were never
+/// applied. A lost UNMAP leaves the device holding the page list of an
+/// IOSurface the guest has already unwired and freed, which is the
+/// write-into-recycled-memory corruption that panicked macOS 26 guests under
+/// sustained simulator load.
+///
+/// `None` for a zero capacity: a ring whose length the guest has not
+/// programmed has no slot to name.
+pub fn mapper_request_entry_offset(index: u32, capacity: u32) -> Option<u64> {
+    if capacity == 0 {
+        return None;
+    }
+    Some(u64::from(index % capacity) * MAPPER_REQUEST_ENTRY_LEN as u64)
 }
 
-pub fn mapper_request_published_entry_offset(producer: u32) -> Option<u64> {
+/// Offset of the request the guest published by moving its producer counter to
+/// `producer`, i.e. request `producer - 1`. `None` before the first request and
+/// for an unprogrammed ring; see [`mapper_request_entry_offset`].
+pub fn mapper_request_published_entry_offset(producer: u32, capacity: u32) -> Option<u64> {
     if producer == 0 {
         None
     } else {
-        Some(mapper_request_entry_offset(producer - 1))
+        mapper_request_entry_offset(producer - 1, capacity)
     }
 }
 
@@ -1151,6 +1177,21 @@ mod tests {
         fn is_kernel_va(&self, address: u64) -> bool {
             arm_kernel_va(address)
         }
+    }
+
+    /// Request `n` lives in slot `n % capacity`, as the guest's mapper writes it;
+    /// a reader that does not wrap reads past the ring after `capacity` requests.
+    #[test]
+    fn mapper_request_slots_wrap_at_the_programmed_capacity() {
+        assert_eq!(mapper_request_entry_offset(0, 4), Some(0));
+        assert_eq!(mapper_request_entry_offset(3, 4), Some(3 * 16));
+        assert_eq!(mapper_request_entry_offset(4, 4), Some(0));
+        assert_eq!(mapper_request_entry_offset(9, 4), Some(16));
+        assert_eq!(mapper_request_entry_offset(u32::MAX, 64), Some(63 * 16));
+        assert_eq!(mapper_request_entry_offset(5, 0), None);
+        assert_eq!(mapper_request_published_entry_offset(0, 4), None);
+        assert_eq!(mapper_request_published_entry_offset(5, 4), Some(0));
+        assert_eq!(mapper_request_published_entry_offset(5, 0), None);
     }
 
     #[test]
