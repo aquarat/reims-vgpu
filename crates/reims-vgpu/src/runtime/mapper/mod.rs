@@ -11,9 +11,8 @@ use crate::model::{DeviceState, MapperCapture};
 use crate::protocol::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
     mapper_request_published_entry_offset, mapping_span_bound, read_internal_desc_ptr,
-    read_mapper_identity, read_mapper_internal, validate_mapper_internal, PagesMemory,
-    DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
-    MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
+    read_mapper_identity, read_mapper_internal, validate_mapper_internal, MapperKextLayout,
+    PagesMemory, DEVICE_DESC_LEN, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
     MAPPER_REQUEST_UNMAP,
 };
 use crate::runtime::host::{HostMemory, HostOps, MemError};
@@ -217,40 +216,60 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     // per (mapping_id, reason). The mapping's MappingInternal never attaches and
     // downstream present/Store paints black otherwise.
     let mid = request.mapping_id;
-    let mapper = match host.read_xreg(MAPPER_CAPTURE_REG_MAPPER_DEVICE) {
-        Ok(value) => value,
-        Err(error) => {
-            let decline = MapperDecline::CaptureMapperXregRead(error);
+    // Which kext build published this request is answered by the registers
+    // themselves: the layout whose request-type register holds the type the
+    // ring entry carries. See `MapperKextLayout` for the two known builds.
+    let read_reg =
+        |index: u32, decline: fn(MemError) -> MapperDecline| host.read_xreg(index).map_err(decline);
+    let mut seen_types = Vec::with_capacity(MapperKextLayout::ALL.len());
+    let mut first_read_error = None;
+    let mut chosen = None;
+    for layout in MapperKextLayout::ALL {
+        let regs = layout.capture_regs();
+        let rtype = match read_reg(regs.request_type, MapperDecline::CaptureRequestTypeXregRead) {
+            Ok(value) => value as u32,
+            Err(decline) => {
+                // A register this host cannot read rules out that layout, not
+                // the capture: the other layout's registers may still answer.
+                first_read_error.get_or_insert(decline);
+                continue;
+            }
+        };
+        seen_types.push(rtype);
+        if rtype == request.request_type {
+            chosen = Some((layout, regs, rtype));
+            break;
+        }
+    }
+    if chosen.is_none() && seen_types.is_empty() {
+        if let Some(decline) = first_read_error {
             return capture_xreg_failed(mid, producer, decline);
         }
-    };
-    let rtype = match host.read_xreg(MAPPER_CAPTURE_REG_REQUEST_TYPE) {
-        Ok(value) => value as u32,
-        Err(error) => {
-            let decline = MapperDecline::CaptureRequestTypeXregRead(error);
-            return capture_xreg_failed(mid, producer, decline);
-        }
-    };
-    let internal = match host.read_xreg(MAPPER_CAPTURE_REG_MAPPING_INTERNAL) {
-        Ok(value) => value,
-        Err(error) => {
-            let decline = MapperDecline::CaptureInternalXregRead(error);
-            return capture_xreg_failed(mid, producer, decline);
-        }
-    };
-    if rtype != request.request_type {
+    }
+    let Some((layout, regs, rtype)) = chosen else {
         let decline = MapperDecline::CaptureRequestTypeMismatch;
         note_capture_fail(
             mid,
             crate::observe::Decline::slug(&decline),
             crate::observe::Emit::decline("mapper_capture_fail", &decline)
                 .field("mapping", mid)
-                .field("rtype", rtype)
+                .field("rtypes", format!("{seen_types:?}"))
                 .field("request_type", request.request_type)
                 .render(),
         );
         return None;
-    }
+    };
+    let mapper = match read_reg(regs.mapper_device, MapperDecline::CaptureMapperXregRead) {
+        Ok(value) => value,
+        Err(decline) => return capture_xreg_failed(mid, producer, decline),
+    };
+    let internal = match read_reg(
+        regs.mapping_internal,
+        MapperDecline::CaptureInternalXregRead,
+    ) {
+        Ok(value) => value,
+        Err(decline) => return capture_xreg_failed(mid, producer, decline),
+    };
     if internal == 0 {
         let decline = MapperDecline::CaptureInternalZero;
         note_capture_fail(
@@ -288,7 +307,7 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
     }
 
     let mem = MapperMem::new(host);
-    let fields = match read_mapper_identity(&mem, internal, mapper != 0, mapper) {
+    let fields = match read_mapper_identity(&mem, layout, internal, mapper != 0, mapper) {
         Ok(f) => f,
         Err(status) => {
             let reason = refusal_reason(&status);
@@ -320,11 +339,19 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
         return None;
     }
 
+    if crate::observe::first_sight("mapper_kext_layout", layout as u64) {
+        crate::observe::off(format!(
+            "mapper_kext_layout layout={} mapping={mid} (the guest IOSurface mapper's handoff \
+             registers and MappingInternal layout this device reads)",
+            layout.slug()
+        ));
+    }
     Some(MapperCapture {
         producer,
         mapper_device_kva: mapper,
         request_type: rtype,
         mapping_internal: internal,
+        layout,
     })
 }
 
@@ -344,6 +371,7 @@ pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u
     if cap.mapper_device_kva != 0 {
         state.mapper_device_kva = cap.mapper_device_kva;
     }
+    state.mapper_layout = cap.layout;
     state.attach_mapping_internal(mapping_id, cap.mapping_internal)
 }
 
@@ -368,7 +396,8 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     let had_cached_pages = cached_pages != 0;
     let mem = MapperMem::new(host);
 
-    let fields = match read_mapper_internal(&mem, internal, mapper != 0, mapper) {
+    let layout = state.mapper_layout;
+    let fields = match read_mapper_internal(&mem, layout, internal, mapper != 0, mapper) {
         Ok(f) => f,
         Err(status) => {
             let reason = refusal_reason(&status);
@@ -447,7 +476,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     let guest_page = state.page_size();
     let mut min_size = guest_page;
     let mut device_desc: Option<Vec<u8>> = None;
-    match read_internal_desc_ptr(&mem, internal) {
+    match read_internal_desc_ptr(&mem, &fields) {
         Ok(desc_kva) => {
             let mut desc = [0u8; DEVICE_DESC_LEN];
             if !mem.read(desc_kva, &mut desc) {

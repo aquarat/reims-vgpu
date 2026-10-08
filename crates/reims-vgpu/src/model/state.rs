@@ -1758,6 +1758,8 @@ pub struct MapperCapture {
     pub request_type: u32,
     /// Guest kernel VA of MappingInternal.
     pub mapping_internal: u64,
+    /// The kext build whose registers corroborated this request.
+    pub layout: crate::protocol::iosurface_pages::MapperKextLayout,
 }
 
 /// Which incarnation of the pages behind a task-local name a value describes.
@@ -3388,6 +3390,9 @@ pub struct DeviceState {
     pub mapper_capture: Option<MapperCapture>,
     /// Cached IOSurfaceParavirtMapperDevice KVA from capture.
     pub mapper_device_kva: u64,
+    /// The guest mapper kext build the last applied capture corroborated; it
+    /// selects how a `MappingInternal` is read.
+    pub mapper_layout: crate::protocol::iosurface_pages::MapperKextLayout,
     /// Sync value table for event + encoder fence domains.
     ///
     /// Key: `(task_id, domain_tag, ref)` → value (event: explicit signal value;
@@ -3584,6 +3589,7 @@ impl DeviceState {
             },
             mapper_capture: None,
             mapper_device_kva: 0,
+            mapper_layout: Default::default(),
             display: DisplayHandshake::default(),
             #[cfg(test)]
             fails: Vec::new(),

@@ -6,6 +6,10 @@
 //! quarter of the file that was hardest to find.
 
 use super::selected_within;
+use crate::protocol::iosurface_pages::{
+    MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
+    MAPPER_CAPTURE_REG_REQUEST_TYPE,
+};
 
 fn sel(ranges: Option<&[(u64, u64)]>, lo: u64, hi: u64) -> Vec<(u64, u64)> {
     selected_within(ranges, lo, hi).collect()
@@ -1299,4 +1303,43 @@ fn transient_views_still_unmap_at_mapping_retirement() {
 
     assert!(state.retired_views.is_empty());
     assert_eq!(host.unmap_pages_calls, 1);
+}
+
+/// The macOS 26 kext keeps the request type in `x20` and the `MappingInternal*`
+/// in `x21`; `x21` therefore holds a kernel pointer, whose low half never equals
+/// a request type, and that is what selects the layout.
+#[test]
+fn a_macos26_capture_is_corroborated_by_its_own_registers() {
+    use crate::protocol::iosurface_pages::{
+        MapperKextLayout, MACOS26_INTERNAL_DESC_CAPACITY, MACOS26_INTERNAL_DESC_KIND,
+        MACOS26_INTERNAL_DESC_OFFSET,
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let ring = 0x7200_0000u64;
+    state.iosfc.ring_base = ring;
+    let mut entry = [0u8; 16];
+    st32(&mut entry[0..], MAPPER_REQUEST_MAP);
+    st32(&mut entry[4..], 7);
+    host.map_range(ring, 16, 0);
+    let _ = host.write_gpa(ring, &entry);
+
+    let internal = KVA + 0x4_0000;
+    let mapper = KVA + 0x5_0000;
+    put_u64(&mut host, internal + MAPPING_INTERNAL_BACKPTR, mapper);
+    put_u32(&mut host, internal + MAPPING_INTERNAL_ID, 7);
+    put_u32(&mut host, internal + MACOS26_INTERNAL_DESC_CAPACITY, 0x2000);
+    put_u32(&mut host, internal + MACOS26_INTERNAL_DESC_OFFSET, 0x200);
+    put_u32(&mut host, internal + MACOS26_INTERNAL_DESC_KIND, 0);
+
+    host.set_xreg(19, mapper);
+    host.set_xreg(20, MAPPER_REQUEST_MAP as u64);
+    host.set_xreg(21, internal);
+    host.set_xreg(22, KVA + 0x9_9990);
+
+    let cap = capture_at_producer(&state, &host, 1).expect("capture");
+    assert_eq!(cap.layout, MapperKextLayout::Macos26);
+    assert_eq!(cap.mapping_internal, internal);
+    assert!(apply_capture(&mut state, &cap, 7));
+    assert_eq!(state.mapper_layout, MapperKextLayout::Macos26);
 }
