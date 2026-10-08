@@ -328,6 +328,28 @@ impl Scheduler {
             .collect()
     }
 
+    /// Stop `ingress` waiting for `pipeline`, and make it ready if that was
+    /// the last thing it waited for.
+    ///
+    /// For work [`Self::pipeline_refused`] named as stranded and its caller
+    /// decided to run anyway — the guest deleting a pipeline after encoding
+    /// work that binds it, which the API it implements allows. Answers whether
+    /// the transaction is now ready.
+    pub fn drop_pipeline_wait(&mut self, ingress: IngressOrdinal, pipeline: ResourceId) -> bool {
+        let Some(p) = self.pending.get_mut(&ingress) else {
+            return false;
+        };
+        let before = p.pipeline_waits.len();
+        p.pipeline_waits.retain(|id| *id != pipeline);
+        // Only the step that removed the wait may ready it: a transaction
+        // already readied (and perhaps already taken) must not be listed again.
+        if p.pipeline_waits.len() != before && p.is_ready() {
+            self.ready.insert(ingress);
+            return true;
+        }
+        false
+    }
+
     /// Transactions waiting on a pipeline that is still being built.
     #[must_use]
     pub fn waiting_on_pipelines(&self) -> usize {
