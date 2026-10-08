@@ -95,6 +95,7 @@ impl crate::observe::Decline for DecodeStatus {
 /// | 8 | `addChildResource` | `createSerializerTexture` | both |
 /// | 11 | `allocateMapperRefTextureHandle` | `createMapperRefTexture` | arm |
 /// | 12 | `allocateTextureHandle` | `createNormalTexture`, dual-plane | arm |
+/// | 9 | `AppleParavirtDevice::createMemorylessTexture` | `newTextureWithDescriptor` | arm |
 /// | 13, 14, 15 | heap, heap buffer, mapper-ref buffer | `createHeap*`, `createMapperRefBuffer` | arm |
 ///
 /// **2 and 3 differ only in who builds the mip chain.** Both are one
@@ -116,6 +117,99 @@ pub const OBJECT_TYPE_FUNCTION: u8 = 6;
 pub const OBJECT_TYPE_SERIALIZER_OBJECT: u8 = 7;
 pub const OBJECT_TYPE_TEXTURE_VIEW: u8 = 8;
 pub const OBJECT_TYPE_MAPPER_REF_TEXTURE: u8 = 11;
+
+/// A texture with `MTLStorageModeMemoryless`: an attachment that exists only
+/// for the duration of a render pass and has no guest storage at all.
+///
+/// The arm64 guest kext assigns it in `AppleParavirtDevice::createMemorylessTexture`
+/// (reached from the device user client's `s_createMemorylessTexture`), which
+/// validates a serializer command and hands it to `createObjectInternal` with
+/// this tag — the same shape as `createObject` with tag 7. The descriptor is
+/// therefore the serializer's own texture-creation record (opcode 1, or `0x34`
+/// with swizzled textures on), whose `resource_options` declares storage mode
+/// memoryless (`0x30`) and whose object ref is the slot itself.
+///
+/// macOS 26's compositor attaches one of these as colour attachment 1 of
+/// nearly every pass it encodes (1920x1080 `RGBA16Float` beside the display
+/// plane), so a device without this tag drops every compositor draw. Earlier
+/// guests never emitted it.
+///
+/// Nothing reads or writes it outside the pass: Metal forbids a memoryless
+/// texture from being sampled, blitted or stored, so its contents are the
+/// pass's own and the attachment needs a host image and nothing else. See
+/// [`decode_memoryless_texture_descriptor`].
+pub const OBJECT_TYPE_MEMORYLESS_TEXTURE: u8 = 9;
+
+/// `MTLStorageModeMemoryless` as it appears in `resource_options[7:4]`.
+pub const STORAGE_MODE_MEMORYLESS: u8 = 3;
+
+/// The decoded creation record behind an [`OBJECT_TYPE_MEMORYLESS_TEXTURE`]
+/// entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemorylessTextureDescriptor {
+    /// The ref the guest's allocator assigned, carried by the record itself.
+    pub object_ref: u32,
+    pub descriptor: heap_query::TextureDescriptor,
+}
+
+/// Decode the descriptor of a tag-9 entry.
+///
+/// Dispatches on the record's opcode and requires the length that opcode
+/// implies, exactly as [`decode_heap_texture`] does for the heap form. The
+/// declared storage mode must be memoryless: a tag-9 entry that declares any
+/// other storage would need guest pages this record does not name, so it is a
+/// refusal rather than a texture with no backing.
+pub fn decode_memoryless_texture_descriptor(
+    bytes: &[u8],
+) -> Result<MemorylessTextureDescriptor, DecodeStatus> {
+    let op = reims_vgpu_wire::op(bytes, 0)
+        .map_err(|_| DecodeStatus::ErrShort("res_memoryless_texture_short"))?;
+    if op.length() as usize != bytes.len() {
+        return Err(DecodeStatus::ErrShort("res_memoryless_texture_len"));
+    }
+    let (object_ref, descriptor) = match op.opcode() {
+        reims_vgpu_wire::ops::texture::OPCODE_NEW_TEXTURE => {
+            if op.length() != reims_vgpu_wire::ops::texture::NEW_TEXTURE_TOTAL_LEN {
+                return Err(DecodeStatus::ErrShort("res_memoryless_texture_len"));
+            }
+            let b = reims_vgpu_wire::ops::texture::new_texture(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_memoryless_texture_len"))?;
+            let at = OP_HDR + offset_of!(reims_vgpu_wire::ops::texture::NewTextureBody, desc);
+            let d = heap_query::decode_serialized_texture_descriptor(
+                &bytes[at..at + heap_query::TEXTURE_BODY_LEN],
+            )
+            .map_err(|_| DecodeStatus::ErrShort("res_memoryless_texture_desc"))?;
+            (b.object_ref.get(), d)
+        }
+        reims_vgpu_wire::ops::texture::OPCODE_NEW_TEXTURE_WIDE => {
+            if op.length() != reims_vgpu_wire::ops::texture::NEW_TEXTURE_WIDE_TOTAL_LEN {
+                return Err(DecodeStatus::ErrShort("res_memoryless_texture_len"));
+            }
+            let b = reims_vgpu_wire::ops::texture::new_texture_wide(&op)
+                .map_err(|_| DecodeStatus::ErrShort("res_memoryless_texture_len"))?;
+            let at = OP_HDR + offset_of!(reims_vgpu_wire::ops::texture::NewTextureWideBody, desc);
+            let d = heap_query::decode_wide_serialized_texture_descriptor(
+                &bytes[at..at + heap_query::WIDE_TEXTURE_BODY_LEN],
+            )
+            .map_err(|_| DecodeStatus::ErrShort("res_memoryless_texture_desc"))?;
+            (b.object_ref.get(), d)
+        }
+        _ => {
+            return Err(DecodeStatus::ErrUnsupported(
+                "res_memoryless_texture_opcode",
+            ))
+        }
+    };
+    if ((descriptor.resource_options >> 4) & 0xf) as u8 != STORAGE_MODE_MEMORYLESS {
+        return Err(DecodeStatus::ErrUnsupported(
+            "res_memoryless_texture_storage_mode",
+        ));
+    }
+    Ok(MemorylessTextureDescriptor {
+        object_ref,
+        descriptor,
+    })
+}
 
 /// A texture whose storage the guest describes as **two planes**.
 ///

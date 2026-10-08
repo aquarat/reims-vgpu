@@ -5619,6 +5619,9 @@ fn render_pass_attachment_template(first: &draw::DrawEncodeRequest) -> draw::Dra
             clear_color: c.clear_color,
             target_seed_rgba: None,
             multisample_source_ref: c.multisample_source_ref,
+            // Within one pass a memoryless attachment keeps what earlier
+            // records drew, so the template's LOAD is right for it too.
+            memoryless: c.memoryless,
         })
         .collect();
     draw::DrawEncodeRequest {

@@ -6555,6 +6555,30 @@ fn note_mapper_ref_texture_store_route(route: &'static str) {
 /// what Vulkan ought to do: `backend::metal::render` attaches every entry of
 /// this same colour list at its own slot number and has never degraded, so the
 /// two arms disagreed about one wire form and only one of them was silent.
+/// The residency identity of a memoryless colour attachment.
+///
+/// A memoryless texture has no guest address and no mapping, so neither of the
+/// namespaces the other attachments use can name it; it is named by the
+/// `(task, ref)` the guest gave it. The resident it keys holds nothing the guest
+/// can observe — Metal forbids loading, storing, sampling or blitting such a
+/// texture — so reuse across passes only saves an allocation, and a pass that
+/// asks for a clear still gets one. Bit 62 tags the namespace, clear of the
+/// depth chain's bit 63 and of the small counters the engine's own anonymous
+/// slots use.
+pub(super) fn memoryless_identity(
+    task_id: u32,
+    texture_ref: u32,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    const MEMORYLESS_TAG_BIT: u32 = 62;
+    const TASK_SHIFT: u32 = 32;
+    const TASK_MASK: u64 = (1 << (MEMORYLESS_TAG_BIT - TASK_SHIFT)) - 1;
+    crate::backend::vulkan::engine::TargetIdentity::Anonymous {
+        slot: (1u64 << MEMORYLESS_TAG_BIT)
+            | ((u64::from(task_id) & TASK_MASK) << TASK_SHIFT)
+            | u64::from(texture_ref),
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
@@ -6639,7 +6663,9 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // Without one this attachment is keyed on `(gva, width, height)` alone
         // and two guest allocations reusing that address at that geometry share
         // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let identity = if c.target_gva != 0 {
+        let identity = if c.memoryless {
+            memoryless_identity(task_id, c.texture_ref)
+        } else if c.target_gva != 0 {
             TargetIdentity::Gva {
                 gva: c.target_gva,
                 width: c.width,
