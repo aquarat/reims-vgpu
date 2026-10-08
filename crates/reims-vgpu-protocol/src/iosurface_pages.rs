@@ -53,6 +53,91 @@ pub const MAPPER_CAPTURE_REG_MAPPER_DEVICE: u32 = 19;
 pub const MAPPER_CAPTURE_REG_REQUEST_TYPE: u32 = 21;
 pub const MAPPER_CAPTURE_REG_MAPPING_INTERNAL: u32 = 22;
 
+/// Which build of the guest's `AppleParavirtIOSurface` kext this device faces.
+///
+/// The capture contract is the guest kext's own register allocation and its
+/// `IOSurfaceParavirtMappingInternal` layout, so both move with the kext. Two
+/// builds are known:
+///
+/// - [`Self::Legacy`] (macOS 13–15): at the producer store of
+///   `do_host_mapping_gated` the mapper device is in `x19`, the request type in
+///   `x21` and the `MappingInternal*` in `x22`; the internal holds the device
+///   descriptor pointer at `+0x38` (`0x200` bytes, size at `+0x40`), the page
+///   table object at `+0x48` (table pointer at `+0xb8` of it) and the page
+///   count at `+0x70`.
+/// - [`Self::Macos26`] (macOS 26): the same function keeps the request type in
+///   `x20` and the `MappingInternal*` in `x21` (`x19` is still the mapper
+///   device). The internal carries two descriptor *spans* — `{base +0x38,
+///   capacity +0x40 (u32), offset +0x44 (u32)}` for the `0x200`-byte device
+///   descriptor and `{+0x48, +0x50, +0x54}` for a `0x400`-byte one, selected by
+///   bit 0 of the byte at `+0x94` — and the page table is no longer reachable
+///   through a fixed object offset. `wire_mapping` writes it into the
+///   descriptor itself: word 0 is a page entry (`pfn << 2 | flags`) naming the
+///   root table page, whose entries are either leaf entries (`flags == 1`) or,
+///   for a surface needing more than one table page, directory entries
+///   (`flags == 3`) naming the leaf table pages. The leaf count is at `+0x80`
+///   (`+0x70` and `+0x78` are the directory page and directory entry counts).
+///
+/// A build is selected per request by which register triple's request type
+/// equals the type the ring entry carries — the low half of a kernel pointer
+/// never equals 1 or 2 — so the selection is the guest's own corroboration
+/// rather than a version string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MapperKextLayout {
+    #[default]
+    Legacy,
+    Macos26,
+}
+
+/// The three handoff registers of one [`MapperKextLayout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapperCaptureRegs {
+    pub mapper_device: u32,
+    pub request_type: u32,
+    pub mapping_internal: u32,
+}
+
+impl MapperKextLayout {
+    pub const ALL: [Self; 2] = [Self::Legacy, Self::Macos26];
+
+    pub fn capture_regs(self) -> MapperCaptureRegs {
+        match self {
+            Self::Legacy => MapperCaptureRegs {
+                mapper_device: MAPPER_CAPTURE_REG_MAPPER_DEVICE,
+                request_type: MAPPER_CAPTURE_REG_REQUEST_TYPE,
+                mapping_internal: MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
+            },
+            Self::Macos26 => MapperCaptureRegs {
+                mapper_device: 19,
+                request_type: 20,
+                mapping_internal: 21,
+            },
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Macos26 => "macos26",
+        }
+    }
+}
+
+/// macOS 26 `MappingInternal` descriptor spans; see [`MapperKextLayout::Macos26`].
+pub const MACOS26_INTERNAL_DESC_BASE: u64 = 0x38;
+pub const MACOS26_INTERNAL_DESC_CAPACITY: u64 = 0x40;
+pub const MACOS26_INTERNAL_DESC_OFFSET: u64 = 0x44;
+pub const MACOS26_INTERNAL_WIDE_DESC_BASE: u64 = 0x48;
+pub const MACOS26_INTERNAL_WIDE_DESC_CAPACITY: u64 = 0x50;
+pub const MACOS26_INTERNAL_WIDE_DESC_OFFSET: u64 = 0x54;
+pub const MACOS26_INTERNAL_LEAF_PAGE_COUNT: u64 = 0x80;
+pub const MACOS26_INTERNAL_DESC_KIND: u64 = 0x94;
+/// Length of the descriptor the wide span holds.
+pub const MACOS26_WIDE_DESC_LEN: u32 = 0x400;
+/// Flags of a directory entry in a two-level macOS 26 page table.
+pub const MACOS26_PAGE_ENTRY_DIRECTORY: u32 = 0x3;
+const PAGE_ENTRY_FLAGS_MASK: u32 = 0x3;
+
 pub const ROW_BYTES_ALIGN: u64 = 128;
 pub const DEVICE_PLANE_DESC_LEN: usize = 0x40;
 pub const DEVICE_PLANE_OFFSET: usize = 0x08;
@@ -214,6 +299,11 @@ pub struct MapperRequestEntry {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MapperInternalFields {
+    pub layout: MapperKextLayout,
+    /// macOS 26: the descriptor's offset inside its span, and whether it is the
+    /// wide (`0x400`) one. Zero and `false` on [`MapperKextLayout::Legacy`].
+    pub desc_offset: u32,
+    pub wide_desc: bool,
     pub internal_kva: u64,
     pub has_mapper_device: bool,
     pub mapper_device_kva: u64,
@@ -675,6 +765,7 @@ fn read_u64_at(mem: &dyn PagesMemory, base: u64, offset: u64) -> Option<u64> {
 
 pub fn read_mapper_identity(
     mem: &dyn PagesMemory,
+    layout: MapperKextLayout,
     internal_kva: u64,
     has_mapper_device: bool,
     mapper_device_kva: u64,
@@ -695,10 +786,42 @@ pub fn read_mapper_identity(
     let mapping_id = read_u32_at(mem, internal_kva, MAPPING_INTERNAL_ID).ok_or(
         Status::ErrInternalRead("iosurface_mapper_internal_mapping_id_read"),
     )?;
-    let internal_size = read_u32_at(mem, internal_kva, MAPPING_INTERNAL_SIZE).ok_or(
-        Status::ErrInternalRead("iosurface_mapper_internal_size_read"),
-    )?;
+    let (internal_size, desc_offset, wide_desc) = match layout {
+        MapperKextLayout::Legacy => (
+            read_u32_at(mem, internal_kva, MAPPING_INTERNAL_SIZE).ok_or(
+                Status::ErrInternalRead("iosurface_mapper_internal_size_read"),
+            )?,
+            0,
+            false,
+        ),
+        MapperKextLayout::Macos26 => {
+            let mut kind = [0u8; 1];
+            let kind_at = checked_add_u64(internal_kva, MACOS26_INTERNAL_DESC_KIND)
+                .ok_or(Status::ErrInternalRead("iosurface_mapper_desc_kind_read"))?;
+            if !mem.read(kind_at, &mut kind) {
+                return Err(Status::ErrInternalRead("iosurface_mapper_desc_kind_read"));
+            }
+            let wide = kind[0] & 1 != 0;
+            let (cap_at, off_at) = if wide {
+                (
+                    MACOS26_INTERNAL_WIDE_DESC_CAPACITY,
+                    MACOS26_INTERNAL_WIDE_DESC_OFFSET,
+                )
+            } else {
+                (MACOS26_INTERNAL_DESC_CAPACITY, MACOS26_INTERNAL_DESC_OFFSET)
+            };
+            let capacity = read_u32_at(mem, internal_kva, cap_at).ok_or(
+                Status::ErrInternalRead("iosurface_mapper_internal_size_read"),
+            )?;
+            let offset = read_u32_at(mem, internal_kva, off_at)
+                .ok_or(Status::ErrInternalRead("iosurface_mapper_desc_offset_read"))?;
+            (capacity, offset, wide)
+        }
+    };
     Ok(MapperInternalFields {
+        layout,
+        desc_offset,
+        wide_desc,
         internal_kva,
         has_mapper_device,
         mapper_device_kva,
@@ -713,11 +836,25 @@ pub fn read_mapper_identity(
 
 pub fn read_mapper_internal(
     mem: &dyn PagesMemory,
+    layout: MapperKextLayout,
     internal_kva: u64,
     has_mapper_device: bool,
     mapper_device_kva: u64,
 ) -> Result<MapperInternalFields, Status> {
-    let mut fields = read_mapper_identity(mem, internal_kva, has_mapper_device, mapper_device_kva)?;
+    let mut fields = read_mapper_identity(
+        mem,
+        layout,
+        internal_kva,
+        has_mapper_device,
+        mapper_device_kva,
+    )?;
+    if layout == MapperKextLayout::Macos26 {
+        // The page table is reached through the descriptor, not through these
+        // two fields; only the leaf count is read here.
+        fields.raw_page_count = read_u64_at(mem, internal_kva, MACOS26_INTERNAL_LEAF_PAGE_COUNT)
+            .ok_or(Status::ErrInternalRead("iosurface_mapper_page_count_read"))?;
+        return Ok(fields);
+    }
     fields.page_field_48 = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_PAGE_FIELD_48).ok_or(
         Status::ErrInternalRead("iosurface_mapper_page_field_48_read"),
     )?;
@@ -729,10 +866,26 @@ pub fn read_mapper_internal(
     Ok(fields)
 }
 
-pub fn read_internal_desc_ptr(mem: &dyn PagesMemory, internal_kva: u64) -> Result<u64, Status> {
-    let desc_kva = read_u64_at(mem, internal_kva, MAPPING_INTERNAL_DESC_PTR).ok_or(
-        Status::ErrInternalRead("iosurface_mapper_device_desc_pointer_read"),
-    )?;
+pub fn read_internal_desc_ptr(
+    mem: &dyn PagesMemory,
+    fields: &MapperInternalFields,
+) -> Result<u64, Status> {
+    let internal_kva = fields.internal_kva;
+    let base_at = match (fields.layout, fields.wide_desc) {
+        (MapperKextLayout::Macos26, true) => MACOS26_INTERNAL_WIDE_DESC_BASE,
+        (MapperKextLayout::Macos26, false) => MACOS26_INTERNAL_DESC_BASE,
+        (MapperKextLayout::Legacy, _) => MAPPING_INTERNAL_DESC_PTR,
+    };
+    let base = read_u64_at(mem, internal_kva, base_at).ok_or(Status::ErrInternalRead(
+        "iosurface_mapper_device_desc_pointer_read",
+    ))?;
+    let desc_kva = if base == 0 {
+        0
+    } else {
+        checked_add_u64(base, u64::from(fields.desc_offset)).ok_or(Status::ErrInternalFields(
+            "iosurface_mapper_device_desc_pointer_invalid",
+        ))?
+    };
     if desc_kva == 0 {
         return Err(Status::ErrInternalFields(
             "iosurface_mapper_device_desc_pointer_zero",
@@ -757,8 +910,29 @@ pub fn validate_mapper_internal(
     if fields.mapping_id != expected_mapping_id {
         return Status::ErrInternalMappingId("iosurface_validate_mapping_id_mismatch");
     }
-    if fields.internal_size != MAPPING_INTERNAL_EXPECTED_SIZE {
-        return Status::ErrInternalSize("iosurface_validate_internal_size_mismatch");
+    match fields.layout {
+        MapperKextLayout::Legacy => {
+            if fields.internal_size != MAPPING_INTERNAL_EXPECTED_SIZE {
+                return Status::ErrInternalSize("iosurface_validate_internal_size_mismatch");
+            }
+        }
+        MapperKextLayout::Macos26 => {
+            // The kext's own bound: the descriptor lies wholly inside its span,
+            // and the offset is a non-negative `i32`.
+            let len = if fields.wide_desc {
+                MACOS26_WIDE_DESC_LEN
+            } else {
+                MAPPING_INTERNAL_EXPECTED_SIZE
+            };
+            if fields.desc_offset > i32::MAX as u32
+                || fields
+                    .desc_offset
+                    .checked_add(len)
+                    .is_none_or(|end| end > fields.internal_size)
+            {
+                return Status::ErrInternalSize("iosurface_validate_desc_span_mismatch");
+            }
+        }
     }
     if fields.has_mapper_device {
         if !mem.is_kernel_va(fields.mapper_device_kva) {
@@ -801,6 +975,9 @@ pub fn build_table_plan(
     let st = validate_mapper_internal(mem, expected_mapping_id, fields);
     if st != Status::Ok {
         return Err(st);
+    }
+    if fields.layout == MapperKextLayout::Macos26 {
+        return build_descriptor_table_plan(mem, fields, min_size, page_shift);
     }
     let field_48_populated = mem.is_kernel_va(fields.page_field_48);
     let field_50_populated = mem.is_kernel_va(fields.page_field_50);
@@ -860,6 +1037,67 @@ pub fn build_table_plan(
         candidates: CandidateOutcome {
             other_field_populated: field_50_populated,
         },
+    })
+}
+
+/// macOS 26: walk the page table the device descriptor's word 0 names, in guest
+/// physical memory. See [`MapperKextLayout::Macos26`] for the shape.
+fn build_descriptor_table_plan(
+    mem: &dyn PagesMemory,
+    fields: &MapperInternalFields,
+    min_size: u64,
+    page_shift: u32,
+) -> Result<PageTablePlan, Status> {
+    let desc_kva = read_internal_desc_ptr(mem, fields)?;
+    let root_entry = read_u32(mem, desc_kva)
+        .ok_or(Status::ErrPageTableRead("iosurface_descriptor_root_read"))?;
+    let root = entry_gpa_shift(root_entry, page_shift)
+        .ok_or(Status::ErrNoPageTable("iosurface_descriptor_root_invalid"))?;
+    if !mem.is_ram_gpa(root) {
+        return Err(Status::ErrNoPageTable("iosurface_descriptor_root_not_ram"));
+    }
+    let required_pages = span_page_count_shift(min_size, page_shift);
+    let pages = required_entry_count(fields, min_size, page_shift)?;
+    let per_table = (1u64 << page_shift) / U32_SIZE as u64;
+    let first =
+        read_u32(mem, root).ok_or(Status::ErrPageTableRead("iosurface_page_table_entry_read"))?;
+    let entries = if first & PAGE_ENTRY_FLAGS_MASK == MACOS26_PAGE_ENTRY_DIRECTORY {
+        let tables = (u64::from(pages)).div_ceil(per_table);
+        if tables > per_table {
+            return Err(Status::ErrPageCount("iosurface_page_directory_overflow"));
+        }
+        let mut entries = Vec::with_capacity(pages as usize);
+        for t in 0..tables {
+            let dir = read_u32_at(mem, root, t * U32_SIZE as u64).ok_or(
+                Status::ErrPageTableRead("iosurface_page_directory_entry_read"),
+            )?;
+            if dir & PAGE_ENTRY_FLAGS_MASK != MACOS26_PAGE_ENTRY_DIRECTORY {
+                return Err(Status::ErrPageEntry(
+                    "iosurface_page_directory_entry_invalid",
+                ));
+            }
+            let table = entry_gpa_shift(dir, page_shift).ok_or(Status::ErrPageEntry(
+                "iosurface_page_directory_entry_invalid",
+            ))?;
+            if !mem.is_ram_gpa(table) {
+                return Err(Status::ErrPageEntry("iosurface_page_table_gpa_not_ram"));
+            }
+            let n = (u64::from(pages) - t * per_table).min(per_table) as u32;
+            entries.extend(read_table_entries(mem, table, n, page_shift)?);
+        }
+        entries
+    } else {
+        if u64::from(pages) > per_table {
+            return Err(Status::ErrPageCount("iosurface_page_table_single_overflow"));
+        }
+        read_table_entries(mem, root, pages, page_shift)?
+    };
+    Ok(PageTablePlan {
+        entries,
+        page_table_kva: root,
+        min_size,
+        required_pages,
+        candidates: CandidateOutcome::default(),
     })
 }
 
@@ -1142,9 +1380,99 @@ mod tests {
         m.put_u64(kva + MAPPING_INTERNAL_BACKPTR, kva);
         m.put_u32(kva + MAPPING_INTERNAL_ID, 1);
         m.put_u32(kva + MAPPING_INTERNAL_SIZE, MAPPING_INTERNAL_EXPECTED_SIZE);
-        let f = read_mapper_identity(&m, kva, false, 0).unwrap();
+        let f = read_mapper_identity(&m, MapperKextLayout::Legacy, kva, false, 0).unwrap();
         assert_eq!(f.mapping_id, 1);
         assert_eq!(validate_mapper_internal(&m, 1, &f), Status::Ok);
+    }
+
+    /// A macOS 26 `MappingInternal` as its `init` and `wire_mapping` leave it:
+    /// a descriptor at `span base + offset` whose word 0 names the root table.
+    fn macos26_internal(m: &mut MapMem, kva: u64, desc_base: u64, root: u64, pages: u64) {
+        m.put_u64(kva + MAPPING_INTERNAL_BACKPTR, kva);
+        m.put_u32(kva + MAPPING_INTERNAL_ID, 7);
+        m.put_u64(kva + MACOS26_INTERNAL_DESC_BASE, desc_base);
+        m.put_u32(kva + MACOS26_INTERNAL_DESC_CAPACITY, 0x2000);
+        m.put_u32(kva + MACOS26_INTERNAL_DESC_OFFSET, 0x600);
+        m.map.insert(kva + MACOS26_INTERNAL_DESC_KIND, 0);
+        m.put_u64(kva + MACOS26_INTERNAL_LEAF_PAGE_COUNT, pages);
+        let root_pfn = (root >> PAGE_SHIFT_ARM64E) as u32;
+        m.put_u32(
+            desc_base + 0x600,
+            (root_pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+        );
+    }
+
+    #[test]
+    fn a_macos26_mapping_walks_a_single_level_table_from_its_descriptor() {
+        let mut m = MapMem::new();
+        let kva = ARM_KERNEL_VA_BASE + 0x10000;
+        let desc_base = ARM_KERNEL_VA_BASE + 0x80000;
+        let root = 0x4_0000u64;
+        macos26_internal(&mut m, kva, desc_base, root, 2);
+        m.put_u32(root, (0x100 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
+        m.put_u32(root + 4, (0x101 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
+        let f = read_mapper_internal(&m, MapperKextLayout::Macos26, kva, false, 0).unwrap();
+        assert_eq!(f.desc_offset, 0x600);
+        assert_eq!(validate_mapper_internal(&m, 7, &f), Status::Ok);
+        assert_eq!(read_internal_desc_ptr(&m, &f).unwrap(), desc_base + 0x600);
+        let plan =
+            build_table_plan(&m, 7, &f, 2 * PAGE_SIZE_ARM64E, PAGE_SHIFT_ARM64E).expect("plan");
+        assert_eq!(
+            plan.entries,
+            vec![
+                (0x100 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                (0x101 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+            ]
+        );
+        assert_eq!(plan.page_table_kva, root);
+    }
+
+    #[test]
+    fn a_macos26_mapping_walks_a_directory_into_its_leaf_tables() {
+        let mut m = MapMem::new();
+        let kva = ARM_KERNEL_VA_BASE + 0x10000;
+        let desc_base = ARM_KERNEL_VA_BASE + 0x80000;
+        let root = 0x4_0000u64;
+        let per_table = PAGE_SIZE_ARM64E / 4;
+        let pages = per_table + 1;
+        macos26_internal(&mut m, kva, desc_base, root, pages);
+        let tables = [0x8_0000u64, 0xc_0000u64];
+        for (i, t) in tables.iter().enumerate() {
+            let pfn = (t >> PAGE_SHIFT_ARM64E) as u32;
+            m.put_u32(
+                root + 4 * i as u64,
+                (pfn << PAGE_ENTRY_PFN_SHIFT) | MACOS26_PAGE_ENTRY_DIRECTORY,
+            );
+        }
+        for i in 0..pages {
+            let table = tables[(i / per_table) as usize];
+            let slot = i % per_table;
+            m.put_u32(
+                table + 4 * slot,
+                ((0x1000 + i as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            );
+        }
+        let f = read_mapper_internal(&m, MapperKextLayout::Macos26, kva, false, 0).unwrap();
+        let plan =
+            build_table_plan(&m, 7, &f, pages * PAGE_SIZE_ARM64E, PAGE_SHIFT_ARM64E).expect("plan");
+        assert_eq!(plan.entries.len() as u64, pages);
+        assert_eq!(
+            plan.entries[per_table as usize],
+            ((0x1000 + per_table as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+        );
+    }
+
+    #[test]
+    fn a_macos26_descriptor_outside_its_span_is_refused() {
+        let mut m = MapMem::new();
+        let kva = ARM_KERNEL_VA_BASE + 0x10000;
+        macos26_internal(&mut m, kva, ARM_KERNEL_VA_BASE + 0x80000, 0x4_0000, 1);
+        m.put_u32(kva + MACOS26_INTERNAL_DESC_OFFSET, 0x1f00);
+        let f = read_mapper_identity(&m, MapperKextLayout::Macos26, kva, false, 0).unwrap();
+        assert_eq!(
+            validate_mapper_internal(&m, 7, &f).refusal(),
+            Some("iosurface_validate_desc_span_mismatch")
+        );
     }
 
     #[test]
