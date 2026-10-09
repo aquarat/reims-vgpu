@@ -807,6 +807,30 @@ impl SessionModel {
         released
     }
 
+    /// The completion word of a packet [`Self::admit`] refused, released in
+    /// channel order.
+    ///
+    /// A refusal admits no position, and its caller still owes the guest the
+    /// packet's word — see [`Self::admit`]. This is where that word goes, rather
+    /// than straight onto the guest's page: written while an earlier position
+    /// in the channel is outstanding, it would tell the guest that position's
+    /// work is done. [`Publisher::refused_word`] holds it behind the channel's
+    /// tail instead, and [`Self::complete`] or [`Self::withdraw`] hand it back
+    /// in order.
+    ///
+    /// Returns what may be published now: the word itself when nothing in the
+    /// channel is outstanding, and nothing otherwise.
+    #[must_use = "what the channel published is what the guest may now read"]
+    pub fn refused_word(&mut self, domain: ChannelId, stamp: CompletionStamp) -> Vec<Release> {
+        let released: Vec<Release> = self.publisher.refused_word(domain, stamp).into_iter().collect();
+        for release in &released {
+            if let Some(stamp) = release.stamp {
+                self.scheduler.publish(stamp);
+            }
+        }
+        released
+    }
+
     #[must_use]
     pub const fn publisher(&self) -> &Publisher {
         &self.publisher
