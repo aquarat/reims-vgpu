@@ -79,6 +79,15 @@ struct Domain {
     /// channel's high-water mark and comparing against it would let a channel
     /// rewind through every position it had already published.
     admitted_through: Option<ChannelSequence>,
+    /// Completion words of packets the channel refused, each held behind the
+    /// position that was the channel's tail when it arrived.
+    ///
+    /// A refused packet takes no position, but its word is still a statement
+    /// about everything before it in the channel: the guest reads a stamp as
+    /// "all work up to here is done". Writing it while an earlier position is
+    /// outstanding retires that earlier work in the guest's eyes, and the
+    /// guest then reuses what the work still reads. See [`Publisher::refused_word`].
+    held: VecDeque<(ChannelSequence, CompletionStamp)>,
 }
 
 /// Ordered guest publication for every channel.
@@ -193,7 +202,11 @@ impl Publisher {
     #[must_use = "the released positions are stamps the guest is waiting to read"]
     fn drain(queue: &mut Domain) -> Vec<Release> {
         let mut out = Vec::new();
-        while let Some(head) = queue.order.front().copied() {
+        loop {
+            Self::release_held(queue, &mut out);
+            let Some(head) = queue.order.front().copied() else {
+                break;
+            };
             let Some(stamp) = queue.finished.remove(&head) else {
                 break;
             };
@@ -204,6 +217,69 @@ impl Publisher {
             });
         }
         out
+    }
+
+    /// Release every held refused word whose trailing position has left the
+    /// FIFO, in arrival order, and stop at the first one still behind the head.
+    ///
+    /// Called before each position is released, so a word goes out after the
+    /// position it trails and before any position admitted after it.
+    fn release_held(queue: &mut Domain, out: &mut Vec<Release>) {
+        while let Some(&(after, stamp)) = queue.held.front() {
+            if queue.order.front().is_some_and(|head| *head <= after) {
+                break;
+            }
+            queue.held.pop_front();
+            out.push(Release {
+                sequence: after,
+                stamp: Some(stamp),
+            });
+        }
+    }
+
+    /// The completion word of a packet this channel refused.
+    ///
+    /// The packet's work did not run, and the guest is still owed its word —
+    /// it polls it. What it is not owed is that word *early*: a stamp tells the
+    /// guest that everything before it in the channel is done, so a word
+    /// written while an earlier position is still outstanding retires that
+    /// position's work in the guest's eyes. The guest then frees what the work
+    /// still reads — objects it deletes, command-buffer memory it refills — and
+    /// the work runs against that afterwards; and when the earlier position
+    /// does publish, its lower value moves the guest's fence backwards.
+    ///
+    /// So the word is released now only when nothing in the channel is
+    /// outstanding. Otherwise it is held behind the channel's current tail and
+    /// comes out of [`Self::complete`] or [`Self::withdraw`] in order: after
+    /// that position, before anything admitted later. The returned
+    /// [`Release::sequence`] of a held word is the position it trailed.
+    #[must_use = "a released word is a stamp the guest is waiting to read"]
+    pub fn refused_word(&mut self, domain: ChannelId, stamp: CompletionStamp) -> Option<Release> {
+        let Some(queue) = self.domains.get_mut(&domain) else {
+            return Some(Release {
+                sequence: ChannelSequence::default(),
+                stamp: Some(stamp),
+            });
+        };
+        match queue.order.back().copied() {
+            None => {
+                self.released += 1;
+                Some(Release {
+                    sequence: queue.admitted_through.unwrap_or_default(),
+                    stamp: Some(stamp),
+                })
+            }
+            Some(tail) => {
+                queue.held.push_back((tail, stamp));
+                None
+            }
+        }
+    }
+
+    /// Refused words held behind an outstanding position, across every channel.
+    #[must_use]
+    pub fn held_words(&self) -> usize {
+        self.domains.values().map(|q| q.held.len()).sum()
     }
 
     /// Positions admitted into a channel and not yet released.
@@ -277,6 +353,91 @@ mod tests {
 
     fn seq(n: u64) -> ChannelSequence {
         ChannelSequence(n)
+    }
+
+    fn word(value: u32) -> CompletionStamp {
+        CompletionStamp {
+            slot: StampSlot(1),
+            value: StampValue(value),
+        }
+    }
+
+    /// A refused packet's word goes out at once when nothing in its channel is
+    /// waiting to publish: there is nothing it could overtake.
+    #[test]
+    fn a_refused_word_on_an_idle_channel_publishes_now() {
+        let mut p = Publisher::new();
+        p.admit(ChannelId(1), seq(1));
+        let _ = p.complete(ChannelId(1), seq(1), stamp(1));
+        assert_eq!(
+            p.refused_word(ChannelId(1), word(2)),
+            Some(Release {
+                sequence: seq(1),
+                stamp: stamp(2)
+            })
+        );
+        assert_eq!(p.held_words(), 0);
+        // A channel nobody opened has nothing to order against either.
+        assert_eq!(
+            p.refused_word(ChannelId(7), word(5)).map(|r| r.stamp),
+            Some(stamp(5))
+        );
+    }
+
+    /// The regression: a refused packet behind a parked one used to have its
+    /// word written at once, which told the guest the parked work was done.
+    /// The guest freed what that work reads and the work ran against it, and
+    /// the parked position's own word then moved the fence backwards.
+    #[test]
+    fn a_refused_word_waits_for_the_positions_before_it_and_not_for_those_after() {
+        let mut p = Publisher::new();
+        p.admit(ChannelId(1), seq(1));
+        assert_eq!(
+            p.refused_word(ChannelId(1), word(2)),
+            None,
+            "an outstanding earlier position holds the word"
+        );
+        assert_eq!(p.held_words(), 1);
+        p.admit(ChannelId(1), seq(3));
+        assert!(
+            p.complete(ChannelId(1), seq(3), stamp(3)).is_empty(),
+            "a later position finishing first releases nothing, and in particular not the word"
+        );
+        assert_eq!(
+            p.complete(ChannelId(1), seq(1), stamp(1)),
+            vec![
+                Release {
+                    sequence: seq(1),
+                    stamp: stamp(1)
+                },
+                Release {
+                    sequence: seq(1),
+                    stamp: stamp(2)
+                },
+                Release {
+                    sequence: seq(3),
+                    stamp: stamp(3)
+                },
+            ],
+            "the word goes out after the position it trailed and before the one admitted after it"
+        );
+        assert_eq!(p.held_words(), 0);
+    }
+
+    /// A trailed position that will never publish still lets the word out.
+    #[test]
+    fn withdrawing_the_trailed_position_releases_a_held_word() {
+        let mut p = Publisher::new();
+        p.admit(ChannelId(1), seq(1));
+        assert!(p.refused_word(ChannelId(1), word(2)).is_none());
+        assert_eq!(
+            p.withdraw(ChannelId(1), seq(1)),
+            vec![Release {
+                sequence: seq(1),
+                stamp: stamp(2)
+            }]
+        );
+        assert!(p.retire(ChannelId(1)).is_ok());
     }
 
     /// The rule: work may finish in any order, and the guest is told in one.

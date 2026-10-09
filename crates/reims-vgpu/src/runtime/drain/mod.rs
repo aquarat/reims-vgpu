@@ -2799,20 +2799,37 @@ fn note_unadmitted<H: HostMemory + HostOps>(
         crate::observe::fail(format!(
             "packet_unadmitted ch={} opcode={:#x} reason={reason} refusal={} (the \
              ordering plane would not take this packet, so its work did not run; its \
-             completion word is written out of band because the guest polls it and no \
-             ordering position exists to publish it through)",
+             completion word is still owed and is published in channel order, after \
+             every earlier position in the channel)",
             fifo.domain().0,
             packet.opcode,
             detail()
         ));
     }
-    publish_word(
-        state,
-        host,
-        fifo.domain().0,
-        completion_slot,
-        packet.completion_stamp,
-    );
+    // The word goes through the channel's publication order, not straight to
+    // the page. It used to be written here at once, and a stamp is the guest's
+    // "everything up to here is done": with an earlier EXEC still parked, the
+    // guest retired that EXEC's command buffer, deleted the objects it names and
+    // refilled its setBytes memory, and the EXEC then ran against all three —
+    // missing textures, a kernel reading another kernel's uniforms as its loop
+    // bound until the host GPU timed out — and published its own lower value
+    // afterwards, moving the fence backwards (`stamp_write_backward`).
+    use reims_vgpu_core::identity::{CompletionStamp, StampSlot, StampValue};
+    let stamp = CompletionStamp {
+        slot: StampSlot(stamp_slot_index(completion_slot)),
+        value: StampValue(packet.completion_stamp),
+    };
+    let released = state.refused_word(fifo.domain(), stamp);
+    note_store_route(if released.is_empty() {
+        "packet_unadmitted_word_held"
+    } else {
+        "packet_unadmitted_word_now"
+    });
+    for release in released {
+        if let Some(stamp) = release.stamp {
+            publish_word(state, host, fifo.domain().0, stamp.slot.0, stamp.value.0);
+        }
+    }
 }
 
 /// A FIFO's bytes, and how this device reaches them.

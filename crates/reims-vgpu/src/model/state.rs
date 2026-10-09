@@ -4603,6 +4603,21 @@ impl DeviceState {
             .complete(epoch, ingress)
     }
 
+    /// The completion word of a packet the session refused, released in its
+    /// channel's order: now if nothing in the channel is outstanding, else
+    /// later, out of [`Self::complete_transaction`].
+    #[must_use = "what the channel published is what the guest may now read"]
+    pub fn refused_word(
+        &self,
+        domain: reims_vgpu_core::identity::ChannelId,
+        stamp: reims_vgpu_core::identity::CompletionStamp,
+    ) -> Vec<reims_vgpu_core::publish::Release> {
+        self.session
+            .lock()
+            .expect("session")
+            .refused_word(domain, stamp)
+    }
+
     /// Take a transaction that will never publish out of every plane holding
     /// it, and say what its channel released behind it.
     ///
