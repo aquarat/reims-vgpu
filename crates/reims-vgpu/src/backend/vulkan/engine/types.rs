@@ -1738,6 +1738,17 @@ pub enum ComputeSampledSource {
     /// copy". A Metal kernel reaches it by declaring
     /// `texture2d_ms<T, access::read>` and calling `read(coord, sample)`.
     MultisampleTarget(TargetIdentity),
+    /// A retained single-sample render target — the resident a draw rendered
+    /// an IOSurface into — bound through its own registry view.
+    ///
+    /// The single-sample sibling of [`Self::MultisampleTarget`], and bound the
+    /// same way for the same reason: the resident is already the surface's
+    /// current content on the device, so staging it would mean reading it back
+    /// into the guest's pages and uploading those pages again. A compute
+    /// dispatch never storage-writes a render target (registry images carry no
+    /// storage usage), so sampling the live resident cannot alias this
+    /// dispatch's own output.
+    Target(TargetIdentity),
 }
 
 /// Pixel formats the product compute path maps, re-exported from the rail that

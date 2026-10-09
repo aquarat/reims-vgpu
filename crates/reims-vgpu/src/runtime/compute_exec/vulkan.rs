@@ -313,6 +313,11 @@ pub(crate) struct VulkanStage {
     /// be uploaded into a multisample image at all. The engine binds this
     /// target's own view.
     pub(crate) multisample_target: Option<crate::backend::vulkan::engine::TargetIdentity>,
+    /// The single-sample resident a draw rendered this whole surface into,
+    /// served instead of the surface's pages. Exclusive with everything above
+    /// it in the same way `multisample_target` is: nothing is staged. See
+    /// [`RailStage::surface_resident`].
+    pub(crate) resident_target: Option<crate::backend::vulkan::engine::TargetIdentity>,
 }
 
 impl RailStage for VulkanStage {
@@ -329,7 +334,108 @@ impl RailStage for VulkanStage {
             residency,
             serve,
             multisample_target: None,
+            resident_target: None,
         }
+    }
+
+    fn surface_resident<M: HostMemory + HostOps>(
+        state: &DeviceState,
+        host: &M,
+        window: &crate::runtime::compute_exec::SurfaceSampleWindow,
+    ) -> Option<Self> {
+        use crate::backend::vulkan::engine::ResidentContentBacking;
+        let refuse = |route: &'static str| {
+            crate::runtime::drain::note_store_route(route);
+            None
+        };
+        let m = state.mappings.get(&window.mapping_id)?;
+        if !m.has_geom
+            || m.width != window.width
+            || m.height != window.height
+            || m.format != window.format
+            || m.map_generation != window.map_generation
+        {
+            return refuse("compute_sampled_surface_resident_shape");
+        }
+        // A compute dispatch's own storage output of this surface is newer than
+        // any resident a draw left, and it lives in the compute mirror rather
+        // than the target registry. While the mirror holds a window of this
+        // incarnation, the mirror is the authority and the pages are where it
+        // was written.
+        if state
+            .compute_storage_residency
+            .keys()
+            .any(|k| k.mapping_id == window.mapping_id && k.map_generation == window.map_generation)
+        {
+            return refuse("compute_sampled_surface_resident_compute_owned");
+        }
+        let identity = crate::backend::vulkan::present_identity::surface_identity(
+            state,
+            window.mapping_id,
+            m.width,
+            m.height,
+        );
+        if crate::backend::vulkan::engine::resident_content_backing(&identity)
+            == ResidentContentBacking::NotReady
+        {
+            return refuse("compute_sampled_surface_resident_not_ready");
+        }
+        // The same witness the draw rail's resident rung asks: a resident is the
+        // surface only while the guest has not painted different pixels into the
+        // pages since the Store that produced it.
+        if !crate::runtime::surface_currency::surface_currency(
+            state,
+            host,
+            window.mapping_id,
+            m.width,
+            m.height,
+        )
+        .serves(crate::runtime::surface_currency::CurrencyStandard::NoContraryEvidence)
+        {
+            return refuse("compute_sampled_surface_resident_guest_wrote");
+        }
+        crate::runtime::drain::note_store_route("compute_sampled_surface_resident");
+        Some(Self {
+            array_element: 0,
+            descriptor_count: 1,
+            residency: None,
+            serve: None,
+            multisample_target: None,
+            resident_target: Some(identity),
+        })
+    }
+
+    fn gva_resident<M: HostMemory + HostOps>(
+        state: &mut DeviceState,
+        host: &mut M,
+        task_id: u32,
+        span: crate::runtime::draw::GvaSpan,
+    ) -> Option<Self> {
+        use crate::runtime::draw::vulkan::GvaResidentRefusal;
+        // The draw rail's one currency rule for GVA residents, asked as is.
+        let identity =
+            match crate::runtime::draw::vulkan::gva_resident_if_current(state, host, task_id, span)
+            {
+                Ok(identity) => identity,
+                Err(GvaResidentRefusal::NoGeneration) => return None,
+                Err(GvaResidentRefusal::Wrote(_)) => {
+                    crate::runtime::drain::note_store_route("compute_sampled_gva_resident_wrote");
+                    return None;
+                }
+                Err(GvaResidentRefusal::NoResident) => {
+                    crate::runtime::drain::note_store_route("compute_sampled_gva_resident_absent");
+                    return None;
+                }
+            };
+        crate::runtime::drain::note_store_route("compute_sampled_gva_resident");
+        Some(Self {
+            array_element: 0,
+            descriptor_count: 1,
+            residency: None,
+            serve: None,
+            multisample_target: None,
+            resident_target: Some(identity),
+        })
     }
 }
 
@@ -1151,9 +1257,13 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 // pair: the producer that sets `multisample_target` is the one
                 // rail that stages nothing, and it leaves `serve` and `bytes`
                 // empty because there is nothing for either to hold.
-                source: match t.rail.multisample_target.take() {
-                    Some(identity) => ComputeSampledSource::MultisampleTarget(identity),
-                    None => match t.rail.serve.and_then(ResidentServe::sample_source) {
+                source: match (
+                    t.rail.multisample_target.take(),
+                    t.rail.resident_target.take(),
+                ) {
+                    (Some(identity), _) => ComputeSampledSource::MultisampleTarget(identity),
+                    (None, Some(identity)) => ComputeSampledSource::Target(identity),
+                    (None, None) => match t.rail.serve.and_then(ResidentServe::sample_source) {
                         Some((identity, generation)) => ComputeSampledSource::ResidentCopy(
                             crate::backend::vulkan::engine::ComputeResidentSampleBind {
                                 identity,
@@ -1974,6 +2084,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
             residency: None,
             serve: None,
             multisample_target: Some(identity),
+            resident_target: None,
         },
     })
 }
