@@ -2081,6 +2081,104 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert_eq!(host.get_u32(stamp_gpa + 4), 22);
 }
 
+/// A vCPU blocked on the device lock ends the tranche at the next packet
+/// boundary, with the rest of the ring left queued and the channel re-armed,
+/// and the next tranche picks up where this one stopped.
+///
+/// The vCPU's wait is guest time: the IOSurface mapper doorbell resolves its
+/// request on the publishing vCPU under the device lock, so a tranche that ran
+/// the rings dry stopped that guest thread for the whole tranche.
+#[test]
+fn a_waiting_vcpu_ends_the_tranche_at_the_next_packet() {
+    use crate::model::CHILD_OP_NOP;
+    use std::sync::atomic::Ordering;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = state.page_size() as usize;
+    let channel = 5u32;
+    let root_pfn = 0x10u32;
+    let list_pfn = 0x20u32;
+    let ring_pfn = 0x30u32;
+    let stamp_pfn = 0x40u32;
+    let root_gpa = state.pfn_gpa(root_pfn);
+    let list_gpa = state.pfn_gpa(list_pfn);
+    let ring_gpa = state.pfn_gpa(ring_pfn);
+    let stamp_gpa = state.pfn_gpa(stamp_pfn);
+    for gpa in [root_gpa, list_gpa, ring_gpa, stamp_gpa] {
+        host.map_range(gpa, page_size, 0);
+    }
+    let first = packet_bytes(CHILD_OP_NOP, 31, &[]);
+    let mut ring = first.clone();
+    ring.extend_from_slice(&packet_bytes(CHILD_OP_NOP, 32, &[]));
+    ring.extend_from_slice(&packet_bytes(CHILD_OP_NOP, 33, &[]));
+    host.write_gpa(ring_gpa, &ring).unwrap();
+    host.put_u32(list_gpa, ring_pfn);
+    let regs_gpa = root_gpa + child_reg_block_offset(channel).unwrap();
+    host.put_u32(regs_gpa + CHILD_REG_TAIL, ring.len() as u32);
+    host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
+    host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, 1);
+    host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
+    state.gfx.root_page = root_pfn;
+    state.gfx.fifo_base_page = stamp_pfn;
+    state.open_child_domains_for_test(1u32 << channel);
+    state.pending.child_mask = 1u32 << channel;
+
+    state.gfx.vcpu_lock_wanted.store(1, Ordering::Release);
+    drain_pending(&mut state, &mut host);
+    assert_eq!(
+        host.get_u32(regs_gpa + CHILD_REG_HEAD),
+        first.len() as u32,
+        "the tranche must stop after the packet it was running"
+    );
+    assert_ne!(
+        state.pending.child_mask & (1u32 << channel),
+        0,
+        "the rest of the ring stays queued on its channel"
+    );
+    assert!(state.pending.lock_yield, "the stop is recorded for device_drain");
+    assert!(!state.pending.host_action_yield, "and is not a present yield");
+
+    // device_drain clears the flag when it hands the lock over; the vCPU drops
+    // its count once it holds the lock.
+    state.pending.lock_yield = false;
+    state.gfx.vcpu_lock_wanted.store(0, Ordering::Release);
+    drain_pending(&mut state, &mut host);
+    assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), ring.len() as u32);
+    assert_eq!(host.get_u32(stamp_gpa + 4), 33, "every packet still completes, in order");
+    assert!(!state.pending.lock_yield);
+}
+
+/// The vCPU yield never cuts a nested drain short. A present drains the other
+/// channels from inside its own packet so the frame it publishes includes
+/// their work; stopping there would change what is presented, not when.
+#[test]
+fn a_nested_drain_does_not_yield_to_a_waiting_vcpu() {
+    use std::sync::atomic::Ordering;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    state.gfx.vcpu_lock_wanted.store(1, Ordering::Release);
+
+    state.draining_mask = (1u32 << 3) | (1u32 << 5);
+    assert!(!tranche_should_stop(&mut state));
+    assert!(!state.pending.lock_yield);
+
+    state.draining_mask = 1u32 << 5;
+    assert!(tranche_should_stop(&mut state));
+    assert!(state.pending.lock_yield);
+
+    // Once fired it holds for the rest of the tranche, but still not inside a
+    // nested drain.
+    state.gfx.vcpu_lock_wanted.store(0, Ordering::Release);
+    assert!(tranche_should_stop(&mut state));
+    state.draining_mask = (1u32 << 3) | (1u32 << 5);
+    assert!(!tranche_should_stop(&mut state));
+
+    // A present yield is unconditional, as before.
+    state.pending.host_action_yield = true;
+    assert!(tranche_should_stop(&mut state));
+}
+
 /// Mode switch (1920→1440) is a new surface identity: reset
 /// content_generation (Load/scanout semantics restart).
 #[test]
