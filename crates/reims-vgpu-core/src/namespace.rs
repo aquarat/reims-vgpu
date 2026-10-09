@@ -265,6 +265,16 @@ struct Slot {
 #[derive(Debug, Default)]
 pub struct Namespace {
     slots: HashMap<ObjectListRef, Slot>,
+    /// Where this namespace's generations start counting from.
+    ///
+    /// A [`ResourceId`] carries no task, and the session holds state keyed by
+    /// it across every task — the pipeline table above all. Each task has its
+    /// own namespace, so two tasks that each fill slot 88 for the first time
+    /// would both mint `(88, 1)` and land on one entry: one task's pipeline
+    /// readying or refusing the other's. Giving each namespace a disjoint base
+    /// keeps every id the session ever sees distinct. See
+    /// [`Self::with_generation_base`].
+    generation_base: u64,
     /// Backings detached from a slot by a delete or a replacement, still held
     /// by accepted work, counted *per backing* rather than per detachment.
     ///
@@ -293,6 +303,20 @@ impl Namespace {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A namespace whose generations count up from `base` rather than from
+    /// zero, so its ids cannot collide with another namespace's.
+    ///
+    /// The owner of several namespaces gives each a disjoint base; a slot is
+    /// redeclared far fewer than 2^32 times, so bases a power of two apart
+    /// never meet.
+    #[must_use]
+    pub fn with_generation_base(base: u64) -> Self {
+        Self {
+            generation_base: base,
+            ..Self::default()
+        }
     }
 
     /// Declare an object into a slot.
@@ -331,8 +355,10 @@ impl Namespace {
     /// previous occupant left behind.
     pub fn declare(&mut self, slot: ObjectListRef, backing: Option<BackingId>) -> Declared {
         let existing = self.slots.get(&slot).copied();
-        let generation =
-            existing.map_or_else(|| SlotGeneration::default().next(), |e| e.generation.next());
+        let generation = existing.map_or_else(
+            || SlotGeneration(self.generation_base).next(),
+            |e| e.generation.next(),
+        );
         // Only a *live* occupant is displaced. A deleted one already handed its
         // backing over.
         let displaced = existing.filter(|e| !e.deleted);
