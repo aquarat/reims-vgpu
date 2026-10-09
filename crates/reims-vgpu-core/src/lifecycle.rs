@@ -1531,11 +1531,11 @@ pub struct ObjectList {
 }
 
 impl Task {
-    fn new(directory: DirectoryFrame) -> Self {
+    fn new(directory: DirectoryFrame, generation_base: u64) -> Self {
         Self {
             directory,
             object_list: None,
-            namespace: Namespace::new(),
+            namespace: Namespace::with_generation_base(generation_base),
             heaps: Heaps::default(),
             resident: HashMap::new(),
         }
@@ -1581,6 +1581,11 @@ impl Task {
 pub struct Lifecycle {
     tasks: HashMap<TaskId, Task>,
     content: ContentLedger,
+    /// Task incarnations defined so far, which is what hands each one its
+    /// namespace's generation base. Per incarnation and not per task id, because
+    /// a redefined task starts a new namespace and its first declarations must
+    /// not reuse the ids its previous incarnation's work may still hold.
+    incarnations: u64,
 }
 
 impl Lifecycle {
@@ -2031,7 +2036,11 @@ impl Lifecycle {
             }
             None => Effects::default(),
         };
-        self.tasks.insert(task, Task::new(directory));
+        // The first incarnation keeps base zero, so a session with one task
+        // mints the ids it always has.
+        let base = self.incarnations << 32;
+        self.incarnations += 1;
+        self.tasks.insert(task, Task::new(directory, base));
         Ok(effects)
     }
 
@@ -3354,6 +3363,58 @@ mod tests {
     /// tear down an allocation the other task's heap still holds, while
     /// `forget_backing` — asked the session-wide question — correctly kept the
     /// content entry. The model said both at once.
+    /// Two tasks naming the same slot name two objects, and the session must
+    /// be able to tell them apart: a [`ResourceId`] carries no task, and the
+    /// pipeline table and dependency graph key on it alone. Both tasks used to
+    /// mint `(slot, 1)`, so one task's pipeline at ref 88 readied, withdrew and
+    /// refused the other's — a macOS 26 guest lost 362 frames that way in one
+    /// run. A redefined task is a new namespace too and must not reuse the ids
+    /// its former incarnation's work may still hold.
+    #[test]
+    fn the_same_slot_in_two_tasks_or_two_incarnations_names_distinct_ids() {
+        let mut l = Lifecycle::new();
+        let define = |l: &mut Lifecycle, task| {
+            apply_inert(
+                l,
+                &LifecycleOp::DefineTask {
+                    task,
+                    kernel: false,
+                    directory: DirectoryFrame(0x1000),
+                },
+            );
+        };
+        let create = |l: &mut Lifecycle, task| {
+            let _ = l.apply(&LifecycleOp::CreateResource {
+                task,
+                slot: ObjectListRef(88),
+                storage: Storage::NoBytes,
+            })
+            .expect("declares");
+        };
+        use crate::resolve::TaskNamespaces as _;
+        define(&mut l, TaskId(1));
+        define(&mut l, TaskId(2));
+        create(&mut l, TaskId(1));
+        create(&mut l, TaskId(2));
+        let one = l.resource(TaskId(1), 88).expect("named");
+        let two = l.resource(TaskId(2), 88).expect("named");
+        assert_eq!(one.slot, two.slot);
+        assert_ne!(one, two, "one slot in two tasks is two objects");
+        assert_eq!(one.generation, SlotGeneration(1), "the first task mints what it always has");
+
+        let _ = l
+            .apply(&LifecycleOp::DefineTask {
+                task: TaskId(1),
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            })
+            .expect("a redefinition tears the old namespace down");
+        create(&mut l, TaskId(1));
+        let again = l.resource(TaskId(1), 88).expect("named");
+        assert_ne!(again, one, "a redefined task does not reuse its former ids");
+        assert_ne!(again, two);
+    }
+
     #[test]
     fn storage_two_tasks_hold_is_not_reported_freed_when_one_lets_go() {
         let mut l = Lifecycle::new();
@@ -5345,6 +5406,9 @@ mod tests {
                 HashMap::new();
             let mut storage: HashMap<TaskId, HashMap<u64, BackingId>> = HashMap::new();
             let mut generations: HashMap<(TaskId, ObjectListRef), SlotGeneration> = HashMap::new();
+            // Incarnations defined, and each live task's generation base, as
+            // the owner hands them out.
+            let mut bases: (u64, HashMap<TaskId, u64>) = (0, HashMap::new());
             let mut handed: Vec<Handed> = Vec::new();
             // Backings the ledger knew at the previous step. A backing
             // something still holds may not stop being known.
@@ -5510,6 +5574,7 @@ mod tests {
                             &mut live,
                             &mut storage,
                             &mut generations,
+                            &mut bases,
                             &mut handed,
                             &mut census,
                         );
@@ -5608,6 +5673,7 @@ mod tests {
         live: &mut HashMap<TaskId, HashMap<ObjectListRef, (ResourceId, BackingId)>>,
         storage: &mut HashMap<TaskId, HashMap<u64, BackingId>>,
         generations: &mut HashMap<(TaskId, ObjectListRef), SlotGeneration>,
+        bases: &mut (u64, HashMap<TaskId, u64>),
         handed: &mut Vec<Handed>,
         census: &mut Census,
     ) {
@@ -5616,11 +5682,14 @@ mod tests {
                 if live.insert(*task, HashMap::new()).is_some() {
                     census.redefinitions += 1;
                 }
-                // A new namespace and new heaps: the generations restart with
-                // them, which is what makes a name from the previous
-                // definition refuse rather than resolve to its successor.
+                // A new namespace and new heaps. Its generations count from a
+                // base no earlier incarnation used, which is what makes a name
+                // from the previous definition refuse rather than resolve to
+                // its successor even once the successor fills the same slot.
                 storage.insert(*task, HashMap::new());
                 generations.retain(|(t, _), _| t != task);
+                bases.1.insert(*task, bases.0 << 32);
+                bases.0 += 1;
             }
             LifecycleOp::DeleteTask { task } => {
                 census.deleted_tasks += 1;
@@ -5633,9 +5702,10 @@ mod tests {
                 slot,
                 storage: what,
             } => {
+                let base = bases.1.get(task).copied().unwrap_or(0);
                 let generation = generations
                     .get(&(*task, *slot))
-                    .map_or_else(|| SlotGeneration::default().next(), |g| g.next());
+                    .map_or_else(|| SlotGeneration(base).next(), |g| g.next());
                 generations.insert((*task, *slot), generation);
                 let id = ResourceId {
                     slot: *slot,
