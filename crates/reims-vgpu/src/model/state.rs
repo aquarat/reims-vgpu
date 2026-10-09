@@ -396,6 +396,14 @@ pub struct GfxRegs {
     /// The `Arc` is shared with the device registry slot and survives reset,
     /// like the three above.
     pub child_doorbell_rung: Arc<AtomicU32>,
+    /// vCPUs parked on the device lock right now, raised and lowered by the
+    /// vCPU thread around its blocking acquire. The drain reads it between
+    /// packets and ends its tranche when it is non-zero; see
+    /// [`crate::runtime::drain::tranche_should_stop`].
+    ///
+    /// Shared with the device registry slot and kept across reset like the
+    /// atomics above, because the slot holds the only other clone.
+    pub vcpu_lock_wanted: Arc<AtomicU32>,
     pub efi_display: u32,
     pub efi_mode_select: u32,
     pub efi_fb_start: u64,
@@ -422,6 +430,7 @@ impl Default for GfxRegs {
             interrupt_status_gpu: Arc::new(AtomicU32::new(0)),
             interrupt_fault: Arc::new(AtomicU32::new(0)),
             child_doorbell_rung: Arc::new(AtomicU32::new(0)),
+            vcpu_lock_wanted: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
             efi_fb_start: 0,
@@ -2657,6 +2666,11 @@ pub struct PendingWork {
     /// before consuming more guest work so QEMU can apply that action without
     /// blocking on the device lock. Cleared when the action is consumed.
     pub host_action_yield: bool,
+    /// This tranche stopped early because a vCPU was waiting for the device
+    /// lock. Sticky until the tranche ends, so every loop between the stop and
+    /// the return leaves its remaining work queued; `device_drain` clears it,
+    /// hands the lock over and re-wakes the worker.
+    pub lock_yield: bool,
 }
 
 /// Byte cap for the guest-CPU-produced content memos (`guest_linear_memo`,
@@ -3965,6 +3979,9 @@ impl DeviceState {
         let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
         let fifo_read = Arc::clone(&self.gfx.fifo_read);
         let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        // Not cleared: it counts threads blocked on the lock this reset holds,
+        // and they lower it themselves once they get it.
+        let lock_wanted = Arc::clone(&self.gfx.vcpu_lock_wanted);
         intr_disp.store(0, Ordering::Release);
         intr_gpu.store(0, Ordering::Release);
         intr_fault.store(0, Ordering::Release);
@@ -3978,6 +3995,7 @@ impl DeviceState {
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
         self.gfx.child_doorbell_rung = child_rung;
+        self.gfx.vcpu_lock_wanted = lock_wanted;
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a

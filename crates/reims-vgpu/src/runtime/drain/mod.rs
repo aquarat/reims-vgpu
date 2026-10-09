@@ -6851,7 +6851,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 admit_and_park(state, host, fifo, stamp_index, packet);
                 settle_model_work(state, host);
 
-                if state.pending.host_action_yield {
+                if tranche_should_stop(state) {
                     if head != tail {
                         state.pending.child_mask |= bit;
                     }
@@ -7943,6 +7943,56 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
     state.pending.child_mask |= rung;
 }
 
+/// Whether the drain must stop at this packet boundary and return the device
+/// lock with the rest of its work left queued.
+///
+/// Two reasons, and they are the same exit: a queued present the main loop
+/// has to paint (`host_action_yield`), or a vCPU blocked on the device lock.
+///
+/// The second exists because the vCPU's wait is guest time, not host time.
+/// The iosfc mapper doorbell resolves the guest's request synchronously on the
+/// publishing vCPU (it reads that vCPU's registers), so the guest thread that
+/// asked for an IOSurface map is stopped for as long as the lock is held — and
+/// a drain tranche runs until the rings are empty. Measured on a sustained
+/// simulator UI load with the drain on its own thread, those waits added up to
+/// 180-400 s of stopped vCPU per 25-minute run, single waits of 2 s were
+/// routine, and the UI tests that failed were the ones waiting on a screen
+/// (launch, screenshot). A packet boundary is a point every drain already
+/// stops at for a present, so stopping there for a vCPU orders nothing
+/// differently; it only moves where the next tranche starts.
+///
+/// Sticky for the rest of the tranche once it has fired, so a loop further
+/// out that checks after an inner one stopped leaves its own work queued too.
+///
+/// **Never inside a nested drain.** A present drains the other channels from
+/// inside its own packet so body-layer work that landed meanwhile is frozen
+/// into the frame it publishes (`present_named_mapping`); cutting that short
+/// for a vCPU would change what is presented, not just when. A nested drain is
+/// one running while another channel's packet is open, which is exactly a
+/// `draining_mask` holding more than the drain's own bit.
+pub(crate) fn tranche_should_stop(state: &mut DeviceState) -> bool {
+    if state.pending.host_action_yield {
+        return true;
+    }
+    if state.draining_mask.count_ones() > 1 {
+        return false;
+    }
+    if state.pending.lock_yield {
+        return true;
+    }
+    if state
+        .gfx
+        .vcpu_lock_wanted
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        return false;
+    }
+    state.pending.lock_yield = true;
+    note_store_route("drain_yield_to_vcpu");
+    true
+}
+
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
@@ -8011,7 +8061,7 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
                     note_translation_order_hold(state, remaining);
                     return;
                 }
-                if state.pending.host_action_yield {
+                if tranche_should_stop(state) {
                     state.pending.child_mask |= remaining;
                     return;
                 }

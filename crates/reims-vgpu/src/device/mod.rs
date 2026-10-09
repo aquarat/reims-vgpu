@@ -91,6 +91,8 @@ struct BoundDevice {
     /// Child channels the guest has rung, OR'd from the vCPU thread with no
     /// device lock; see [`crate::model::GfxRegs::child_doorbell_rung`].
     child_doorbell_rung: Arc<AtomicU32>,
+    /// vCPUs blocked on `inner`; see [`crate::model::GfxRegs::vcpu_lock_wanted`].
+    vcpu_lock_wanted: Arc<AtomicU32>,
     /// Lock-free clone of the fault status (0x102c) — the ISR's third read.
     intr_fault: Arc<AtomicU32>,
     /// Lock-free clone of the main-FIFO consumer counter (0x100c): the guest
@@ -229,6 +231,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
+    let vcpu_lock_wanted = Arc::clone(&dev.state.gfx.vcpu_lock_wanted);
     let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
     let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
     DEVICES.lock().insert(
@@ -245,6 +248,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             intr_disp,
             intr_gpu,
             child_doorbell_rung,
+            vcpu_lock_wanted,
             intr_fault,
             fifo_read_live,
             present_action_pending: AtomicBool::new(false),
@@ -476,7 +480,12 @@ fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = 
         return guard;
     }
     let waited = std::time::Instant::now();
+    // Raised for the length of the wait so the drain stops at its next packet
+    // boundary instead of finishing the tranche; see
+    // `runtime::drain::tranche_should_stop`.
+    slot.vcpu_lock_wanted.fetch_add(1, Ordering::AcqRel);
     let guard = slot.inner.lock();
+    slot.vcpu_lock_wanted.fetch_sub(1, Ordering::AcqRel);
     crate::runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
     guard
 }
@@ -651,7 +660,18 @@ pub fn device_drain(id: u64) -> bool {
     if device.state.pending.host_action_yield {
         slot.present_action_pending.store(true, Ordering::Release);
     }
+    // A tranche that stopped for a waiting vCPU still has guest work queued,
+    // and nothing else will wake the worker for it: the doorbells behind that
+    // work were already consumed. Re-arm the worker before letting go, then
+    // hand the lock to the waiter directly — a plain unlock lets this thread
+    // take it straight back on its next wakeup, ahead of the vCPU it stopped
+    // for.
+    let lock_yield = std::mem::take(&mut device.state.pending.lock_yield);
     crate::runtime::drain::note_drain_exit(busy_end_us, false);
+    if lock_yield {
+        schedule_device(&slot);
+        parking_lot::MutexGuard::unlock_fair(d);
+    }
     true
 }
 
