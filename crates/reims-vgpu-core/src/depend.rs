@@ -97,7 +97,24 @@ pub struct DependencyGraph {
     /// signature owns.
     scratch: Vec<usize>,
     waits: Vec<IngressOrdinal>,
+    /// Entries [`Self::retire`] has marked and no compaction has dropped yet.
+    ///
+    /// Retirement only marks: the indexes still hold a retired entry, and every
+    /// admission that gathers its bucket walks past it. Nothing compacted the
+    /// graph on a live device, so the walk grew with the session — on a macOS 26
+    /// guest running UI tests, admission was 30 % of the drain thread's CPU
+    /// twenty minutes in. [`Self::admit`] compacts once this outgrows both
+    /// [`COMPACT_RETIRED_FLOOR`] and the live population, which keeps the
+    /// rebuild amortised over the admissions that made it necessary.
+    retired: usize,
 }
+
+/// Retired entries the graph tolerates before an admission compacts it.
+///
+/// A floor so a small graph does not rebuild on every other admission; above
+/// it, compaction waits until retired entries outnumber live ones, so each
+/// rebuild is paid for by at least as many admissions as it walks.
+const COMPACT_RETIRED_FLOOR: usize = 4096;
 
 impl DependencyGraph {
     #[must_use]
@@ -145,6 +162,11 @@ impl DependencyGraph {
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
         // panicking assertion above must not leave stale contents behind.
+        if self.retired >= COMPACT_RETIRED_FLOOR
+            && self.retired > self.entries.len() - self.retired
+        {
+            self.compact();
+        }
         let mut waits = std::mem::take(&mut self.waits);
         let mut scratch = std::mem::take(&mut self.scratch);
         waits.clear();
@@ -261,7 +283,10 @@ impl DependencyGraph {
     /// that retires early publishes a hazard it still owes.
     pub fn retire(&mut self, ordinal: IngressOrdinal) {
         for &idx in self.by_ordinal.get(&ordinal).into_iter().flatten() {
-            self.entries[idx].live = false;
+            if self.entries[idx].live {
+                self.entries[idx].live = false;
+                self.retired += 1;
+            }
         }
         self.by_ordinal.remove(&ordinal);
     }
@@ -286,6 +311,14 @@ impl DependencyGraph {
             self.insert(e.ordinal, e.intent);
         }
         self.census = saved;
+        self.retired = 0;
+    }
+
+    /// Entries the graph holds, live and retired: what an admission's
+    /// gathering can walk.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -315,6 +348,30 @@ mod tests {
 
     fn ord(n: u64) -> IngressOrdinal {
         IngressOrdinal(n)
+    }
+
+    /// Retired accesses are dropped by admission itself once they outnumber
+    /// the live ones, so a long session's graph stays the size of its work in
+    /// flight. Nothing on a live device called `compact`, and every admission
+    /// walked the session's whole history of each backing it touched.
+    #[test]
+    fn a_long_session_keeps_the_graph_the_size_of_its_live_work() {
+        let mut g = DependencyGraph::default();
+        let w = |b| intent(AccessKey::Whole(res(b)), AccessMode::Write);
+        for n in 1..=50_000u64 {
+            let waits = g.admit(ord(n), &[w(1), w(n % 7 + 2)]);
+            // Each admission still meets the one writer before it on backing 1:
+            // compaction drops retired entries and never a live edge.
+            if n > 1 {
+                assert_eq!(waits, vec![ord(n - 1)], "admission {n}");
+            }
+            g.retire(ord(n - 1));
+        }
+        assert!(
+            g.held() <= 2 * COMPACT_RETIRED_FLOOR + 4,
+            "the graph held {} entries for one live transaction",
+            g.held()
+        );
     }
 
     /// The property the whole graph rests on.
