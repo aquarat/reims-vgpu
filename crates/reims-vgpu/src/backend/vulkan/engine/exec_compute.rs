@@ -554,7 +554,12 @@ pub(crate) unsafe fn execute_compute_inner(
         // A multisample image cannot be filled by an upload or a copy, so
         // acquiring a transient for it would allocate a single-sample image
         // this dispatch then binds instead of the samples the guest rendered.
-        if let ComputeSampledSource::MultisampleTarget(identity) = &resource.source {
+        let target = match &resource.source {
+            ComputeSampledSource::MultisampleTarget(identity) => Some((identity, true)),
+            ComputeSampledSource::Target(identity) => Some((identity, false)),
+            _ => None,
+        };
+        if let Some((identity, want_multisample)) = target {
             // Reading a resident is using it, and the mark goes ahead of the
             // lookup so the refusals below cannot skip it — the render rail's
             // `SampledSource::Target` arm states the reason: a resident whose
@@ -586,13 +591,13 @@ pub(crate) unsafe fn execute_compute_inner(
             };
             // Each of the three is a distinct loss and none substitutes for
             // another: nothing has been rendered yet, the samples are not the
-            // ones this bind names, or the resident is single-sample and would
-            // be a descriptor-type mismatch against the shader's declared
-            // multisampled image.
+            // ones this bind names, or the resident's sample count is not the
+            // one the shader declared — either way round a descriptor-type
+            // mismatch against the image the kernel reads.
             if !content_ready
                 || width != resource.width
                 || height != resource.height
-                || samples <= 1
+                || (samples > 1) != want_multisample
             {
                 return Err(DrawError::ComputeExecution(
                     ComputeExecutionDecline::MultisampleSampleUnusable {
@@ -655,7 +660,9 @@ pub(crate) unsafe fn execute_compute_inner(
             ComputeSampledSource::ResidentCopy(bind) => Some(*bind),
             ComputeSampledSource::Bytes(_) => None,
             // Returned above.
-            ComputeSampledSource::MultisampleTarget(_) => unreachable!(),
+            ComputeSampledSource::MultisampleTarget(_) | ComputeSampledSource::Target(_) => {
+                unreachable!()
+            }
         };
         if resident_copy.is_some() && resource.mip_levels > 1 {
             // A resident is one window at one level. Seeding a pyramid's base

@@ -1394,6 +1394,46 @@ pub(crate) trait RailStage: Sized {
         residency: Option<ComputeStorageResidencyCandidate>,
         serve: Option<ResidentServe>,
     ) -> Self;
+
+    /// This rail's half of a *sampled* binding that it can serve from an image
+    /// it already holds for the whole surface, or `None` to stage the guest's
+    /// pages as usual.
+    ///
+    /// Asked before anything is read: a served binding stages no bytes, and so
+    /// also never settles the surface's outstanding write-back, which would
+    /// read that same image back into the guest's pages only for this binding
+    /// to upload them again.
+    fn surface_resident<M: HostMemory + HostOps>(
+        _state: &DeviceState,
+        _host: &M,
+        _window: &SurfaceSampleWindow,
+    ) -> Option<Self> {
+        None
+    }
+
+    /// The linear-texture sibling of [`Self::surface_resident`]: this rail's
+    /// half of a sampled single-level linear texture it can serve from the image
+    /// a render Store left for exactly that span, or `None` to stage the pages.
+    fn gva_resident<M: HostMemory + HostOps>(
+        _state: &mut DeviceState,
+        _host: &mut M,
+        _task_id: u32,
+        _span: crate::runtime::draw::GvaSpan,
+    ) -> Option<Self> {
+        None
+    }
+}
+
+/// A sampled binding that covers one IOSurface whole, as
+/// [`RailStage::surface_resident`] is asked about it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SurfaceSampleWindow {
+    pub mapping_id: u32,
+    pub map_generation: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The format the binding samples, which is the surface's own.
+    pub format: u16,
 }
 
 /// The storage-mirror window a staged binding corresponds to.
@@ -2223,6 +2263,49 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 "compute_stage_tex_mapper_ref_texture_span",
             ));
         }
+        // A sampled binding of the whole surface, in the surface's own format,
+        // may be served by an image the rail already holds for it. Anything
+        // narrower — a sub-window, an offset plane, a reinterpreting view —
+        // stages the pages, because the held image is the surface and not that
+        // window of it.
+        if !is_storage && !(surface_offset == 0 && stage_fmt == format) {
+            crate::runtime::drain::note_store_route("compute_sampled_surface_resident_window");
+            if crate::observe::first_sight(
+                "compute_sampled_surface_resident_window",
+                u64::from(mapping_id),
+            ) {
+                crate::observe::off(format!(
+                    "compute_sampled_surface_resident_window mapping={mapping_id} {width}x{height} \
+                     off={surface_offset} stage_fmt={stage_fmt:#x} fmt={format:#x}"
+                ));
+            }
+        }
+        if !is_storage && surface_offset == 0 && stage_fmt == format {
+            if let Some(rail) = R::surface_resident(
+                state,
+                &*host,
+                &SurfaceSampleWindow {
+                    mapping_id,
+                    map_generation,
+                    width,
+                    height,
+                    format: stage_fmt,
+                },
+            ) {
+                return Ok(StagedTexture {
+                    binding,
+                    pixel_format: stage_fmt,
+                    storage_selector,
+                    mip_levels: 1,
+                    width,
+                    height,
+                    bytes: Vec::new(),
+                    is_storage,
+                    writeback: TextureWriteback::None,
+                    rail,
+                });
+            }
+        }
         let residency_key = crate::model::ComputeStorageResidencyKey {
             mapping_id,
             map_generation,
@@ -2488,6 +2571,43 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             bpp,
             texture_ref,
         ));
+    }
+    // A sampled single-level texture read whole, in its own format, may be
+    // served by the image a render Store left for this span — staging it would
+    // copy the guest's pages of that very image back to the device.
+    if !is_storage
+        && view_level == 0
+        && level_sources.len() == 1
+        && stage_format == tex.pixel_format
+    {
+        if let Ok(row_stride) = u32::try_from(layout.row_stride) {
+            if let Some(rail) = R::gva_resident(
+                state,
+                host,
+                task_id,
+                crate::runtime::draw::GvaSpan {
+                    texture_ref: stage_ref,
+                    gva,
+                    row_stride,
+                    width: w,
+                    height: h,
+                    format: tex.pixel_format,
+                },
+            ) {
+                return Ok(StagedTexture {
+                    binding,
+                    pixel_format: stage_format,
+                    storage_selector,
+                    width: w,
+                    height: h,
+                    mip_levels: 1,
+                    bytes: Vec::new(),
+                    is_storage,
+                    writeback: TextureWriteback::None,
+                    rail,
+                });
+            }
+        }
     }
     let Some(pyramid) = reims_vgpu_protocol::extent::tight_pyramid_spans(
         w,
