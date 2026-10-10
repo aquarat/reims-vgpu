@@ -78,7 +78,6 @@ in the host repository.
 - Pipelines with no fragment function are refused, so screenshots of
   Compose/Skia apps are mostly flat colour. UI tests that use accessibility
   are not affected. Being fixed.
-- Some object references resolve to the wrong object type (`wrong_type`).
 - `memcpy` is 70 % of the drain's CPU time after compaction; part of it is an
   extra copy through an intermediate buffer, which can go.
 
