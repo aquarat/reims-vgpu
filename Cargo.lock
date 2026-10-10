@@ -654,7 +654,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan"
 version = "0.1.0"
-source = "git+https://github.com/aquarat/metal2vulkan.git?rev=9b8e86b4bd50cadd31996082af4cc7ea68aba0cc#9b8e86b4bd50cadd31996082af4cc7ea68aba0cc"
+source = "git+https://github.com/aquarat/metal2vulkan.git?rev=6406b8eb6edde9264c36051d012dbfddf99e3519#6406b8eb6edde9264c36051d012dbfddf99e3519"
 dependencies = [
  "spirv",
  "wait-timeout",

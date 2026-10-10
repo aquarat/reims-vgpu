@@ -89,7 +89,7 @@ reims-vgpu-vulkan = { path = "../reims-vgpu-vulkan", optional = true }
 # Vulkan build does not also pay.
 reims-vgpu-core = { path = "../reims-vgpu-core" }
 # Always available for Linux MTLB→AIR→SPIR-V (encode path + probes).
-metal2vulkan = { git = "https://github.com/aquarat/metal2vulkan.git", rev = "9b8e86b4bd50cadd31996082af4cc7ea68aba0cc" }
+metal2vulkan = { git = "https://github.com/aquarat/metal2vulkan.git", rev = "6406b8eb6edde9264c36051d012dbfddf99e3519" }
 winit = { version = "0.30", optional = true }
 ash-window = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
