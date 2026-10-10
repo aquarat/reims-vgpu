@@ -6709,6 +6709,22 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     host: &mut H,
     channel_id: u32,
 ) {
+    drain_child_fifo_turn(state, host, channel_id, usize::MAX);
+}
+
+/// [`drain_child_fifo`] for at most `budget` packets, re-arming the channel when
+/// it stops with packets still on the ring.
+///
+/// The turn [`drain_pending`] gives each pending channel; see
+/// [`CHILD_PACKETS_PER_TURN`] for why the drain takes channels in turns rather
+/// than one ring at a time.
+fn drain_child_fifo_turn<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    channel_id: u32,
+    budget: usize,
+) {
+    let mut taken = 0usize;
     if state.gfx.root_page == 0 {
         return;
     }
@@ -6852,6 +6868,13 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 settle_model_work(state, host);
 
                 if tranche_should_stop(state) {
+                    if head != tail {
+                        state.pending.child_mask |= bit;
+                    }
+                    break;
+                }
+                taken += 1;
+                if taken >= budget {
                     if head != tail {
                         state.pending.child_mask |= bit;
                     }
@@ -7902,16 +7925,35 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
 /// because "apply it sooner" is only safe for registers whose effect is to
 /// publish more work, and unsafe for any the decode below depends on not
 /// changing mid-tranche.
-/// How many times one tranche will pick up newly rung child channels.
+/// Packets one child channel runs before the drain moves to the next pending
+/// channel.
 ///
-/// Not a time budget and not a work budget — a bound on how many times the
-/// drain will go back for doorbells that arrived while it was running. Three
-/// covers the measured shape: `gfx_doorbell_delay` reads about a hundred rings
-/// a second against tranches of tens of milliseconds, so at most a handful of
-/// channels are rung during any one pass and a channel already served is
-/// excluded from the refill. The cap exists so a guest that rings continuously
-/// cannot hold the device lock indefinitely, not because any run has needed it.
-const CHILD_DOORBELL_REFILLS: u32 = 3;
+/// The guest submits to several channels at once and orders some of what it
+/// does across them by submission time alone: it deletes an object on one
+/// channel, writes a new object into the same list slot and binds it from
+/// another, with no stamp between the two. A drain that runs one ring dry
+/// before looking at the next processes those in channel-number order instead,
+/// and the later channel's use arrives here before the earlier channel's
+/// delete. With the drain on its own thread the guest is not stopped by the
+/// drain and many packets accumulate per tranche, so this happened tens of
+/// times a run (`delete_object_*_type_differs`, 30-45 a sustained simulator
+/// run against 3-10 with the drain on the main loop).
+///
+/// Taking channels a packet at a time keeps what the drain runs close to the
+/// order the guest submitted it in. It cannot reorder anything the guest
+/// ordered: within a channel packets still run in ring order, and across
+/// channels the only ordering the guest states is a stamp wait, which the
+/// model enforces whatever order the rings are read in.
+const CHILD_PACKETS_PER_TURN: usize = 1;
+
+/// Rounds of channel turns one tranche will run before handing the rest to the
+/// next wakeup.
+///
+/// Bounds how long a guest that keeps every ring busy holds the device lock.
+/// The remainder is not dropped: it stays armed and the drain is woken again,
+/// which is what the earlier tranche budget lacked when it froze a boot for
+/// 29 s.
+const CHILD_DRAIN_ROUNDS: u32 = 256;
 
 /// Move child channels the guest rang lock-free into the drain's pending mask.
 ///
@@ -8031,55 +8073,46 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         drain_main_fifo(state, host);
     }
     fold_rung_child_doorbells(state);
-    let mut mask = state.pending.child_mask;
-    state.pending.child_mask = 0;
-    // Channels this pass has already run, so a refill cannot re-run one.
-    let mut served = 0u32;
-    // Bounded refills. Each pass picks up channels the guest rang *while the
-    // previous pass was running, under the device lock it could not take* —
-    // which is the whole point, and is why the doorbell was worth making
-    // lock-free. Serving them here rather than next tranche is what turns a
-    // ring into work that starts now.
-    //
-    // Bounded because the guest can ring faster than this drains, and an
-    // unbounded refill would hold the device lock for as long as it kept
-    // ringing. Leaving the remainder is safe here in a way it was NOT for the
-    // reverted tranche budget: that one returned with `child_mask` set and
-    // nothing to re-arm it, and froze a boot for 29 s. Every bit that arrives
-    // here arrives with its own `schedule_bh` already rung by the vCPU, so the
-    // worker is guaranteed another wakeup for whatever this pass leaves.
-    for _ in 0..CHILD_DOORBELL_REFILLS {
-        let mut remaining = mask;
+    // Pending channels are taken in turns of `CHILD_PACKETS_PER_TURN` packets
+    // rather than one ring at a time; see that constant for why. A channel that
+    // still has packets after its turn is re-armed by `drain_child_fifo_turn`
+    // and comes round again, and channels the guest rings meanwhile join the
+    // next round. A guest that keeps every ring busy is bounded by
+    // `CHILD_DRAIN_ROUNDS`, after which the remainder stays armed and the drain
+    // is woken again rather than left for a doorbell that has already rung.
+    let mut mask = std::mem::take(&mut state.pending.child_mask);
+    let mut rounds = 0u32;
+    while mask != 0 {
         for ch in 1..MAX_CHANNELS as u32 {
             let bit = 1u32 << ch;
-            if mask & bit != 0 {
-                remaining &= !bit;
-                served |= bit;
-                drain_child_fifo(state, host, ch);
-                if state.translation_deferred_mask != 0 {
-                    state.pending.child_mask |= remaining | state.translation_deferred_mask;
-                    note_translation_order_hold(state, remaining);
-                    return;
-                }
-                if tranche_should_stop(state) {
-                    state.pending.child_mask |= remaining;
-                    return;
-                }
+            if mask & bit == 0 {
+                continue;
+            }
+            mask &= !bit;
+            drain_child_fifo_turn(state, host, ch, CHILD_PACKETS_PER_TURN);
+            if state.translation_deferred_mask != 0 {
+                state.pending.child_mask |= mask | state.translation_deferred_mask;
+                note_translation_order_hold(state, mask);
+                return;
+            }
+            if tranche_should_stop(state) {
+                state.pending.child_mask |= mask;
+                return;
             }
         }
         fold_rung_child_doorbells(state);
-        // Only channels this pass has not already run: a channel rung again
-        // while its own drain was in flight has had that work seen, and
-        // re-running it here would spin on one busy channel while the others
-        // wait.
-        mask = std::mem::take(&mut state.pending.child_mask) & !served;
-        if mask == 0 {
+        mask = std::mem::take(&mut state.pending.child_mask);
+        rounds += 1;
+        if mask != 0 && rounds >= CHILD_DRAIN_ROUNDS {
+            state.pending.child_mask |= mask;
+            note_store_route("child_drain_round_bound");
+            host.schedule_bh();
             break;
         }
-        note_store_route("child_doorbell_refill");
+        if mask != 0 {
+            note_store_route("child_doorbell_refill");
+        }
     }
-    // Whatever the refill cap left, handed back to the next wakeup.
-    state.pending.child_mask |= mask;
     // The successor of `retry_stamp_held_timelines`, which walked channels in
     // id order and re-offered the ones held on a slot a higher-numbered channel
     // publishes. There is no walk to get out of order any more: a released

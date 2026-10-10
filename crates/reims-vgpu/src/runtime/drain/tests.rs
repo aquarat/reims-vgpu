@@ -2149,6 +2149,65 @@ fn a_waiting_vcpu_ends_the_tranche_at_the_next_packet() {
     assert!(!state.pending.lock_yield);
 }
 
+/// Pending channels are drained in turns, not one ring at a time, so packets
+/// the guest submitted to different channels run close to the order it
+/// submitted them in.
+///
+/// Two channels publish into one stamp slot so the order is observable: channel
+/// 3 carries the words 10 and 30 and channel 5 the word 20. In turns the slot
+/// ends at 30; one ring at a time it would have run 10, 30, 20 and ended on 20,
+/// with the word moving backwards on the way.
+#[test]
+fn pending_channels_are_drained_in_turns() {
+    use crate::model::CHILD_OP_NOP;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = state.page_size() as usize;
+    let root_pfn = 0x10u32;
+    let stamp_pfn = 0x40u32;
+    let root_gpa = state.pfn_gpa(root_pfn);
+    let stamp_gpa = state.pfn_gpa(stamp_pfn);
+    host.map_range(root_gpa, page_size, 0);
+    host.map_range(stamp_gpa, page_size, 0);
+    state.gfx.root_page = root_pfn;
+    state.gfx.fifo_base_page = stamp_pfn;
+    let mut heads = Vec::new();
+    for (channel, list_pfn, ring_pfn, words) in
+        [(3u32, 0x20u32, 0x30u32, vec![10u32, 30]), (5, 0x21, 0x31, vec![20])]
+    {
+        let list_gpa = state.pfn_gpa(list_pfn);
+        let ring_gpa = state.pfn_gpa(ring_pfn);
+        host.map_range(list_gpa, page_size, 0);
+        host.map_range(ring_gpa, page_size, 0);
+        let mut ring = Vec::new();
+        for w in &words {
+            ring.extend_from_slice(&packet_bytes(CHILD_OP_NOP, *w, &[]));
+        }
+        host.write_gpa(ring_gpa, &ring).unwrap();
+        host.put_u32(list_gpa, ring_pfn);
+        let regs_gpa = root_gpa + child_reg_block_offset(channel).unwrap();
+        host.put_u32(regs_gpa + CHILD_REG_TAIL, ring.len() as u32);
+        host.put_u32(regs_gpa + CHILD_REG_HEAD, 0);
+        host.put_u32(regs_gpa + CHILD_REG_STAMP_INDEX, 1);
+        host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
+        heads.push((regs_gpa, ring.len() as u32));
+    }
+    state.open_child_domains_for_test((1u32 << 3) | (1u32 << 5));
+    state.pending.child_mask = (1u32 << 3) | (1u32 << 5);
+
+    drain_pending(&mut state, &mut host);
+    for (regs_gpa, len) in heads {
+        assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), len, "every ring drained");
+    }
+    assert_eq!(state.pending.child_mask, 0);
+    assert_eq!(
+        host.get_u32(stamp_gpa + 4),
+        30,
+        "channel 3's second packet ran after channel 5's first"
+    );
+}
+
 /// The vCPU yield never cuts a nested drain short. A present drains the other
 /// channels from inside its own packet so the frame it publishes includes
 /// their work; stopping there would change what is presented, not when.
