@@ -683,8 +683,7 @@ fn stage_tag(stage: Stage) -> u8 {
     }
 }
 
-/// The bucket digest for a non-kernel shader: 64 bits of SipHash over stage +
-/// AIR.
+/// The bucket digest for a non-kernel shader: [`fold_air`] over stage + AIR.
 ///
 /// # This narrows the search and decides nothing
 ///
@@ -700,15 +699,11 @@ fn stage_tag(stage: Stage) -> u8 {
 /// cannot observe was not, and the same doc already named retaining the AIR as
 /// the answer.
 ///
-/// `air.hash()` writes a length prefix before the bytes, per `Hash for [u8]`, so
-/// two blobs of different lengths are not merely unlikely to share a bucket —
-/// the length is in the digest too. That is now a statement about walk length
+/// The length is folded in as well, so two blobs of different lengths are not
+/// merely unlikely to share a bucket. That is a statement about walk length
 /// rather than about correctness.
 fn air_key(stage: Stage, air: &[u8]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    stage_tag(stage).hash(&mut h);
-    air.hash(&mut h);
-    h.finish()
+    fold_air(u64::from(stage_tag(stage)), air, &[])
 }
 
 /// The bucket digest for a kernel, which includes LocalSize because the SPIR-V
@@ -721,11 +716,61 @@ fn air_key(stage: Stage, air: &[u8]) -> u64 {
 /// would be the wrong-shader hazard [`air_key`] describes, except reachable by a
 /// guest doing something entirely ordinary rather than by chance.
 fn air_key_kernel(air: &[u8], local_size: [u32; 3]) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    stage_tag(Stage::Kernel).hash(&mut h);
-    air.hash(&mut h);
-    local_size.hash(&mut h);
-    h.finish()
+    fold_air(u64::from(stage_tag(Stage::Kernel)), air, &local_size)
+}
+
+/// A fast 64-bit fold of a shader's AIR, for the bucket digest and nothing else.
+///
+/// The digest is computed on every pipeline lookup — every draw and dispatch
+/// that names a shader, not once per shader — over the whole AIR blob, tens of
+/// kilobytes each. It used to be `DefaultHasher` (SipHash-1-3), whose keyed,
+/// DoS-resistant mixing this prefilter has no use for: [`ShaderId`] compares the
+/// retained bytes on every hit, so a collision costs a longer bucket walk and
+/// never a wrong shader. Measured on an iOS-simulator compositor workload,
+/// that SipHash was 8% of the drain thread's cycles.
+///
+/// This folds eight bytes per step in four independent lanes (so the multiply
+/// chains overlap), with the multiply-rotate step of the Fx hash and a
+/// SplitMix64 finalizer so the low bits a `HashMap` buckets on depend on every
+/// input word. `tag` and `extra` (the kernel's local size) and the length go
+/// in too. Deterministic, so it is stable across the process, which is all the
+/// cache asks of it.
+fn fold_air(tag: u64, air: &[u8], extra: &[u32]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    #[inline(always)]
+    fn step(h: u64, w: u64) -> u64 {
+        (h.rotate_left(5) ^ w).wrapping_mul(K)
+    }
+    let mut lanes = [tag, tag ^ 1, tag ^ 2, tag ^ 3];
+    let (blocks, rest) = air.as_chunks::<32>();
+    for block in blocks {
+        let (words, _) = block.as_chunks::<8>();
+        for (lane, word) in lanes.iter_mut().zip(words) {
+            *lane = step(*lane, u64::from_le_bytes(*word));
+        }
+    }
+    let mut h = step(tag, air.len() as u64);
+    for lane in lanes {
+        h = step(h, lane);
+    }
+    let (words, tail) = rest.as_chunks::<8>();
+    for word in words {
+        h = step(h, u64::from_le_bytes(*word));
+    }
+    if !tail.is_empty() {
+        let mut last = [0u8; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        h = step(h, u64::from_le_bytes(last));
+    }
+    for &x in extra {
+        h = step(h, u64::from(x));
+    }
+    // SplitMix64 finalizer.
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 /// Process-local temp dir for m2v path-based translate (reused across draws).
@@ -1641,6 +1686,34 @@ mod tests {
         let again = shader.variant(true, true).words.clone();
         assert!(Arc::ptr_eq(&both, &again));
         assert_eq!(*shader.words, widened);
+    }
+
+    #[test]
+    fn the_air_fold_sees_every_byte_the_length_and_the_extras() {
+        // Every lane, the 32-byte block remainder, the 8-byte tail and a
+        // trailing partial word: flipping any one byte moves the digest.
+        for len in [0usize, 1, 7, 8, 9, 31, 32, 33, 63, 64, 65, 200] {
+            let base: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let digest = fold_air(1, &base, &[]);
+            for at in 0..len {
+                let mut flipped = base.clone();
+                flipped[at] ^= 0x40;
+                assert_ne!(fold_air(1, &flipped, &[]), digest, "len={len} byte {at}");
+            }
+            // A zero byte appended is a different blob, not padding.
+            let mut longer = base.clone();
+            longer.push(0);
+            assert_ne!(fold_air(1, &longer, &[]), digest, "len={len} + zero byte");
+            assert_ne!(fold_air(2, &base, &[]), digest, "len={len} tag");
+        }
+        let air = [5u8; 40];
+        assert_ne!(fold_air(3, &air, &[8, 8, 1]), fold_air(3, &air, &[8, 1, 8]));
+        assert_ne!(fold_air(3, &air, &[]), fold_air(3, &air, &[0]));
+        assert_eq!(
+            fold_air(3, &air, &[4]),
+            fold_air(3, &air, &[4]),
+            "deterministic"
+        );
     }
 
     #[test]
