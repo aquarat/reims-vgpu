@@ -1422,6 +1422,101 @@ pub(crate) trait RailStage: Sized {
     ) -> Option<Self> {
         None
     }
+
+    /// Whether this rail copies a sampled linear binding's texels into its own
+    /// upload memory straight out of the guest's pages, given a
+    /// [`StagedGuestRead`] in place of the bytes.
+    ///
+    /// Asked before the pages are mapped, so a rail that answers `false` costs
+    /// nothing and stages bytes exactly as before.
+    const TAKES_GUEST_READS: bool = false;
+
+    /// Hand this rail half a sampled binding's guest read, or give it back so
+    /// the caller reads bytes instead. Only called when
+    /// [`Self::TAKES_GUEST_READS`] holds.
+    fn take_guest_read(&mut self, read: StagedGuestRead) -> Result<(), StagedGuestRead> {
+        Err(read)
+    }
+}
+
+/// A sampled linear binding's texels, left in the guest's pages: the layout
+/// that packs them and the views it points into.
+///
+/// What the bytes path would have read into a `Vec` and the rail would then
+/// have copied into its upload memory; the rail gathers it there in one copy
+/// instead. The views are mapped by this staging and must be released in the
+/// same drain call — whoever takes the read takes that obligation with
+/// [`Self::take_views`].
+#[derive(Debug)]
+pub(crate) struct StagedGuestRead {
+    pub layout: crate::runtime::guest_ram::PackedGuestLayout,
+    views: Vec<(usize, usize)>,
+}
+
+impl StagedGuestRead {
+    /// The views to release once the layout has been consumed. The layout's
+    /// pointers are dangling from the moment they are released.
+    pub(crate) fn take_views(&mut self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut self.views)
+    }
+}
+
+/// Map a sampled single-level linear window for a [`StagedGuestRead`], or
+/// `None` for the bytes path to read it instead.
+///
+/// The bytes path's own preliminaries run first and in the same order —
+/// a cached copy of exactly this window is served from host memory, an owed
+/// write-back is paid and outstanding guest writes settle before the pages
+/// are read — so the texels the rail gathers are the ones
+/// [`read_linear_level`] would have returned. Every `None` is a routing
+/// answer: the bytes path repeats the read and reports any refusal itself.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the window, its gva, stride and extent are the same explicit geometry read_linear_level takes"
+)]
+fn stage_guest_read<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    window: &crate::runtime::surface_cache::LinearWindow,
+    gva: u64,
+    row_stride: u64,
+    tight: usize,
+    height: u32,
+) -> Option<StagedGuestRead> {
+    if crate::runtime::surface_cache::get_linear_texture(state, window).is_some() {
+        crate::runtime::drain::note_store_route("compute_stage_guest_read_cached");
+        return None;
+    }
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
+    crate::runtime::render_writeback::settle_guest_writes(
+        crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
+    );
+    let span_len = u64::from(height.checked_sub(1)?)
+        .checked_mul(row_stride)?
+        .checked_add(tight as u64)?;
+    let Ok(mapped) = crate::runtime::gva_view::map_span_runs(state, host, task_id, gva, span_len)
+    else {
+        crate::runtime::drain::note_store_route("compute_stage_guest_read_unmapped");
+        return None;
+    };
+    match crate::runtime::guest_ram::PackedGuestLayout::rows(
+        mapped.runs(),
+        height,
+        row_stride,
+        tight as u64,
+    ) {
+        Some(layout) => Some(StagedGuestRead {
+            layout,
+            views: mapped.into_views(),
+        }),
+        None => {
+            crate::runtime::drain::note_store_route("compute_stage_guest_read_layout");
+            crate::runtime::gva_view::release_span_views(host, mapped.into_views());
+            None
+        }
+    }
 }
 
 /// A sampled binding that covers one IOSurface whole, as
@@ -2677,7 +2772,6 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             stage_format,
         )
     });
-    let mut bytes = vec![0u8; pyramid_need];
     // Resident-authoritative window (deferred linear writeback): consume the
     // rail's resident without bytes when possible; otherwise flush it into the
     // entry first — falling through to the raw guest read would silently serve
@@ -2714,6 +2808,46 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             stage_format
         ));
     }
+    // A sampled single level the rail gathers itself: no bytes are read here,
+    // and the rail copies the guest's pages straight into its upload memory.
+    // Everything this binding would otherwise carry is the bytes path's own
+    // answer for a sampled level — no write-back, no residency, nothing served.
+    if R::TAKES_GUEST_READS && !is_storage && serve.is_none() && level_sources.len() == 1 {
+        if let Some(read) = stage_guest_read(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            &window,
+            gva,
+            layout.row_stride,
+            tight,
+            h,
+        ) {
+            let mut rail = R::stage(texture_ref, None, None);
+            match rail.take_guest_read(read) {
+                Ok(()) => {
+                    crate::runtime::drain::note_store_route("compute_stage_guest_read");
+                    return Ok(StagedTexture {
+                        binding,
+                        pixel_format: stage_format,
+                        storage_selector,
+                        width: w,
+                        height: h,
+                        mip_levels: 1,
+                        bytes: Vec::new(),
+                        is_storage,
+                        writeback: TextureWriteback::None,
+                        rail,
+                    });
+                }
+                Err(mut read) => {
+                    crate::runtime::gva_view::release_span_views(host, read.take_views());
+                }
+            }
+        }
+    }
+    let mut bytes = vec![0u8; pyramid_need];
     if serve.is_some() {
         // The rail's resident serves this window; no cache/guest read.
     } else {

@@ -3436,6 +3436,42 @@ impl ResourcePools {
         Ok(())
     }
 
+    /// Gather guest texels straight into a mapped staging slot.
+    ///
+    /// The compute rail used to read a sampled texture's guest pages into a
+    /// heap `Vec` and then [`Self::write_staging`] that `Vec` here — two full
+    /// copies and an allocation per bind, for bytes nothing else reads. The
+    /// layout names every packed byte's guest address, so this is the single
+    /// copy, in the layout's own segments (one per guest run on a dense
+    /// window, one per row fragment on a padded one). The same freshness as
+    /// the read it replaces: it races guest CPU writes exactly as that did.
+    ///
+    /// # Safety
+    ///
+    /// Every run in `layout` must be a live, readable host view of guest
+    /// memory for the duration of this call.
+    pub(crate) unsafe fn write_staging_gathered(
+        &self,
+        ctx: &DeviceContext,
+        slot: &BufferSlot,
+        layout: &crate::runtime::guest_ram::PackedGuestLayout,
+    ) -> Result<(), DrawError> {
+        let len = layout.packed_len();
+        let _slow = SlowStagingWrite::watch("guest_layout", len, layout.segments().len());
+        let size = len.max(4);
+        let ptr = staging_write_ptr(ctx, slot, size)?;
+        unsafe {
+            // SAFETY: `ptr` is the mapped staging span of `size >= len` bytes,
+            // and the layout writes exactly `0..len` of it.
+            layout.gather_into(ptr);
+            if len < size {
+                // The 4-byte minimum tail, so the bind reads defined memory.
+                std::ptr::write_bytes(ptr.add(len as usize), 0, (size - len) as usize);
+            }
+        }
+        Ok(())
+    }
+
     /// Copy into a mapped staging slot with R and B exchanged.
     ///
     /// The exchange is an involution, so this serves both directions: a

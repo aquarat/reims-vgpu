@@ -1715,6 +1715,18 @@ pub enum ComputeSampledSource {
     /// declares, base first, tightly packed by
     /// [`reims_vgpu_protocol::extent::tight_pyramid_spans`].
     Bytes(Vec<u8>),
+    /// The same upload, still in the guest's pages: the staging buffer is
+    /// filled by gathering the layout straight into its mapping, so the texels
+    /// are copied once instead of into a `Vec` and then again into staging.
+    ///
+    /// A single level, tightly packed — exactly what [`Self::Bytes`] would have
+    /// held for it, and checked against the same length.
+    ///
+    /// The layout's runs are host views over guest pages that the runtime
+    /// mapped for this request and releases when the engine call returns. The
+    /// engine reads them only inside that call, under the engine lock, which is
+    /// why a request carrying one must never be retained past it.
+    Gathered(crate::runtime::guest_ram::PackedGuestLayout),
     /// A device-local copy from the named resident storage image into a pooled
     /// transient (copy-on-sample: the transient never aliases the live
     /// resident, so the same dispatch may storage-write it).

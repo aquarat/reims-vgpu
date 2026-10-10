@@ -318,9 +318,22 @@ pub(crate) struct VulkanStage {
     /// it in the same way `multisample_target` is: nothing is staged. See
     /// [`RailStage::surface_resident`].
     pub(crate) resident_target: Option<crate::backend::vulkan::engine::TargetIdentity>,
+    /// A sampled binding's texels left in the guest's pages, for the engine to
+    /// gather straight into its staging buffer. Exclusive with everything above
+    /// it: `bytes` is empty and nothing is served. The views it points into are
+    /// handed to the dispatch's release list the moment staging returns, so
+    /// none can outlive the dispatch. See [`RailStage::take_guest_read`].
+    pub(crate) guest_read: Option<StagedGuestRead>,
 }
 
 impl RailStage for VulkanStage {
+    const TAKES_GUEST_READS: bool = true;
+
+    fn take_guest_read(&mut self, read: StagedGuestRead) -> Result<(), StagedGuestRead> {
+        self.guest_read = Some(read);
+        Ok(())
+    }
+
     /// The guest ref is not kept: this rail reaches its images through the
     /// engine's own registry and never names the object the guest bound.
     fn stage(
@@ -335,6 +348,7 @@ impl RailStage for VulkanStage {
             serve,
             multisample_target: None,
             resident_target: None,
+            guest_read: None,
         }
     }
 
@@ -402,6 +416,7 @@ impl RailStage for VulkanStage {
             serve: None,
             multisample_target: None,
             resident_target: Some(identity),
+            guest_read: None,
         })
     }
 
@@ -435,6 +450,7 @@ impl RailStage for VulkanStage {
             serve: None,
             multisample_target: None,
             resident_target: Some(identity),
+            guest_read: None,
         })
     }
 }
@@ -593,6 +609,26 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     task_id: u32,
     acc: &ComputeAccum,
     dispatch: &DispatchRecord,
+) -> ComputeStatus {
+    // Guest views mapped for this dispatch's gathered inputs. Released here,
+    // on every return path of the dispatch, and only after the engine call that
+    // reads through them has returned — which is the whole lifetime the
+    // request's `ComputeSampledSource::Gathered` layouts are promised.
+    let mut views = Vec::new();
+    let status = execute_dispatch_linux_viewed(state, host, task_id, acc, dispatch, &mut views);
+    crate::runtime::gva_view::release_span_views(host, views);
+    status
+}
+
+/// [`execute_dispatch_linux`], with the list its staged guest reads hand their
+/// views to.
+fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    acc: &ComputeAccum,
+    dispatch: &DispatchRecord,
+    views: &mut Vec<(usize, usize)>,
 ) -> ComputeStatus {
     use crate::backend::vulkan::engine::{
         self as vk_engine, ComputeBufferResource, ComputeImageResult, ComputeRequest,
@@ -976,6 +1012,11 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             is_storage,
         ) {
             Ok(mut s) => {
+                // First, before anything below can return: from here the
+                // dispatch's release list owns these views.
+                if let Some(read) = s.rail.guest_read.as_mut() {
+                    views.extend(read.take_views());
+                }
                 s.rail.array_element = descriptor.array_element;
                 s.rail.descriptor_count = descriptor.descriptor_count;
                 if let Some(storage_access) = storage_access {
@@ -1270,7 +1311,10 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                                 generation,
                             },
                         ),
-                        None => ComputeSampledSource::Bytes(std::mem::take(&mut t.bytes)),
+                        None => match t.rail.guest_read.take() {
+                            Some(read) => ComputeSampledSource::Gathered(read.layout),
+                            None => ComputeSampledSource::Bytes(std::mem::take(&mut t.bytes)),
+                        },
                     },
                 },
             });
@@ -2085,6 +2129,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
             serve: None,
             multisample_target: Some(identity),
             resident_target: None,
+            guest_read: None,
         },
     })
 }
