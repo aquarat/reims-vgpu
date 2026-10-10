@@ -862,6 +862,53 @@ fn put_list_entry(
     gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &le);
 }
 
+/// A render pipeline whose descriptor names no fragment function loads.
+///
+/// Metal allows one: rasterization runs, depth and stencil are tested and
+/// written, and no colour attachment is touched. Skia's stencil passes are
+/// built that way, and `load_render_pipeline` used to refuse every one of them
+/// as `fragment_func_zero`, which left a Compose UI's frames at the clear
+/// colour. The rail builds the stage (`pipeline_resolve::null_fragment`); the
+/// loader's part is only to hand the descriptor over with the absence intact.
+#[test]
+fn a_render_pipeline_without_a_fragment_function_loads() {
+    use crate::runtime::decode::resource::SERIALIZER_OBJECT_FIRST_TLVS;
+    let _guard = icb_test_guard();
+    let (mut host, state) = icb_device();
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], SERIALIZER_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    st32(&mut pdesc[8..], 32 - SERIALIZER_OBJECT_FIRST_TLVS as u32);
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS] = 1;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[SERIALIZER_OBJECT_FIRST_TLVS + 3..], 2);
+    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    put_object(
+        &mut host,
+        &state,
+        5,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        gva,
+        &pdesc,
+    );
+
+    let cap = crate::observe::FailCapture::start();
+    let desc = crate::runtime::draw::load_render_pipeline(&state, &host, 1, 5)
+        .expect("a vertex-only render pipeline is a pipeline");
+    assert_eq!(desc.vertex_func_ref, 2);
+    assert_eq!(desc.fragment_func_ref, 0);
+    let refusals: Vec<_> = cap
+        .lines()
+        .into_iter()
+        .filter(|line| line.starts_with("draw_load_pipeline"))
+        .collect();
+    assert!(
+        refusals.is_empty(),
+        "loading it must refuse nothing: {refusals:?}"
+    );
+}
+
 #[test]
 fn load_icb_from_object_list() {
     let _guard = icb_test_guard();

@@ -6866,12 +6866,22 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
         // The mask is read from the same entry but *not* through the
         // `blending_enabled` filter below: `MTLColorWriteMask` applies whether
         // or not the slot blends, and an entry with no mask means `all`.
+        //
+        // Except with no fragment function, where nothing is written to any
+        // slot: the entries were already masked when the pipeline resolved
+        // (`pipeline_resolve::null_fragment`), and a slot with no entry must
+        // not fall back to `all`, which would let Vulkan store the undefined
+        // value of an output the stage never wrote.
         let color_write_mask = pipeline
             .color_attachments
             .iter()
             .find(|a| a.slot == c.slot)
             .map(|a| a.write_mask)
-            .unwrap_or_default();
+            .unwrap_or(if pipeline.fragment_func_ref == 0 {
+                crate::runtime::decode::resource::ColorWriteMask::NONE
+            } else {
+                crate::runtime::decode::resource::ColorWriteMask::ALL
+            });
         // The six ordinals travel to the engine as the guest wrote them. An
         // out-of-contract factor or op used to make *this slot* unblended with
         // a decline of its own, which is a compositing attachment quietly
@@ -13889,7 +13899,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipeline_ref: u32,
-) -> Result<(Vec<u8>, Vec<u8>), DrawPreparationDecline> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), DrawPreparationDecline> {
     let pd = load_render_pipeline(state, host, task_id, pipeline_ref).ok_or(
         DrawPreparationDecline::PipelineMissing {
             task_id,
@@ -13902,6 +13912,11 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
             function_ref: pd.vertex_func_ref,
         },
     )?;
+    // `None` for a pipeline with no fragment function, which has nothing to
+    // translate on that side; see `pipeline_resolve::null_fragment`.
+    if pd.fragment_func_ref == 0 {
+        return Ok((v_mtlb, None));
+    }
     let f_mtlb = load_mtlb(
         state,
         host,
@@ -13913,7 +13928,7 @@ pub(crate) fn load_render_mtlb_pair<M: HostMemory + HostOps>(
         task_id,
         function_ref: pd.fragment_func_ref,
     })?;
-    Ok((v_mtlb, f_mtlb))
+    Ok((v_mtlb, Some(f_mtlb)))
 }
 
 /// Report the **residual** in-contract `MTLLoadActionDontCare` — one this

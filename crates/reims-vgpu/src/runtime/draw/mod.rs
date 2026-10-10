@@ -913,25 +913,23 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
             return None;
         }
     };
-    // Both stages are required to build a pipeline, and the two are reported
-    // apart because they are different guest mistakes — the compute sibling
-    // names its one stage the same way, as `kernel_func_zero`.
+    // A vertex function is required. A fragment function is not: Metal allows
+    // a render pipeline without one (depth and stencil only, no colour
+    // written), and Skia's stencil passes are exactly that. Each rail decides
+    // how to build it; the Vulkan rail substitutes a stage that does nothing
+    // and masks every colour write (`pipeline_resolve::null_fragment`).
     if p.vertex_func_ref == 0 {
         report.reason(task_id, pipeline_ref, "vertex_func_zero", "");
-        return None;
-    }
-    if p.fragment_func_ref == 0 {
-        report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
     // The guest has created this pipeline object, which is the semantic model's
     // `Declared` and nothing more — no host work has started here, and both
     // rails reach this same door before any of theirs does.
     //
-    // After the two zero-stage checks rather than before them: a descriptor
-    // naming no vertex or fragment function is not a pipeline the guest can
-    // ever bind, and declaring one would put a name in the table that nothing
-    // will ever advance or retire.
+    // After the zero-stage check rather than before it: a descriptor naming no
+    // vertex function is not a pipeline the guest can ever bind, and declaring
+    // one would put a name in the table that nothing will ever advance or
+    // retire.
     if let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) {
         crate::runtime::drain::note_store_route(if state.declare_pipeline(name) {
             "pipeline_declared"

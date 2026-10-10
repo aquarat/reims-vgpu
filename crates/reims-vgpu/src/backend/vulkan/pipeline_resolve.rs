@@ -325,6 +325,94 @@ pub(crate) fn retained_pipeline_for_test() -> Arc<ResolvedRenderPipeline> {
     retained_pipeline_with_desc_for_test(RenderPipelineDescriptor::default())
 }
 
+/// The fragment stage of a render pipeline whose guest descriptor names none.
+///
+/// Metal allows a render pipeline with no fragment function: rasterization
+/// still runs, depth and stencil are still tested and written, and no colour
+/// attachment is written. Skia draws its stencil-then-cover paths that way,
+/// so a Compose UI built on it puts one such pipeline in front of nearly every
+/// shape. Refusing them (`fragment_func_zero`) dropped the stencil passes, the
+/// cover passes that test against the stencil drew nothing, and the frames came
+/// out as the clear colour.
+///
+/// Vulkan can build that pipeline without a fragment stage too, but every
+/// consumer on this rail holds a vertex and a fragment translation, so the
+/// rail gets a fragment stage that does nothing: one entry point, no inputs, no
+/// outputs, no resources. Paired with every colour write mask forced to none
+/// (see [`resolve_uncached_inner`]), it leaves exactly the depth and stencil
+/// effects of the vertex stage, which is what Metal's pipeline has. Vertex
+/// outputs it does not read are allowed by the interface rules.
+///
+/// Built once; the module is a constant, so every such pipeline shares it and
+/// its translation-cache and pipeline keys stay stable.
+pub(crate) fn null_fragment() -> Arc<CachedShader> {
+    static SHADER: OnceLock<Arc<CachedShader>> = OnceLock::new();
+    Arc::clone(SHADER.get_or_init(|| {
+        use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
+        let spirv: Vec<u8> = NULL_FRAGMENT_SPIRV
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let reflection = Arc::new(ShaderReflection {
+            reflection_version: REFLECTION_VERSION,
+            descriptor_layout: Default::default(),
+            stage: ShaderStage::Fragment,
+            entry_point: None,
+            bindings: vec![],
+            argument_buffer_fields: vec![],
+            vertex_attributes: vec![],
+            varyings: vec![],
+            render_targets: vec![],
+            depth_members: vec![],
+            depth_qualifier: None,
+            stencil_members: vec![],
+            local_size: None,
+            max_work_group_size: None,
+            kernel_dispatch: None,
+            vertex_builtins: None,
+            tessellation: None,
+            imageblock_layouts: vec![],
+            implicit_imageblock_attachments: vec![],
+            fragment_imageblock: None,
+            datalayout: None,
+            runtime_sampler_specializations: vec![],
+            runtime_storage_image_specializations: vec![],
+            function_constants: vec![],
+        });
+        Arc::new(CachedShader::new(spirv, reflection))
+    }))
+}
+
+/// `void main() {}` as a fragment shader, SPIR-V 1.0, entry point `main` (the
+/// name every stage on this rail is created with).
+///
+/// ```text
+/// OpCapability Shader
+/// OpMemoryModel Logical GLSL450
+/// OpEntryPoint Fragment %3 "main"
+/// OpExecutionMode %3 OriginUpperLeft
+/// %1 = OpTypeVoid
+/// %2 = OpTypeFunction %1
+/// %3 = OpFunction %1 None %2
+/// %4 = OpLabel
+///      OpReturn
+///      OpFunctionEnd
+/// ```
+#[rustfmt::skip]
+const NULL_FRAGMENT_SPIRV: [u32; 32] = [
+    0x0723_0203, 0x0001_0000, 0, 5, 0,
+    (2 << 16) | 17, 1,
+    (3 << 16) | 14, 0, 1,
+    (5 << 16) | 15, 4, 3, u32::from_le_bytes(*b"main"), 0,
+    (3 << 16) | 16, 3, 7,
+    (2 << 16) | 19, 1,
+    (3 << 16) | 33, 2, 1,
+    (5 << 16) | 54, 1, 3, 0, 2,
+    (2 << 16) | 248, 4,
+    (1 << 16) | 253,
+    (1 << 16) | 56,
+];
+
 /// Whether retained pipeline states are on. See [`crate::config::PIPELINE_MEMO`].
 fn memo_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -575,11 +663,23 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
     task_id: u32,
     pipeline_ref: u32,
 ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
-    let desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+    let mut desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
         .ok_or(DrawPreparationDecline::PipelineMissing {
-            task_id,
-            pipeline_ref,
-        })?;
+        task_id,
+        pipeline_ref,
+    })?;
+    // No fragment function: depth and stencil only, no colour written. The
+    // stage is [`null_fragment`], and the masks are what make it Metal's
+    // pipeline — with no fragment function Metal writes no colour attachment,
+    // whatever the attachment entries say.
+    let fragment_absent = desc.fragment_func_ref == 0;
+    if fragment_absent {
+        use crate::runtime::decode::resource::ColorWriteMask;
+        desc.color0.write_mask = ColorWriteMask::NONE;
+        for attachment in &mut desc.color_attachments {
+            attachment.write_mask = ColorWriteMask::NONE;
+        }
+    }
     // The descriptor decoded and the pipeline is declared; the guest's shader
     // form is about to become the host's.
     crate::runtime::draw::advance_pipeline(
@@ -607,17 +707,23 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         task_id,
         function_ref: desc.vertex_func_ref,
     })?;
-    let f_mtlb = load_mtlb(
-        state,
-        host,
-        task_id,
-        desc.fragment_func_ref,
-        AirLoadRail::Draw,
-    )
-    .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
-        task_id,
-        function_ref: desc.fragment_func_ref,
-    })?;
+    let f_mtlb = if fragment_absent {
+        None
+    } else {
+        Some(
+            load_mtlb(
+                state,
+                host,
+                task_id,
+                desc.fragment_func_ref,
+                AirLoadRail::Draw,
+            )
+            .ok_or(DrawPreparationDecline::FragmentMtlbMissing {
+                task_id,
+                function_ref: desc.fragment_func_ref,
+            })?,
+        )
+    };
     enter(Phase::PipelineAir);
     let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
         DrawPreparationDecline::VertexAirExtract {
@@ -625,12 +731,17 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
             reason,
         }
     })?;
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
-        DrawPreparationDecline::FragmentAirExtract {
-            function_ref: desc.fragment_func_ref,
-            reason,
-        }
-    })?;
+    let f_air = f_mtlb
+        .as_deref()
+        .map(|mtlb| {
+            crate::runtime::mtlb::extract_air(mtlb).map_err(|reason| {
+                DrawPreparationDecline::FragmentAirExtract {
+                    function_ref: desc.fragment_func_ref,
+                    reason,
+                }
+            })
+        })
+        .transpose()?;
     enter(Phase::PipelineXlate);
     let vertex = crate::runtime::m2v_cache::translate_cached_reflected(
         v_air,
@@ -641,15 +752,21 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
-    let fragment = crate::runtime::m2v_cache::translate_cached_reflected(
-        f_air,
-        metal2vulkan::passes::Stage::Fragment,
-        pipeline_ref,
-    )
-    .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
-        pipeline_ref,
-        reason,
-    })?;
+    let fragment = match f_air {
+        Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        )
+        .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
+            pipeline_ref,
+            reason,
+        })?,
+        None => {
+            note_store_route("pipeline_fragment_absent");
+            null_fragment()
+        }
+    };
     // Both stages are SPIR-V now. What is left is this rail building the
     // pipeline object out of them, which is `Compiling`.
     crate::runtime::draw::advance_pipeline(
@@ -673,6 +790,52 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
 mod tests {
     use super::*;
     use crate::runtime::decode::resource::VertexAttribute;
+
+    /// The stage a fragment-less pipeline gets is a complete module: a valid
+    /// header, instructions that tile the words exactly, ids under the bound,
+    /// and one `Fragment` entry point named `main` — the name every stage on
+    /// this rail is created with. A malformed module here would fail pipeline
+    /// creation for every depth- or stencil-only pass, which is the population
+    /// it exists to serve.
+    #[test]
+    fn the_null_fragment_is_a_fragment_module_with_a_main_entry_point() {
+        let words = &NULL_FRAGMENT_SPIRV;
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+        let bound = words[3];
+        let mut at = 5;
+        let mut entry_points = Vec::new();
+        let mut max_id = 0;
+        while at < words.len() {
+            let len = (words[at] >> 16) as usize;
+            let opcode = words[at] & 0xffff;
+            assert!(len > 0 && at + len <= words.len(), "instruction at {at}");
+            match opcode {
+                // OpEntryPoint: model, id, name.
+                15 => {
+                    let name: Vec<u8> = words[at + 3..at + len]
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .take_while(|&b| b != 0)
+                        .collect();
+                    entry_points.push((words[at + 1], name));
+                    max_id = max_id.max(words[at + 2]);
+                }
+                // Result ids of OpTypeVoid, OpLabel / OpTypeFunction, OpFunction.
+                19 | 248 => max_id = max_id.max(words[at + 1]),
+                33 | 54 => max_id = max_id.max(words[at + 2].max(words[at + 1])),
+                _ => {}
+            }
+            at += len;
+        }
+        assert_eq!(at, words.len(), "instructions tile the module");
+        assert!(max_id < bound, "every id is under the bound");
+        // Execution model 4 is Fragment.
+        assert_eq!(entry_points, vec![(4, b"main".to_vec())]);
+
+        let shader = null_fragment();
+        assert_eq!(shader.spirv.len(), words.len() * 4);
+        assert!(Arc::ptr_eq(&shader, &null_fragment()), "built once");
+    }
 
     /// This rail's retained table, which is what these tests are about. Named
     /// rather than asked of `selected()`: the retention belongs to this rail
