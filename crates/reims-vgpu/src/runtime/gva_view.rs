@@ -710,16 +710,141 @@ fn span_multi<H: HostMemory + HostOps>(
     allowed: WindowPages<'_>,
 ) -> Result<(), MemError> {
     let length = copy.len() as u64;
+    let access = if copy.is_write() {
+        SpanAccess::Write(allowed)
+    } else {
+        SpanAccess::Read
+    };
+    let walked = walk_span(state, host, task_id, gva, length, access)?;
+    let page_sz = walked.page_size as usize;
+    for run in &walked.runs {
+        let run_gpas = &walked.gpas[run.clone()];
+        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
+            return Err(MemError::MapPagesRefused);
+        };
+        let total = run_gpas.len().saturating_mul(page_sz);
+        let clipped = match walked.clip(run, gva, length, total) {
+            Ok(Some(clipped)) => clipped,
+            Ok(None) => {
+                host.unmap_pages(ptr, total);
+                continue;
+            }
+            Err(e) => {
+                host.unmap_pages(ptr, total);
+                return Err(e);
+            }
+        };
+        let ClippedRun {
+            window_offset: buf_off,
+            host_off,
+            n,
+        } = clipped;
+        if buf_off + n > copy.len() {
+            host.unmap_pages(ptr, total);
+            return Err(MemError::RunOutOfRange);
+        }
+        // SAFETY: map_pages packed `total` bytes, and `clip` plus the bound
+        // above put `host_off + n` inside it and `buf_off + n` inside the
+        // caller's buffer.
+        unsafe { copy.apply(ptr, host_off, buf_off, n) };
+        if copy.is_write() {
+            // A run is packed by construction, so the `n` bytes at `host_off`
+            // are the `n` bytes at `run_gpas[0] + host_off` in guest-physical
+            // space — the exact destination, not the run's hull.
+            crate::observe::footprint::note_written_range(
+                run_gpas[0].saturating_add(host_off as u64),
+                n as u64,
+            );
+        }
+        host.unmap_pages(ptr, total);
+    }
+    Ok(())
+}
+
+/// Which direction a span walk serves, and for a write the pages it may reach.
+#[derive(Clone, Copy)]
+enum SpanAccess<'a> {
+    Read,
+    Write(WindowPages<'a>),
+}
+
+/// A task span resolved to guest pages and split into packed GPA runs.
+struct WalkedSpan {
+    gpas: Vec<u64>,
+    runs: Vec<std::ops::Range<usize>>,
+    page_size: u64,
+    span_page_base: u64,
+}
+
+/// One packed run's share of a span: the run's bytes that fall inside
+/// `[gva, gva + length)`.
+struct ClippedRun {
+    /// Distance from `gva` to the first byte of the share.
+    window_offset: usize,
+    /// Distance from the run's mapped base to the same byte.
+    host_off: usize,
+    n: usize,
+}
+
+impl WalkedSpan {
+    /// The share of `run` inside the span, `None` when it has none, and a
+    /// refusal when the arithmetic would leave the `total` bytes mapped for it.
+    fn clip(
+        &self,
+        run: &std::ops::Range<usize>,
+        gva: u64,
+        length: u64,
+        total: usize,
+    ) -> Result<Option<ClippedRun>, MemError> {
+        let end = gva.saturating_add(length);
+        let run_gva = self
+            .span_page_base
+            .saturating_add((run.start as u64).saturating_mul(self.page_size));
+        let run_end = run_gva.saturating_add(total as u64);
+        let copy_lo = gva.max(run_gva);
+        let copy_hi = end.min(run_end);
+        if copy_lo >= copy_hi {
+            return Ok(None);
+        }
+        let window_offset = (copy_lo - gva) as usize;
+        let host_off = (copy_lo - run_gva) as usize;
+        let n = (copy_hi - copy_lo) as usize;
+        if host_off + n > total || window_offset as u64 + n as u64 > length {
+            return Err(MemError::RunOutOfRange);
+        }
+        Ok(Some(ClippedRun {
+            window_offset,
+            host_off,
+            n,
+        }))
+    }
+}
+
+/// The page walk every span copier shares: resolve the task, walk its page
+/// table over `[gva, gva + length)`, check every page is RAM, split the pages
+/// into packed runs and release retired views before anything new is mapped.
+///
+/// The write direction additionally records the pages as host-written — after
+/// the walk that names them and before any of them is written, so a refusal
+/// below costs a spurious invalidation rather than a missing one — and refuses
+/// a page outside the window it was armed on.
+fn walk_span<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    access: SpanAccess<'_>,
+) -> Result<WalkedSpan, MemError> {
     let page_shift = state.page_shift;
     let page_size = state.page_size();
-    let page_sz = page_size as usize;
     let gpas = {
         let Some((_tid, task)) = resolve_task_for_walk(&state.tasks, task_id) else {
             return Err(MemError::NoSuchTask);
         };
         collect_span_gpas(host, task, gva, length, page_shift)?
     };
-    if copy.is_write() {
+    if let SpanAccess::Write(allowed) = access {
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. Recorded here, after the walk that names them and before any
         // of them is written, so a refusal below costs a spurious invalidation
@@ -737,44 +862,12 @@ fn span_multi<H: HostMemory + HostOps>(
         return Err(MemError::BadArgs);
     }
     crate::runtime::mapper::flush_retired_views(state, host);
-    let span_page_base = gva & !(page_size - 1);
-    let end = gva.saturating_add(length);
-    for run in &runs {
-        let run_gpas = &gpas[run.clone()];
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            return Err(MemError::MapPagesRefused);
-        };
-        let total = run_gpas.len().saturating_mul(page_sz);
-        let run_gva = span_page_base.saturating_add((run.start as u64).saturating_mul(page_size));
-        let run_end = run_gva.saturating_add(total as u64);
-        let copy_lo = gva.max(run_gva);
-        let copy_hi = end.min(run_end);
-        if copy_lo >= copy_hi {
-            host.unmap_pages(ptr, total);
-            continue;
-        }
-        let buf_off = (copy_lo - gva) as usize;
-        let host_off = (copy_lo - run_gva) as usize;
-        let n = (copy_hi - copy_lo) as usize;
-        if host_off + n > total || buf_off + n > copy.len() {
-            host.unmap_pages(ptr, total);
-            return Err(MemError::RunOutOfRange);
-        }
-        // SAFETY: map_pages packed `total` bytes, and the bound above puts
-        // `host_off + n` inside it and `buf_off + n` inside the caller's buffer.
-        unsafe { copy.apply(ptr, host_off, buf_off, n) };
-        if copy.is_write() {
-            // A run is packed by construction, so the `n` bytes at `host_off`
-            // are the `n` bytes at `run_gpas[0] + host_off` in guest-physical
-            // space — the exact destination, not the run's hull.
-            crate::observe::footprint::note_written_range(
-                run_gpas[0].saturating_add(host_off as u64),
-                n as u64,
-            );
-        }
-        host.unmap_pages(ptr, total);
-    }
-    Ok(())
+    Ok(WalkedSpan {
+        gpas,
+        runs,
+        page_size,
+        span_page_base: gva & !(page_size - 1),
+    })
 }
 
 #[cfg(test)]
