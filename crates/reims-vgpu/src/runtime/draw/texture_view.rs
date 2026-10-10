@@ -394,12 +394,30 @@ pub(crate) fn resolve_texture_view_reasoned<M: HostMemory + HostOps>(
 /// the chain exceeds the max depth without a non-view base, a base ref is zero,
 /// or swizzle selectors are malformed. See [`resolve_texture_view_reasoned`] for
 /// the specific reason on the fail path.
+///
+/// **"Is this a view?" is asked of the slot's type before the view is asked
+/// for.** Most callers hold an arbitrary texture ref and use this to find out
+/// whether to look through a view, so the common answer is "no". Asking
+/// [`objects::resolve_descriptor`] for a view and taking its `WrongType` as
+/// that "no" made every plain, memoryless and mapper-ref texture a type
+/// refusal: about two thousand `memo_wrong_type want=[8]` lines a run on a
+/// macOS 26 guest, each one reading as a resolver handed the wrong kind of
+/// object when nothing was wrong. The retained resolution answers for a
+/// constructed object, so the ordinary bind pays no guest read for this.
 pub(super) fn resolve_texture_view<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     texture_ref: u32,
 ) -> Option<ViewResolve> {
+    use crate::runtime::decode::resource::OBJECT_TYPE_TEXTURE_VIEW;
+    let object_type = match state.constructed_object(task_id, texture_ref) {
+        Some(resource) => resource.entry.object_type,
+        None => objects::lookup_list_entry(state, host, task_id, texture_ref)?.object_type,
+    };
+    if object_type != OBJECT_TYPE_TEXTURE_VIEW {
+        return None;
+    }
     resolve_texture_view_reasoned(state, host, task_id, texture_ref).ok()
 }
 
