@@ -3555,3 +3555,142 @@ fn a_nil_entry_clears_the_slot_on_the_wire_path_too() {
     assert_eq!(acc.textures.len(), 1);
     assert_eq!(acc.textures[0].index, 0);
 }
+
+/// A linear BGRA8 texture of `levels` levels at ref 11, `base` texels square,
+/// every row padded by 16 bytes and every texel a function of its level, row
+/// and column. The same layout `a_declared_mip_chain_stages_every_level_and_not_only_its_base`
+/// builds, with texels that differ from one another so a misplaced byte shows.
+fn padded_linear_texture(levels: u32, base: u32) -> (FakeHost, DeviceState) {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET,
+        TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
+    };
+    use reims_vgpu_protocol::extent::mip_extent;
+    const BPP: u32 = 4;
+    let stride = |level: u32| (mip_extent(base, level) * BPP + 16) as u64;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+    let handle = 5u64;
+    let base_gva = handle << RESOURCE_PAGE_SHIFT;
+    let mut offsets = Vec::new();
+    let mut image = Vec::new();
+    for level in 0..levels {
+        offsets.push(image.len() as u64);
+        let h = mip_extent(base, level);
+        let mut level_bytes = vec![0xEEu8; (stride(level) * u64::from(h)) as usize];
+        for y in 0..h as usize {
+            let row = y * stride(level) as usize;
+            for x in 0..(mip_extent(base, level) * BPP) as usize {
+                // Below 0xE0, so no texel can be mistaken for the 0xEE padding.
+                level_bytes[row + x] = ((level as usize * 64 + y * 7 + x) % 0xE0) as u8;
+            }
+        }
+        image.extend_from_slice(&level_bytes);
+    }
+    write_task_gva_arm64e(&mut host, &state.tasks[1], base_gva, &image);
+    let desc_len =
+        TEXTURE_DESC_BASE_LEN + (levels as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut desc = vec![0u8; desc_len];
+    st64(&mut desc[LINEAR_DESC_SIZE..], image.len() as u64);
+    st64(&mut desc[LINEAR_DESC_HANDLE..], handle);
+    desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT] = levels as u8;
+    st32(
+        &mut desc[TEXTURE_DESC_USED_SIZE..],
+        (stride(0) * u64::from(base)) as u32,
+    );
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], stride(0) as u32);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], base);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], base);
+    for level in 1..levels {
+        let rec =
+            TEXTURE_DESC_LEVEL_RECORDS + (level as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+        let side = mip_extent(base, level);
+        st64(
+            &mut desc[rec + TEXTURE_LEVEL_OFFSET..],
+            offsets[level as usize],
+        );
+        st64(
+            &mut desc[rec + TEXTURE_LEVEL_SIZE..],
+            stride(level) * u64::from(side),
+        );
+        st64(&mut desc[rec + TEXTURE_LEVEL_ROW_STRIDE..], stride(level));
+        st32(&mut desc[rec + TEXTURE_LEVEL_WIDTH..], side);
+        st32(&mut desc[rec + TEXTURE_LEVEL_HEIGHT..], side);
+    }
+    let pf_off =
+        TEXTURE_DESC_PIXEL_FORMAT + (levels as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    st16(&mut desc[pf_off..], MTL_FORMAT_BGRA8_UNORM);
+    let desc_gva = 0x2000u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    let off = list_object_entry_offset(11, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE as u32) | ((desc.len() as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+    (host, state)
+}
+
+/// The Vulkan rail stages a sampled single-level linear texture as a guest
+/// read — no bytes, a layout over the guest's pages — and that layout gathers
+/// exactly the tight rows the bytes path reads, padding excluded.
+///
+/// The two other shapes stay on bytes, because a layout describes one level and
+/// a storage binding's bytes are its seed and its readback size: a declared mip
+/// chain, and the same texture bound for storage.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_sampled_linear_level_is_staged_as_a_guest_read_of_the_same_bytes() {
+    const BASE: u32 = 24;
+    let (mut host, mut state) = padded_linear_texture(1, BASE);
+    let reference = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, false)
+        .expect("a single-level linear texture stages");
+    assert_eq!(reference.bytes.len(), (BASE * BASE * 4) as usize);
+    assert!(
+        !reference.bytes.contains(&0xEE),
+        "padding never reaches the bytes"
+    );
+
+    let before = crate::runtime::drain::store_route_count("compute_stage_guest_read");
+    let (mut host, mut state) = padded_linear_texture(1, BASE);
+    let mut gathered = stage_texture_raw::<VulkanStage, _>(&mut state, &mut host, 1, 11, 0, false)
+        .expect("the same texture stages on the Vulkan rail");
+    assert_eq!(
+        crate::runtime::drain::store_route_count("compute_stage_guest_read"),
+        before + 1
+    );
+    assert!(gathered.bytes.is_empty(), "a guest read carries no bytes");
+    assert!(matches!(gathered.writeback, TextureWriteback::None));
+    let mut read = gathered.rail.guest_read.take().expect("a guest read");
+    assert_eq!(read.layout.packed_len(), reference.bytes.len() as u64);
+    let mut packed = vec![0u8; read.layout.packed_len() as usize];
+    // SAFETY: the views are released only below.
+    unsafe { read.layout.gather_into(packed.as_mut_ptr()) };
+    assert_eq!(packed, reference.bytes);
+    crate::runtime::gva_view::release_span_views(&mut host, read.take_views());
+
+    let (mut host, mut state) = padded_linear_texture(3, BASE);
+    let pyramid = stage_texture_raw::<VulkanStage, _>(&mut state, &mut host, 1, 11, 0, false)
+        .expect("a mip chain stages");
+    assert!(pyramid.rail.guest_read.is_none() && pyramid.mip_levels == 3);
+    assert!(!pyramid.bytes.is_empty());
+
+    let (mut host, mut state) = padded_linear_texture(1, BASE);
+    let storage = stage_texture_raw::<VulkanStage, _>(&mut state, &mut host, 1, 11, 0, true)
+        .expect("the texture stages as a storage destination");
+    assert!(storage.rail.guest_read.is_none());
+    assert_eq!(
+        storage.bytes, reference.bytes,
+        "a storage seed is still read as bytes"
+    );
+}

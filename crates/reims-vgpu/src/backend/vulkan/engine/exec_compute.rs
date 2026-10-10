@@ -210,7 +210,16 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
         // The whole pyramid, not the base: `bytes` carries every level the
         // binding declares, and checking only the base would let a request
         // through whose upper levels the copy then reads past the end of.
-        if let ComputeSampledSource::Bytes(bytes) = &img.source {
+        // A gathered source owes the same length: it stands for exactly the
+        // bytes the `Bytes` arm would have carried.
+        let carried = match &img.source {
+            ComputeSampledSource::Bytes(bytes) => Some(bytes.len()),
+            ComputeSampledSource::Gathered(layout) => {
+                Some(usize::try_from(layout.packed_len()).unwrap_or(usize::MAX))
+            }
+            _ => None,
+        };
+        if let Some(actual) = carried {
             let expected = reims_vgpu_protocol::extent::tight_pyramid_bytes(
                 img.width,
                 img.height,
@@ -218,11 +227,11 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 img.format.bytes_per_texel(),
             )
             .unwrap_or(usize::MAX);
-            if bytes.len() != expected {
+            if actual != expected {
                 return Err(DrawError::ComputeValidation(
                     ComputeValidationDecline::SampledBytesLength {
                         binding: img.binding,
-                        actual: bytes.len(),
+                        actual,
                         expected,
                     },
                 ));
@@ -658,7 +667,7 @@ pub(crate) unsafe fn execute_compute_inner(
         .unwrap_or(0) as u64;
         let resident_copy = match &resource.source {
             ComputeSampledSource::ResidentCopy(bind) => Some(*bind),
-            ComputeSampledSource::Bytes(_) => None,
+            ComputeSampledSource::Bytes(_) | ComputeSampledSource::Gathered(_) => None,
             // Returned above.
             ComputeSampledSource::MultisampleTarget(_) | ComputeSampledSource::Target(_) => {
                 unreachable!()
@@ -707,12 +716,22 @@ pub(crate) unsafe fn execute_compute_inner(
             counters.note_compute_sampled_resident_copy(staged_bytes);
             (None, Some((src_image, src_access)))
         } else {
-            let ComputeSampledSource::Bytes(bytes) = &resource.source else {
-                unreachable!("the resident and multisample sources are handled above")
+            let len = match &resource.source {
+                ComputeSampledSource::Bytes(bytes) => bytes.len() as u64,
+                ComputeSampledSource::Gathered(layout) => layout.packed_len(),
+                _ => unreachable!("the resident and multisample sources are handled above"),
             };
-            let st = pools.acquire_staging(ctx, bytes.len() as u64, counters)?;
-            pools.write_staging(ctx, &st, bytes)?;
-            counters.note_compute_sampled_upload(bytes.len() as u64);
+            let st = pools.acquire_staging(ctx, len, counters)?;
+            match &resource.source {
+                ComputeSampledSource::Bytes(bytes) => pools.write_staging(ctx, &st, bytes)?,
+                // SAFETY: the runtime keeps the layout's guest views mapped
+                // until this call returns (see `ComputeSampledSource::Gathered`).
+                ComputeSampledSource::Gathered(layout) => {
+                    pools.write_staging_gathered(ctx, &st, layout)?
+                }
+                _ => unreachable!("the resident and multisample sources are handled above"),
+            }
+            counters.note_compute_sampled_upload(len);
             (Some(st), None)
         };
         sampled_slots.push(PreparedSampledImage::Staged {

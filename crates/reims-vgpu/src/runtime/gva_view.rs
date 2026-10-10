@@ -870,6 +870,102 @@ fn walk_span<H: HostMemory + HostOps>(
     })
 }
 
+/// Guest runs over `[gva, gva + length)` of a task, mapped and left mapped.
+///
+/// The read direction of [`span_multi`]'s walk for a caller that moves the
+/// bytes itself, later and into memory this module never sees — a Vulkan
+/// staging buffer filled by a [`crate::runtime::guest_ram::PackedGuestLayout`].
+/// Holding the runs instead of copying them into a buffer here is what removes
+/// the intermediate copy; the walk, the RAM check and the run split are
+/// `span_multi`'s own, so the bytes named are the bytes a read would have
+/// returned.
+///
+/// The views stay mapped until [`release_span_views`] is handed
+/// [`MappedSpan::into_views`]. A caller must release them in the same drain
+/// call: nothing here retires them when the guest unmaps the range, so a view
+/// held past the packet that walked it is the stale-view class
+/// [`write_span_within`] documents.
+pub(crate) struct MappedSpan {
+    runs: Vec<crate::runtime::guest_ram::WindowRun>,
+    views: Vec<(usize, usize)>,
+}
+
+impl MappedSpan {
+    /// The runs, ascending and clipped to the span, positioned from `gva`.
+    pub(crate) fn runs(&self) -> &[crate::runtime::guest_ram::WindowRun] {
+        &self.runs
+    }
+
+    /// The `(ptr, len)` views to release, giving up the runs that point into
+    /// them.
+    pub(crate) fn into_views(self) -> Vec<(usize, usize)> {
+        self.views
+    }
+}
+
+impl std::fmt::Debug for MappedSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedSpan")
+            .field("runs", &self.runs.len())
+            .field("views", &self.views.len())
+            .finish()
+    }
+}
+
+/// Release views from [`MappedSpan::into_views`].
+pub(crate) fn release_span_views<H: HostOps>(host: &mut H, views: Vec<(usize, usize)>) {
+    for (ptr, len) in views {
+        host.unmap_pages(ptr, len);
+    }
+}
+
+/// Walk and map `[gva, gva + length)` for a later read; see [`MappedSpan`].
+pub(crate) fn map_span_runs<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+) -> Result<MappedSpan, MemError> {
+    let walked = walk_span(state, host, task_id, gva, length, SpanAccess::Read)?;
+    let page_sz = walked.page_size as usize;
+    let mut mapped = MappedSpan {
+        runs: Vec::with_capacity(walked.runs.len()),
+        views: Vec::with_capacity(walked.runs.len()),
+    };
+    for run in &walked.runs {
+        let run_gpas = &walked.gpas[run.clone()];
+        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
+            release_span_views(host, mapped.into_views());
+            return Err(MemError::MapPagesRefused);
+        };
+        let total = run_gpas.len().saturating_mul(page_sz);
+        mapped.views.push((ptr, total));
+        let clipped = match walked.clip(run, gva, length, total) {
+            Ok(Some(clipped)) => clipped,
+            Ok(None) => continue,
+            Err(e) => {
+                release_span_views(host, mapped.into_views());
+                return Err(e);
+            }
+        };
+        let Some(guest) = crate::runtime::guest_ram::GuestRun::in_mapping(
+            ptr,
+            total as u64,
+            clipped.host_off as u64,
+            clipped.n as u64,
+        ) else {
+            release_span_views(host, mapped.into_views());
+            return Err(MemError::RunOutOfRange);
+        };
+        mapped.runs.push(crate::runtime::guest_ram::WindowRun {
+            window_offset: clipped.window_offset as u64,
+            run: guest,
+        });
+    }
+    Ok(mapped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,6 +1610,56 @@ mod tests {
             line.contains("reason=gva_zero_pfn"),
             "the walk's own check must be the reason: {line}"
         );
+    }
+
+    /// [`map_span_runs`] names exactly the bytes [`read_span`] returns, across a
+    /// page gap and with a row pitch, so a layout gathered from its runs is the
+    /// packed read the copying rail used to make into a `Vec`.
+    #[test]
+    fn mapped_span_runs_gather_what_a_read_returns_across_a_gap() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
+        // PTE[1] -> pfn 10, so the span's two pages are not GPA-contiguous.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let head: Vec<u8> = (0..16u8).map(|b| 0x40 + b).collect();
+        let tail: Vec<u8> = (0..16u8).map(|b| 0x80 + b).collect();
+        host.write_gpa(data0 + page - 16, &head).unwrap();
+        host.write_gpa(data1, &tail).unwrap();
+        let mut state = state_x86();
+        state.define_task(1, page, 2);
+
+        // Three rows of 5 bytes at a pitch of 8, starting 12 bytes before the
+        // gap: row 0 is wholly in page 0, row 1 straddles it, row 2 is in page 1.
+        let gva = page - 12;
+        let (rows, pitch, row_bytes) = (3u32, 8u64, 5u64);
+        let length = u64::from(rows - 1) * pitch + row_bytes;
+        let mut read = vec![0u8; length as usize];
+        assert!(read_span(&mut state, &mut host, 1, gva, &mut read));
+
+        let mapped = map_span_runs(&mut state, &mut host, 1, gva, length).expect("walk resolves");
+        assert_eq!(mapped.runs().len(), 2, "one run per GPA-contiguous stretch");
+        let layout = crate::runtime::guest_ram::PackedGuestLayout::rows(
+            mapped.runs(),
+            rows,
+            pitch,
+            row_bytes,
+        )
+        .expect("every row byte is covered");
+        let mut packed = vec![0u8; layout.packed_len() as usize];
+        // SAFETY: the views stay mapped until the release below.
+        unsafe { layout.gather_into(packed.as_mut_ptr()) };
+        let expect: Vec<u8> = (0..rows as usize)
+            .flat_map(|y| {
+                read[y * pitch as usize..y * pitch as usize + row_bytes as usize].to_vec()
+            })
+            .collect();
+        assert_eq!(packed, expect);
+        release_span_views(&mut host, mapped.into_views());
+
+        // An unresolved page refuses the whole walk, as `read_span` does.
+        assert!(map_span_runs(&mut state, &mut host, 1, 2 * page - 4, 8).is_err());
     }
 
     /// The three refusals [`span_multi`] owns must stay distinguishable
