@@ -1164,6 +1164,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "reims-vgpu-backend"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "reims-vgpu",
+ "reims-vgpu-proxy-wire",
+]
+
+[[package]]
 name = "reims-vgpu-config"
 version = "0.1.0"
 
@@ -1208,6 +1217,10 @@ dependencies = [
  "reims-vgpu-paging",
  "reims-vgpu-wire",
 ]
+
+[[package]]
+name = "reims-vgpu-proxy-wire"
+version = "0.1.0"
 
 [[package]]
 name = "reims-vgpu-testkit"

@@ -1,0 +1,8 @@
+[package]
+name = "reims-vgpu-proxy-wire"
+version = "0.1.0"
+edition = "2021"
+description = "apv-gpu-proxy protocol: the VMM <-> out-of-process GPU device interface"
+license = "MIT"
+
+[dependencies]

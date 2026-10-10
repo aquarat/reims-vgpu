@@ -1,0 +1,15 @@
+[package]
+name = "reims-vgpu-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Out-of-process Reims vGPU device: serves a VMM's apv-gpu-proxy device over the apv-gpu-proxy protocol"
+license = "LGPL-3.0-or-later"
+
+[[bin]]
+name = "reims-vgpu-backend"
+path = "src/main.rs"
+
+[dependencies]
+reims-vgpu = { path = "../reims-vgpu", default-features = false, features = ["backend-vulkan"] }
+reims-vgpu-proxy-wire = { path = "../reims-vgpu-proxy-wire" }
+libc = "0.2"
