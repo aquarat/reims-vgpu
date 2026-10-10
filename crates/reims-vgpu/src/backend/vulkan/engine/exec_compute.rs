@@ -28,12 +28,12 @@ struct DispatchStep {
     push: Option<(u32, ComputeDispatchPayload)>,
 }
 
-struct PreparedStorageImage {
+struct PreparedStorageImage<'r> {
     binding: u32,
     array_element: u32,
     slot: StorageImageSlot,
     seed: Option<BufferSlot>,
-    dst: ComputeImageDst,
+    dst: ComputeImageDst<'r>,
     len: usize,
     width: u32,
     height: u32,
@@ -103,10 +103,14 @@ impl PreparedSampledImage {
 }
 
 /// Post-dispatch copy destination for one storage image.
-enum ComputeImageDst {
-    /// Pooled host-visible buffer; the CPU reads it back and the runtime
-    /// writes guest pages itself.
-    Readback(BufferSlot),
+enum ComputeImageDst<'r> {
+    /// Pooled host-visible buffer the CPU reads back: into a `Vec` the runtime
+    /// writes into guest pages itself, or — with `scatter` — straight into
+    /// the guest window that layout describes, before the engine returns.
+    Readback {
+        slot: BufferSlot,
+        scatter: Option<&'r crate::runtime::guest_ram::PackedGuestLayout>,
+    },
     /// The dispatch's own image→buffer copy lands in the guest's pages and no
     /// pixels cross device→host.
     ///
@@ -295,6 +299,21 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                     expected,
                 },
             ));
+        }
+        // The scatter copies the whole readback through the layout, so the
+        // layout has to tile it exactly: shorter would leave rows unwritten,
+        // longer would read past what the copy filled.
+        if let super::types::ComputeImageDestination::HostScatter(layout) = &img.destination {
+            let actual = usize::try_from(layout.packed_len()).unwrap_or(usize::MAX);
+            if actual != expected {
+                return Err(DrawError::ComputeValidation(
+                    ComputeValidationDecline::StorageScatterLength {
+                        binding: img.binding,
+                        actual,
+                        expected,
+                    },
+                ));
+            }
         }
     }
     Ok(())
@@ -814,9 +833,20 @@ pub(crate) unsafe fn execute_compute_inner(
         // request that named guest pages licensed them first, and one that did
         // not gets the pooled readback and the device→host crossing with it.
         let dst = match &resource.destination {
-            super::types::ComputeImageDestination::Host => ComputeImageDst::Readback(
-                pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
-            ),
+            super::types::ComputeImageDestination::Host => ComputeImageDst::Readback {
+                slot: pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
+                scatter: None,
+            },
+            super::types::ComputeImageDestination::HostScatter(layout) => {
+                ComputeImageDst::Readback {
+                    slot: pools.acquire_readback_extra(
+                        ctx,
+                        resource.bytes.len() as u64,
+                        counters,
+                    )?,
+                    scatter: Some(layout),
+                }
+            }
             super::types::ComputeImageDestination::GuestPages { target, .. } => {
                 ComputeImageDst::Direct(unsafe {
                     super::plan_guest_copy(ctx, pools, counters, target)?
@@ -1330,7 +1360,7 @@ pub(crate) unsafe fn execute_compute_inner(
             &barrier,
         );
         match &prepared.dst {
-            ComputeImageDst::Readback(slot) => {
+            ComputeImageDst::Readback { slot, .. } => {
                 // The pooled readback is always tightly packed from texel zero.
                 // A guest window's own offset and row stride belong to the
                 // plan on the direct arm, never to this one.
@@ -1375,7 +1405,7 @@ pub(crate) unsafe fn execute_compute_inner(
     // released its own writes to `HOST` per plan, right where it recorded them.
     if simg_slots
         .iter()
-        .any(|prepared| matches!(prepared.dst, ComputeImageDst::Readback(_)))
+        .any(|prepared| matches!(prepared.dst, ComputeImageDst::Readback { .. }))
     {
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1460,7 +1490,7 @@ pub(crate) unsafe fn execute_compute_inner(
     let all_writeback_deferred = storage_slots.iter().all(|(_, _, _, writable)| !writable)
         && simg_slots
             .iter()
-            .all(|prepared| !matches!(prepared.dst, ComputeImageDst::Readback(_)));
+            .all(|prepared| !matches!(prepared.dst, ComputeImageDst::Readback { .. }));
     // Park the owed cleanup (descriptor set + transient pool slots) on this
     // ring slot in every mode; whichever entry retires the slot drains it. A
     // failed wait below leaves the slot pending, so no path ever reuses an
@@ -1509,7 +1539,10 @@ pub(crate) unsafe fn execute_compute_inner(
     let mut images = Vec::with_capacity(simg_slots.len());
     for prepared in &simg_slots {
         match &prepared.dst {
-            ComputeImageDst::Readback(readback) => {
+            ComputeImageDst::Readback {
+                slot: readback,
+                scatter: None,
+            } => {
                 let out = crate::backend::vulkan::engine::pools::read_back_slot(
                     ctx,
                     readback,
@@ -1522,6 +1555,29 @@ pub(crate) unsafe fn execute_compute_inner(
                     super::counters::ReadbackSource::ComputeImage,
                 );
                 images.push(super::types::ComputeImageResult::Bytes(out));
+            }
+            // The same readback, crossed once: from the mapping into the
+            // guest's pages, with no `Vec` between them. Still a device→host
+            // crossing, so still charged to the readback census.
+            ComputeImageDst::Readback {
+                slot: readback,
+                scatter: Some(layout),
+            } => {
+                crate::backend::vulkan::engine::pools::scatter_back_slot(
+                    ctx,
+                    readback,
+                    prepared.len as u64,
+                    layout,
+                    VkOp::ComputeExecMapImageReadback,
+                    VkOp::ComputeExecInvalidateImageReadback,
+                )?;
+                counters.note_readback(
+                    prepared.len as u64,
+                    super::counters::ReadbackSource::ComputeImage,
+                );
+                images.push(super::types::ComputeImageResult::Scattered {
+                    bytes: prepared.len as u64,
+                });
             }
             // Nothing was read, so nothing is charged to the readback census —
             // that is the saving this arm exists for, and a bump here would
@@ -1787,6 +1843,73 @@ mod tests {
         assert_eq!(
             decline.slug(),
             "vk_compute_validate_duplicate_storage_image_binding"
+        );
+    }
+    /// A layout over guest memory stands for bytes, so it owes the length the
+    /// bytes would have: a gathered sampled source must pack the binding's
+    /// tight pyramid, and a scatter destination must tile the storage image's
+    /// readback exactly. Either one short or long is refused by its own name
+    /// before anything is recorded.
+    #[test]
+    fn guest_layouts_owe_the_length_the_bytes_would_have() {
+        use crate::runtime::guest_ram::{GuestRun, PackedGuestLayout, WindowRun};
+        let guest = [0u8; 64];
+        let layout = |rows: u32, row_bytes: u64| {
+            PackedGuestLayout::rows(
+                &[WindowRun {
+                    window_offset: 0,
+                    run: GuestRun::whole(guest.as_ptr() as usize, guest.len() as u64).unwrap(),
+                }],
+                rows,
+                row_bytes,
+                row_bytes,
+            )
+            .unwrap()
+        };
+        // 2x2 RGBA8: 16 bytes, as two rows of 8.
+        let request = |sampled: PackedGuestLayout, scatter: PackedGuestLayout| ComputeRequest {
+            spirv: vec![0x0723_0203],
+            entry: "main".into(),
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
+            sampled_images: vec![ComputeSampledImageResource {
+                mip_levels: 1,
+                binding: 32,
+                array_element: 0,
+                descriptor_count: 1,
+                format: StorageImageFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                source: ComputeSampledSource::Gathered(sampled),
+            }],
+            storage_images: vec![ComputeStorageImageResource {
+                destination: super::super::types::ComputeImageDestination::HostScatter(scatter),
+                binding: 34,
+                array_element: 0,
+                descriptor_count: 1,
+                format: StorageImageFormat::Rgba8Unorm,
+                width: 2,
+                height: 2,
+                bytes: vec![0; 16],
+                residency: None,
+                seed_skipped: false,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_compute(&request(layout(2, 8), layout(2, 8))),
+            Ok(())
+        );
+        let slug = |req: ComputeRequest| match validate_compute(&req) {
+            Err(DrawError::ComputeValidation(decline)) => decline.slug(),
+            other => panic!("expected a typed length refusal, got {other:?}"),
+        };
+        assert_eq!(
+            slug(request(layout(2, 4), layout(2, 8))),
+            "vk_compute_validate_sampled_bytes_length"
+        );
+        assert_eq!(
+            slug(request(layout(2, 8), layout(3, 8))),
+            "vk_compute_validate_storage_scatter_length"
         );
     }
 }

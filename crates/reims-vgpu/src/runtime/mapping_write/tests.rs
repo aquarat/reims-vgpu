@@ -2590,3 +2590,160 @@ fn rect_raw_roundtrip_subregion() {
         8
     ));
 }
+
+/// A readback scattered through [`prepare_full_rect_scatter`]'s layout and
+/// finished with [`finish_rect_write`] leaves the guest exactly what
+/// [`write_full_rect_raw_at`] leaves for the same rows: the same bytes at the
+/// same offsets, the inter-row and trailing padding untouched, the residency
+/// window over the plane retired and the content generation moved — on a
+/// plane that starts inside its mapping and whose pitch is wider than a row.
+///
+/// And the arm it serves is the contiguous one only: a mapping whose pages are
+/// not adjacent has no view to lay the rows over, so it answers `None` for the
+/// writer to take its fragmented arm.
+#[test]
+fn a_scattered_full_rect_lands_what_the_writer_lands() {
+    use crate::model::{ComputeStorageResidencyKey, PAGE_SHIFT_X86};
+
+    let page = 1u64 << PAGE_SHIFT_X86;
+    let (w, h, bpp) = (3u32, 4u32, 4u32);
+    let tight = (w * bpp) as usize;
+    let (base_off, bpr) = (40u64, 20u32);
+    let span_end = base_off + u64::from(bpr) * u64::from(h - 1) + tight as u64;
+    let src: Vec<u8> = (0..(tight * h as usize) as u32)
+        .map(|i| (i * 13 + 5) as u8)
+        .collect();
+    let mid = 23u32;
+    let fixture = |gpa: u64| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        host.map_range(gpa, page as usize, 0xCC);
+        let pfn = (gpa >> PAGE_SHIFT_X86) as u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+        let window = ComputeStorageResidencyKey {
+            mapping_id: mid,
+            map_generation: state.mappings[&mid].map_generation,
+            surface_offset: base_off,
+            surface_bpr: bpr,
+            span_end,
+            width: w,
+            height: h,
+            pixel_format: MTL_FORMAT_BGRA8_UNORM,
+            texture_ref: 0,
+        };
+        state.compute_storage_residency.insert(window, 5);
+        (state, host, window)
+    };
+
+    let gpa = 0x5100_0000u64;
+    let (mut written, mut written_host, written_window) = fixture(gpa);
+    assert!(write_full_rect_raw_at(
+        &mut written,
+        &mut written_host,
+        mid,
+        base_off,
+        bpr,
+        span_end,
+        w,
+        h,
+        bpp,
+        &src,
+        tight as u32,
+    ));
+
+    let (mut scattered, mut scattered_host, scattered_window) = fixture(gpa);
+    let layout = prepare_full_rect_scatter(
+        &mut scattered,
+        &mut scattered_host,
+        mid,
+        base_off,
+        bpr,
+        span_end,
+        w,
+        h,
+        bpp,
+    )
+    .expect("one packed page has a contiguous view");
+    assert_eq!(layout.packed_len(), src.len() as u64);
+    assert_eq!(
+        layout.segments().len(),
+        h as usize,
+        "a padded pitch is a row each"
+    );
+    // SAFETY: the contiguous view is live for the mapping's lifetime and the
+    // source is the layout's packed length.
+    unsafe { layout.scatter_from(src.as_ptr()) };
+    finish_rect_write(&mut scattered, &mut scattered_host, mid, base_off, span_end);
+
+    let mut got_written = vec![0u8; page as usize];
+    let mut got_scattered = vec![0u8; page as usize];
+    written_host.read_gpa(gpa, &mut got_written).unwrap();
+    scattered_host.read_gpa(gpa, &mut got_scattered).unwrap();
+    assert_eq!(
+        got_scattered, got_written,
+        "the guest page differs between the two rails"
+    );
+    let mut want = vec![0xCCu8; page as usize];
+    for y in 0..h as usize {
+        let at = base_off as usize + y * bpr as usize;
+        want[at..at + tight].copy_from_slice(&src[y * tight..(y + 1) * tight]);
+    }
+    assert_eq!(got_scattered, want, "a byte outside the rows was touched");
+    assert!(!written
+        .compute_storage_residency
+        .contains_key(&written_window));
+    assert!(!scattered
+        .compute_storage_residency
+        .contains_key(&scattered_window));
+    assert_eq!(
+        scattered.mappings[&mid].content_generation,
+        written.mappings[&mid].content_generation
+    );
+
+    // Two pages that are not adjacent have no contiguous view.
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.strict_linux_map = true;
+    let (gpa0, gpa1) = (0x3500_0000u64, 0x4600_0000u64);
+    host.map_range(gpa0, page as usize, 0xCC);
+    host.map_range(gpa1, page as usize, 0xCC);
+    state.map_surface(mid);
+    {
+        let m = state.mappings.get_mut(&mid).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = [gpa0, gpa1]
+            .iter()
+            .map(|g| (((g >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+    }
+    assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+    assert_eq!(
+        prepare_full_rect_scatter(&mut state, &mut host, mid, base_off, bpr, span_end, w, h, bpp),
+        None
+    );
+    // And a window the writer would refuse as an overrun is refused here too.
+    let (mut state, mut host, _) = fixture(gpa);
+    assert_eq!(
+        prepare_full_rect_scatter(
+            &mut state,
+            &mut host,
+            mid,
+            base_off,
+            bpr,
+            span_end - 1,
+            w,
+            h,
+            bpp
+        ),
+        None
+    );
+}

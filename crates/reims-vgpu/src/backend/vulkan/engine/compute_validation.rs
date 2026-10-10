@@ -75,6 +75,14 @@ pub enum ComputeValidationDecline {
         actual: usize,
         expected: usize,
     },
+    /// A storage image whose readback is scattered straight into guest pages
+    /// names a layout that does not cover the readback exactly: `actual` is
+    /// the layout's packed length, `expected` the image's tight byte size.
+    StorageScatterLength {
+        binding: u32,
+        actual: usize,
+        expected: usize,
+    },
 }
 
 impl Decline for ComputeValidationDecline {
@@ -108,6 +116,7 @@ impl Decline for ComputeValidationDecline {
             }
             Self::StorageZeroGeometry { .. } => "vk_compute_validate_storage_zero_geometry",
             Self::StorageBytesLength { .. } => "vk_compute_validate_storage_bytes_length",
+            Self::StorageScatterLength { .. } => "vk_compute_validate_storage_scatter_length",
         }
     }
 
@@ -159,6 +168,11 @@ impl Decline for ComputeValidationDecline {
                 expected,
             }
             | Self::StorageBytesLength {
+                binding,
+                actual,
+                expected,
+            }
+            | Self::StorageScatterLength {
                 binding,
                 actual,
                 expected,
@@ -257,6 +271,11 @@ mod tests {
                 actual: 3,
                 expected: 4,
             },
+            ComputeValidationDecline::StorageScatterLength {
+                binding: 34,
+                actual: 3,
+                expected: 4,
+            },
         ]
     }
 
@@ -280,7 +299,8 @@ mod tests {
         // for a request to get wrong.
         // Up from 16: an exact-thread launch is decomposed into regions, and
         // both ways that decomposition can carry no work are their own reason.
-        assert_eq!(before, 18, "the compute validator's reason census moved");
+        // Up from 18: a scattered readback's layout must cover the image.
+        assert_eq!(before, 19, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

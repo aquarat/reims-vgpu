@@ -1550,6 +1550,21 @@ pub enum ComputeImageDestination {
         /// cannot be turned back into. One walk produced both.
         pages: Vec<u64>,
     },
+    /// The engine reads the pixels back and copies them straight from the
+    /// mapped readback buffer into the guest window this layout describes,
+    /// before the engine call returns.
+    ///
+    /// The host arm without its intermediate `Vec`: on a host that cannot
+    /// import guest RAM the readback is unavoidable, but copying it into a heap
+    /// buffer only for the caller to copy that buffer into the guest's pages
+    /// doubled the traffic. The caller prepared the destination — settled what
+    /// was owed to it, vouched for its pages, resolved the contiguous view the
+    /// layout points into — so the copy here is the whole of the write, and the
+    /// caller still owes the bookkeeping that follows a write.
+    ///
+    /// The layout must pack exactly the image's tight bytes; the request
+    /// validation refuses one that does not.
+    HostScatter(crate::runtime::guest_ram::PackedGuestLayout),
 }
 
 impl std::fmt::Debug for ComputeImageDestination {
@@ -1568,6 +1583,7 @@ impl std::fmt::Debug for ComputeImageDestination {
                 target.runs.len(),
                 pages.len()
             ),
+            Self::HostScatter(layout) => write!(f, "HostScatter({layout:?})"),
         }
     }
 }
@@ -1588,6 +1604,11 @@ pub enum ComputeImageResult {
     /// `record_guest_write_debt`. `bytes` is what the copy will land, for the
     /// census, and is not a length of anything the caller holds.
     Landed { bytes: u64 },
+    /// The readback was copied into the guest's pages through the layout of a
+    /// [`ComputeImageDestination::HostScatter`]. Like [`Self::Landed`] there
+    /// are no bytes to hand back; unlike it the write is complete, and the
+    /// caller owes only the bookkeeping that follows a guest write.
+    Scattered { bytes: u64 },
 }
 
 impl ComputeImageResult {
@@ -1601,7 +1622,7 @@ impl ComputeImageResult {
     pub fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytes(bytes) => Some(bytes),
-            Self::Landed { .. } => None,
+            Self::Landed { .. } | Self::Scattered { .. } => None,
         }
     }
 }

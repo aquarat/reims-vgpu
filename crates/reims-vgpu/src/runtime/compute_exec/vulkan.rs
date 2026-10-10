@@ -273,9 +273,81 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route(
                 "compute_dst_host_mapper_ref_texture_unlicensed",
             );
-            ComputeImageDestination::Host
+            // The readback stays, but its `Vec` need not: scatter it straight
+            // into the mapping's contiguous view when the writer could have
+            // taken the bytes verbatim.
+            match mapper_ref_texture_scatter(
+                state,
+                host,
+                held,
+                *mapping_id,
+                *surface_offset,
+                *surface_bpr,
+                *span_end,
+                *width,
+                *height,
+                *format,
+            ) {
+                Some(layout) => {
+                    crate::runtime::drain::note_store_route("compute_dst_host_scatter");
+                    ComputeImageDestination::HostScatter(layout)
+                }
+                None => ComputeImageDestination::Host,
+            }
         }
     }
+}
+
+/// The copying rail's destination for a mapper-ref-texture surface, without
+/// the `Vec`: the layout of the plane's rows in the mapping's contiguous view,
+/// for the engine to copy the readback into directly.
+///
+/// Served only where the bytes path would have written the readback
+/// verbatim: the storage image holds the surface's own texel
+/// ([`verbatim_texel`] of the staged format is `held`), so the readback's
+/// tight rows are exactly the rows [`crate::runtime::mapping_write::write_full_rect_raw_at`]
+/// would have copied, and the layout packs exactly the image's bytes. Anything
+/// else — another texel, a fragmented mapping, a window the writer would
+/// refuse — answers `None` and reads back into a `Vec` exactly as before.
+///
+/// [`verbatim_texel`]: crate::backend::vulkan::translate::pixel::verbatim_texel
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the surface window's own geometry, as the writeback record carries it"
+)]
+fn mapper_ref_texture_scatter<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    held: ash::vk::Format,
+    mapping_id: u32,
+    surface_offset: u64,
+    surface_bpr: u32,
+    span_end: u64,
+    width: u32,
+    height: u32,
+    format: u16,
+) -> Option<crate::runtime::guest_ram::PackedGuestLayout> {
+    let (texel_format, texel_bytes) =
+        crate::backend::vulkan::translate::pixel::verbatim_texel(format)?;
+    if texel_format != held || pixel_format::bytes_per_pixel(format) != Some(texel_bytes) {
+        crate::runtime::drain::note_store_route("compute_dst_host_scatter_texel");
+        return None;
+    }
+    let layout = crate::runtime::mapping_write::prepare_full_rect_scatter(
+        state,
+        host,
+        mapping_id,
+        surface_offset,
+        surface_bpr,
+        span_end,
+        width,
+        height,
+        texel_bytes,
+    );
+    if layout.is_none() {
+        crate::runtime::drain::note_store_route("compute_dst_host_scatter_declined");
+    }
+    layout
 }
 
 /// This rail's half of a staged compute texture. See [`RailStage`].
@@ -1099,6 +1171,9 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
     // BGRA8Unorm storage surface can composite into a B8G8R8A8_UNORM view (no
     // R/B swap) or must degrade to the swapped Rgba8Unorm view.
     let write_without_format = vk_engine::supports_storage_image_write_without_format();
+    // Mapping windows whose readback the engine scatters into the guest's
+    // pages itself, so the writes' bookkeeping can follow the engine call.
+    let mut scatter_windows: Vec<(u32, u64, u64)> = Vec::new();
     for t in staged_tex.iter().filter(|texture| texture.is_storage) {
         let Some(selector) = t.storage_selector else {
             crate::observe::fail(format!(
@@ -1278,6 +1353,21 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
                     .and_then(ResidentServe::seed_generation)
                     .is_some(),
             });
+            if let (
+                Some(ComputeStorageImageResource {
+                    destination: vk_engine::ComputeImageDestination::HostScatter(_),
+                    ..
+                }),
+                TextureWriteback::MapperRefTexture {
+                    mapping_id,
+                    surface_offset,
+                    span_end,
+                    ..
+                },
+            ) = (storage_images.last(), &t.writeback)
+            {
+                scatter_windows.push((*mapping_id, *surface_offset, *span_end));
+            }
         } else {
             let Some(sampled_fmt) = mtl_to_engine_sampled(t.pixel_format) else {
                 crate::observe::fail(format!(
@@ -1456,6 +1546,22 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
         vk_engine::execute_compute_request(device, req)
     };
     let out_result = run_engine(&req);
+    // A scatter is the whole of its guest write, and it lands inside the
+    // engine call, so the write is finished here — before any return below,
+    // and whatever the engine answered. A call that failed may have scattered
+    // some images and not others; finishing one that never landed retires a
+    // cache entry and moves a generation for nothing, which is the direction
+    // these records tolerate, while leaving a landed one unfinished would let
+    // the host cache go on naming the frame the guest's pages no longer hold.
+    for (mapping_id, surface_offset, span_end) in &scatter_windows {
+        crate::runtime::mapping_write::finish_rect_write(
+            state,
+            host,
+            *mapping_id,
+            *surface_offset,
+            *span_end,
+        );
+    }
     let out = match out_result {
         Ok(o) => o,
         Err(e) => {
@@ -1520,6 +1626,22 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
                 if let Err(e) = writeback_texture(state, host, task_id, t) {
                     return e;
                 }
+            }
+            // The engine scattered the readback into the mapping's rows itself,
+            // through the layout `mapper_ref_texture_scatter` prepared, and the
+            // write's bookkeeping already ran when the engine returned.
+            ComputeImageResult::Scattered { .. } => {
+                let TextureWriteback::MapperRefTexture { .. } = &t.writeback else {
+                    // Only a mapper-ref-texture writeback is ever given a
+                    // scatter destination, so this is the engine answering a
+                    // destination it was not asked for.
+                    crate::observe::fail(format!(
+                        "compute_linux scatter_without_mapping pipe={} bind={}",
+                        acc.pipeline_ref, t.binding
+                    ));
+                    return ComputeStatus::MetalFailed("compute_vk_scatter_destination");
+                };
+                crate::runtime::drain::note_store_route("compute_wb_mapper_ref_texture_scattered");
             }
             // The engine copied straight into the guest's pages, so there is no
             // writeback to do and no bytes to do it from.
