@@ -363,11 +363,11 @@ pub(crate) struct VulkanStage {
     /// can register the resident it produced under the same key.
     pub(crate) residency: Option<ComputeStorageResidencyCandidate>,
     /// What the engine could already serve for this binding, so the stage-time
-    /// guest read was skipped and `bytes` is a zero placeholder.
+    /// guest read was skipped and `bytes` is empty.
     ///
     /// [`ResidentServe::Seed`] — a storage binding whose resident the engine
     /// holds at a verified generation; it must never be seeded from the
-    /// placeholder. [`ResidentServe::Sample`] — a sampled input whose window is
+    /// absent bytes. [`ResidentServe::Sample`] — a sampled input whose window is
     /// a prior dispatch's storage output; the engine seeds the sampled image by
     /// copy-on-sample from that resident, again never from the bytes.
     ///

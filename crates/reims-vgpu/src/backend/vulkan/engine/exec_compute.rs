@@ -288,15 +288,18 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let expected = (img.width as usize)
-            .saturating_mul(img.height as usize)
-            .saturating_mul(img.format.bytes_per_texel());
-        if img.bytes.len() != expected {
+        let expected = img.tight_bytes();
+        // A skipped seed carries nothing; anything else carries the whole
+        // image. A served binding with bytes would be a seed the engine
+        // silently ignores, and an unserved one without them a seed it reads
+        // past the end of.
+        let carried = if img.seed_skipped { 0 } else { expected };
+        if img.bytes.len() != carried {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::StorageBytesLength {
                     binding: img.binding,
                     actual: img.bytes.len(),
-                    expected,
+                    expected: carried,
                 },
             ));
         }
@@ -834,14 +837,14 @@ pub(crate) unsafe fn execute_compute_inner(
         // not gets the pooled readback and the device→host crossing with it.
         let dst = match &resource.destination {
             super::types::ComputeImageDestination::Host => ComputeImageDst::Readback {
-                slot: pools.acquire_readback_extra(ctx, resource.bytes.len() as u64, counters)?,
+                slot: pools.acquire_readback_extra(ctx, resource.tight_bytes() as u64, counters)?,
                 scatter: None,
             },
             super::types::ComputeImageDestination::HostScatter(layout) => {
                 ComputeImageDst::Readback {
                     slot: pools.acquire_readback_extra(
                         ctx,
-                        resource.bytes.len() as u64,
+                        resource.tight_bytes() as u64,
                         counters,
                     )?,
                     scatter: Some(layout),
@@ -859,7 +862,7 @@ pub(crate) unsafe fn execute_compute_inner(
             slot: img,
             seed: st,
             dst,
-            len: resource.bytes.len(),
+            len: resource.tight_bytes(),
             width: resource.width,
             height: resource.height,
             initial_access,
@@ -1845,6 +1848,50 @@ mod tests {
             "vk_compute_validate_duplicate_storage_image_binding"
         );
     }
+    /// A storage image's size is its geometry, and `bytes` carries a seed only
+    /// when one was not skipped: a served binding carries none, an unserved one
+    /// carries the whole image, and either the other way round is refused by
+    /// name. The readback the engine sizes is `tight_bytes`, never the field.
+    #[test]
+    fn a_skipped_seed_carries_no_bytes_and_the_image_is_sized_by_its_geometry() {
+        let request = |bytes: Vec<u8>, seed_skipped: bool| ComputeRequest {
+            spirv: vec![0x0723_0203],
+            entry: "main".into(),
+            dispatch: ComputeDispatch::Workgroups([1, 1, 1]),
+            storage_images: vec![ComputeStorageImageResource {
+                destination: Default::default(),
+                binding: 34,
+                array_element: 0,
+                descriptor_count: 1,
+                format: StorageImageFormat::Rgba8Unorm,
+                width: 3,
+                height: 2,
+                bytes,
+                residency: None,
+                seed_skipped,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            request(Vec::new(), true).storage_images[0].tight_bytes(),
+            24
+        );
+        assert_eq!(validate_compute(&request(Vec::new(), true)), Ok(()));
+        assert_eq!(validate_compute(&request(vec![0; 24], false)), Ok(()));
+        for (bytes, skipped) in [
+            (vec![0; 24], true),
+            (Vec::new(), false),
+            (vec![0; 23], false),
+        ] {
+            match validate_compute(&request(bytes, skipped)) {
+                Err(DrawError::ComputeValidation(decline)) => {
+                    assert_eq!(decline.slug(), "vk_compute_validate_storage_bytes_length")
+                }
+                other => panic!("expected a storage length refusal, got {other:?}"),
+            }
+        }
+    }
+
     /// A layout over guest memory stands for bytes, so it owes the length the
     /// bytes would have: a gathered sampled source must pack the binding's
     /// tight pyramid, and a scatter destination must tile the storage image's

@@ -1383,7 +1383,7 @@ pub(crate) trait RailStage: Sized {
     /// from. `residency` is the storage-mirror window the staging corresponds
     /// to, for a storage binding and `None` for anything else, and `serve` is
     /// what the running rail said it could already serve for that window —
-    /// which is also why `bytes` may be a zero placeholder.
+    /// which is also why `bytes` may be empty.
     ///
     /// Three arguments rather than one struct of them because a rail that keeps
     /// no residency mirror ignores the last two, and an ignored *argument* is
@@ -2016,7 +2016,15 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             mip_levels: 1,
             width,
             height,
-            bytes: vec![0; need],
+            // A served binding carries no bytes: the engine sizes the image
+            // from its geometry and never seeds or uploads from them. An
+            // unserved heap texture's zeros are its content — the engine copy
+            // is the only one there is.
+            bytes: if serve.is_some() {
+                Vec::new()
+            } else {
+                vec![0; need]
+            },
             is_storage,
             writeback: TextureWriteback::None,
             rail: R::stage(
@@ -2422,8 +2430,9 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         // pages reproduces what the GPU already has. The mapping-level content
         // generation may have advanced via disjoint sibling windows
         // (ping-pong canvases), so the gate pairs mirror↔engine directly.
-        // The zero placeholder is never seeded — the engine fails visibly
-        // with `vk_compute_exec_resident_seed_generation_lost` if the resident
+        // A served binding carries no bytes, so there is nothing that could be
+        // seeded — the engine fails visibly with
+        // `vk_compute_exec_resident_seed_generation_lost` if the resident
         // vanishes by acquire time.
         // Copy-on-sample is the same gate: a sampled input of a window whose
         // current content the engine already holds GPU-resident (a prior
@@ -2462,7 +2471,15 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 "compute_stage_resident_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={generation} bytes={need}"
             ));
         }
-        let mut bytes = vec![0u8; need];
+        // Nothing to read when a resident serves this window, and nothing to
+        // hold: the engine sizes the image from its geometry, so a served
+        // binding carries no bytes rather than a zero-filled frame whose only
+        // use was its length.
+        let mut bytes = if serve.is_some() {
+            Vec::new()
+        } else {
+            vec![0u8; need]
+        };
         if serve.is_none()
             && !mapping_write::read_rect_raw_at(
                 state,
@@ -2847,7 +2864,12 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             }
         }
     }
-    let mut bytes = vec![0u8; pyramid_need];
+    // A served window carries no bytes (see the mapper-ref-texture arm).
+    let mut bytes = if serve.is_some() {
+        Vec::new()
+    } else {
+        vec![0u8; pyramid_need]
+    };
     if serve.is_some() {
         // The rail's resident serves this window; no cache/guest read.
     } else {

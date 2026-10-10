@@ -827,10 +827,10 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
 }
 
 /// `seed_skipped` contract: a generation-matching resident dispatch renders
-/// from the GPU-resident content while `bytes` is a zero placeholder (no seed
-/// upload); once the resident is gone the same request must fail with
-/// `vk_compute_exec_resident_seed_generation_lost` — never silently seed the
-/// placeholder.
+/// from the GPU-resident content while `bytes` is empty (no seed upload, the
+/// image sized by its geometry); once the resident is gone the same request
+/// must fail with `vk_compute_exec_resident_seed_generation_lost` — there is
+/// nothing it could seed from.
 #[test]
 fn compute_storage_image_seed_skip_and_lost_resident() {
     let _g = engine_test_session();
@@ -868,7 +868,12 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
                 format: StorageImageFormat::Rgba8Unorm,
                 width: w,
                 height: h,
-                bytes: vec![0u8; (w * h * 4) as usize],
+                // A skipped seed carries no bytes; an unskipped one the whole image.
+                bytes: if skipped {
+                    Vec::new()
+                } else {
+                    vec![0u8; (w * h * 4) as usize]
+                },
                 residency: Some(ComputeStorageResidency {
                     identity,
                     seed_generation,
@@ -888,8 +893,9 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
         .chunks_exact(4)
         .all(|p| p[0] >= 254));
 
-    // Skip dispatch: one texel, zero-placeholder bytes, matching generation.
-    // Untouched texels staying red prove the placeholder was never seeded.
+    // Skip dispatch: one texel, no bytes, matching generation. Untouched
+    // texels staying red prove nothing was seeded, and the full 4x4 readback
+    // proves the image was sized from its geometry rather than from `bytes`.
     engine::reset_draw_counters();
     let skip = engine::execute_compute_request(engine_device(), &make([1, 1, 1], 2, 3, true))
         .expect("seed-skip resident hit");

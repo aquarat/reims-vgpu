@@ -1662,6 +1662,10 @@ pub struct ComputeStorageImageResource {
     /// pages, which this device refuses on its own grounds: it acks a command
     /// before the work runs, so the guest may repaint those pages first. Only
     /// the output direction is routed.
+    ///
+    /// Empty exactly when [`Self::seed_skipped`] holds: a binding the engine's
+    /// resident already serves has no seed to carry, and the image's size is
+    /// [`Self::tight_bytes`], never this field's length.
     pub bytes: Vec<u8>,
     /// Where the post-dispatch pixels go. See [`ComputeImageDestination`].
     pub destination: ComputeImageDestination,
@@ -1669,17 +1673,31 @@ pub struct ComputeStorageImageResource {
     /// storage. `None` keeps the conservative transient upload path.
     pub residency: Option<ComputeStorageResidency>,
     /// The caller skipped reading guest pages into `bytes` because the
-    /// resident generation matched at stage time. The engine must fail
-    /// visibly (never seed the zero placeholder) if the resident image is
-    /// gone by acquire time.
+    /// resident generation matched at stage time, so `bytes` is empty. The
+    /// engine must fail visibly (it has nothing to seed from) if the resident
+    /// image is gone by acquire time.
     pub seed_skipped: bool,
+}
+
+impl ComputeStorageImageResource {
+    /// The image's tight byte size: what its readback holds and what a seed
+    /// must carry.
+    ///
+    /// Derived from the geometry rather than read off `bytes`. A served
+    /// binding used to carry a zero-filled frame of this length for nothing
+    /// but the length — on a compositor-heavy guest two full-screen frames
+    /// per composite, filled with zeroes and never read.
+    pub fn tight_bytes(&self) -> usize {
+        (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(self.format.bytes_per_texel())
+    }
 }
 
 /// Bind request for a sampled input whose window content the engine already
 /// holds GPU-resident (a prior dispatch's storage output). The engine copies
 /// the resident image into the transient sampled image device-locally instead
-/// of uploading `bytes` (which is a zero placeholder and must never reach the
-/// GPU): the copy never aliases the live resident, so the same dispatch may
+/// of uploading anything (the binding carries no bytes): the copy never aliases the live resident, so the same dispatch may
 /// also storage-write that identity. A missing/mismatched resident fails
 /// visibly with a `vk_compute_exec_resident_sample_*` decline naming the check
 /// that refused.
