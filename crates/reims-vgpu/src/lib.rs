@@ -110,6 +110,7 @@ pub mod runtime;
 
 pub mod backend;
 pub mod qemu;
+pub mod remote;
 
 /// Host-owned presentation window — a Rust-owned `winit` window that replaces
 /// QEMU's UI. See [[host-window]].

@@ -4,12 +4,14 @@
 //! ApplePV-shaped model. No parsing of wire bytes here; no backend execution.
 
 pub(crate) mod content_cache;
+pub(crate) mod hot_word;
 mod lru_memo;
 mod regs;
 mod state;
 
 pub(crate) use lru_memo::LruBytesMemo;
 pub(crate) use regs::*;
+pub use hot_word::{install_external_hot_words, HotWord, HotWordBlock};
 // `GfxRegs` has no in-crate importer and is here for the five doc comments
 // that link `model::GfxRegs::child_doorbell_rung`. `state` is a private
 // `mod`, so this is the only path those links can name — and rustc's

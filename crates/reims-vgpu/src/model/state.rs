@@ -358,7 +358,7 @@ pub struct GfxRegs {
     /// `Arc<AtomicU32>` shared with the registry slot: the guest `writeFifo`
     /// producer spins on this register, so it must observe drain progress
     /// live while the drain worker owns the device lock.
-    pub fifo_read: Arc<AtomicU32>,
+    pub fifo_read: super::hot_word::HotWord,
     pub fifo_start: u32,
     pub root_page: u32,
     pub fifo_base_page: u32,
@@ -366,12 +366,12 @@ pub struct GfxRegs {
     /// the guest ISR MMIO read observes live bits even while the drain worker
     /// owns the device lock (ack fast: a cached/stale mask loses signals).
     /// The `Arc` is shared with the device registry slot and survives reset.
-    pub interrupt_status_disp: Arc<AtomicU32>,
+    pub interrupt_status_disp: super::hot_word::HotWord,
     /// Read-to-clear stamp-signal status (0x1018). Same lock-free contract.
-    pub interrupt_status_gpu: Arc<AtomicU32>,
+    pub interrupt_status_gpu: super::hot_word::HotWord,
     /// Fault interrupt status (0x102c), host-set, guest-read (not r2c). Same
     /// lock-free read rail (the guest ISR reads it right after 0x1018).
-    pub interrupt_fault: Arc<AtomicU32>,
+    pub interrupt_fault: super::hot_word::HotWord,
     /// Child channels rung since the drain last folded them in (0x1020/0x1028).
     ///
     /// The lock-free *write* rail, and the only one: every other register the
@@ -395,7 +395,7 @@ pub struct GfxRegs {
     ///
     /// The `Arc` is shared with the device registry slot and survives reset,
     /// like the three above.
-    pub child_doorbell_rung: Arc<AtomicU32>,
+    pub child_doorbell_rung: super::hot_word::HotWord,
     /// vCPUs parked on the device lock right now, raised and lowered by the
     /// vCPU thread around its blocking acquire. The drain reads it between
     /// packets and ends its tranche when it is non-zero; see
@@ -422,14 +422,14 @@ impl Default for GfxRegs {
             control_fifo: 0,
             fifo_length: 0,
             fifo_written: 0,
-            fifo_read: Arc::new(AtomicU32::new(0)),
+            fifo_read: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::FifoRead),
             fifo_start: 0,
             root_page: 0,
             fifo_base_page: 0,
-            interrupt_status_disp: Arc::new(AtomicU32::new(0)),
-            interrupt_status_gpu: Arc::new(AtomicU32::new(0)),
-            interrupt_fault: Arc::new(AtomicU32::new(0)),
-            child_doorbell_rung: Arc::new(AtomicU32::new(0)),
+            interrupt_status_disp: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::IntrStatusDisp),
+            interrupt_status_gpu: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::IntrStatusGpu),
+            interrupt_fault: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::IntrFault),
+            child_doorbell_rung: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::ChildDoorbellRung),
             vcpu_lock_wanted: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
@@ -3974,11 +3974,11 @@ impl DeviceState {
         let page_shift = self.page_shift;
         // Keep the interrupt-status Arcs wired to the registry slot: the
         // lock-free ISR read rail clones them once at device create.
-        let intr_disp = Arc::clone(&self.gfx.interrupt_status_disp);
-        let intr_gpu = Arc::clone(&self.gfx.interrupt_status_gpu);
-        let intr_fault = Arc::clone(&self.gfx.interrupt_fault);
-        let fifo_read = Arc::clone(&self.gfx.fifo_read);
-        let child_rung = Arc::clone(&self.gfx.child_doorbell_rung);
+        let intr_disp = self.gfx.interrupt_status_disp.clone();
+        let intr_gpu = self.gfx.interrupt_status_gpu.clone();
+        let intr_fault = self.gfx.interrupt_fault.clone();
+        let fifo_read = self.gfx.fifo_read.clone();
+        let child_rung = self.gfx.child_doorbell_rung.clone();
         // Not cleared: it counts threads blocked on the lock this reset holds,
         // and they lower it themselves once they get it.
         let lock_wanted = Arc::clone(&self.gfx.vcpu_lock_wanted);

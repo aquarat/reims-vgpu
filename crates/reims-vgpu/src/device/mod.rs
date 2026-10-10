@@ -86,19 +86,19 @@ struct BoundDevice {
     /// Lock-free clones of the read-to-clear interrupt-status registers
     /// (`state.gfx.interrupt_status_disp` / `_gpu`): the guest ISR read at
     /// 0x1014/0x1018 must observe live bits mid-drain, never a stale cache.
-    intr_disp: Arc<AtomicU32>,
-    intr_gpu: Arc<AtomicU32>,
+    intr_disp: crate::model::HotWord,
+    intr_gpu: crate::model::HotWord,
     /// Child channels the guest has rung, OR'd from the vCPU thread with no
     /// device lock; see [`crate::model::GfxRegs::child_doorbell_rung`].
-    child_doorbell_rung: Arc<AtomicU32>,
+    child_doorbell_rung: crate::model::HotWord,
     /// vCPUs blocked on `inner`; see [`crate::model::GfxRegs::vcpu_lock_wanted`].
     vcpu_lock_wanted: Arc<AtomicU32>,
     /// Lock-free clone of the fault status (0x102c) — the ISR's third read.
-    intr_fault: Arc<AtomicU32>,
+    intr_fault: crate::model::HotWord,
     /// Lock-free clone of the main-FIFO consumer counter (0x100c): the guest
     /// `writeFifo` producer spin must observe drain progress live, not a
     /// cached snapshot from before the tranche.
-    fifo_read_live: Arc<AtomicU32>,
+    fifo_read_live: crate::model::HotWord,
     /// An accepted present is waiting for QEMU to consume its scanout action.
     /// Kept outside `inner` so new worker wakeups can yield without racing the
     /// main-loop copy for the same device lock.
@@ -228,12 +228,12 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     // would otherwise be the first to notice.
     crate::observe::off(format!("backend_selected name={}", backend_name()));
     let dev = Device::new(DeviceId(id), page_shift);
-    let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
-    let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
-    let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
+    let intr_disp = dev.state.gfx.interrupt_status_disp.clone();
+    let intr_gpu = dev.state.gfx.interrupt_status_gpu.clone();
+    let child_doorbell_rung = dev.state.gfx.child_doorbell_rung.clone();
     let vcpu_lock_wanted = Arc::clone(&dev.state.gfx.vcpu_lock_wanted);
-    let intr_fault = Arc::clone(&dev.state.gfx.interrupt_fault);
-    let fifo_read_live = Arc::clone(&dev.state.gfx.fifo_read);
+    let intr_fault = dev.state.gfx.interrupt_fault.clone();
+    let fifo_read_live = dev.state.gfx.fifo_read.clone();
     DEVICES.lock().insert(
         id,
         Arc::new(BoundDevice {
