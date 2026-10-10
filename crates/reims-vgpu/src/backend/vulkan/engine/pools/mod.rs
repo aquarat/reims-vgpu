@@ -4016,6 +4016,61 @@ pub(super) unsafe fn read_back_slot(
     Ok(out)
 }
 
+/// [`read_back_slot`] into the guest's pages instead of a `Vec`.
+///
+/// The same bound, the same mapping rule and the same invalidate — this is the
+/// one other consumer of a readback's bytes, so it shares every step that makes
+/// those bytes the GPU's and not the previous frame's — and then one copy
+/// through `layout` where `read_back_slot` would copy into a fresh `Vec` the
+/// caller then copied again.
+///
+/// `layout` must pack exactly `len` bytes; the request validation is what
+/// refuses one that does not, and this re-checks it rather than read past what
+/// the GPU copy filled.
+///
+/// # Safety
+///
+/// Every run in `layout` must be a live, writable host view of guest memory
+/// for the duration of this call, overlapping neither the slot's mapping nor
+/// each other.
+pub(super) unsafe fn scatter_back_slot(
+    ctx: &DeviceContext,
+    slot: &BufferSlot,
+    len: u64,
+    layout: &crate::runtime::guest_ram::PackedGuestLayout,
+    map_op: VkOp,
+    invalidate_op: VkOp,
+) -> Result<(), DrawError> {
+    if !slot_span_fits(len, slot.size) || layout.packed_len() != len {
+        return Err(DrawError::DrawExecution(
+            super::draw_execution::DrawExecutionDecline::ReadBackBeyondSlot {
+                len: layout.packed_len().max(len),
+                slot_size: slot.size.min(len),
+            },
+        ));
+    }
+    let persistent = slot.mapped != 0;
+    let ptr = if persistent {
+        slot.mapped as *const u8
+    } else {
+        ctx.device
+            .map_memory(slot.memory, 0, len, vk::MemoryMapFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(map_op, e)))? as *const u8
+    };
+    let release = |ctx: &DeviceContext| {
+        if !persistent {
+            ctx.device.unmap_memory(slot.memory);
+        }
+    };
+    if let Err(e) = invalidate_slot_for_read(ctx, slot, invalidate_op) {
+        release(ctx);
+        return Err(e);
+    }
+    layout.scatter_from(ptr);
+    release(ctx);
+    Ok(())
+}
+
 /// Make the GPU's writes to `slot` visible to a host read of its mapping.
 ///
 /// A no-op on coherent memory and a `vkInvalidateMappedMemoryRanges` otherwise;

@@ -2582,6 +2582,22 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             }
         }
     }
+    finish_rect_write(state, host, mapping_id, base_off, span_end);
+    true
+}
+
+/// The bookkeeping a rect write owes once its rows are in the guest's pages.
+///
+/// Its own function because the rows can land without this module: a compute
+/// readback scattered through [`prepare_full_rect_scatter`]'s layout lands them
+/// from inside the engine, and the write is not finished until this has run.
+pub(crate) fn finish_rect_write<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    base_off: u64,
+    span_end: u64,
+) {
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     // Guest pages are authoritative after this write and no host-side copy
@@ -2611,7 +2627,107 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     // exists to avoid. A miss costs the next LOAD a guest read.
     crate::runtime::surface_cache::forget(state, mapping_id);
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
-    true
+}
+
+/// The destination half of [`write_full_rect_raw_at`], for a caller that moves
+/// the rows itself: every check and every obligation that precedes the write,
+/// answered with the layout of the plane's rows in the mapping's contiguous
+/// view instead of a copy into it.
+///
+/// The compute readback is the caller. It used to copy the readback buffer
+/// into a `Vec` only for [`write_full_rect_raw_at`] to copy that `Vec` here; with
+/// this layout the engine copies the readback into these rows directly. The
+/// rows land later than this call, so everything here is what the writer did
+/// *before* its first byte — the window bound, the settle of what was owed to
+/// this mapping, the vouch for its pages, the contiguous view with its
+/// footprint and host-write marks — and [`finish_rect_write`] is what it did
+/// after its last. Marking the pages as host-written ahead of the bytes is the
+/// direction those records tolerate: over-marking turns a miss into a hit and
+/// never invents a clean verdict.
+///
+/// `None` is a routing answer, never a loss: the mapping has no contiguous
+/// view (the fragmented arms stay on the writer), or one of the writer's own
+/// refusals holds, which the caller's fallback to the writer then reports
+/// exactly as it always did. Only the contiguous view is served because it is
+/// the arm the copy goes through on the hot path, and a layout over it is one
+/// run; the view stays valid until the drain handles the mapping's unmap, which
+/// cannot happen inside the dispatch that holds it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the full-plane API mirrors its mapping window and row layout"
+)]
+pub(crate) fn prepare_full_rect_scatter<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    base_off: u64,
+    surface_bpr: u32,
+    span_end: u64,
+    width: u32,
+    height: u32,
+    bpp: u32,
+) -> Option<crate::runtime::guest_ram::PackedGuestLayout> {
+    if !scanout_extent_ok(width, height) || bpp == 0 {
+        return None;
+    }
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.mapped || m.page_entries.is_empty() {
+        return None;
+    }
+    let row_bytes = width.checked_mul(bpp)?;
+    if row_bytes > surface_bpr {
+        return None;
+    }
+    let rb = row_bytes as usize;
+    let bpr = surface_bpr as usize;
+    if rect_extent_end(base_off, 0, height, bpr, 0, rb) > span_end {
+        // The writer's `writeback_overrun`, which the fallback reports.
+        return None;
+    }
+    let settle_started = std::time::Instant::now();
+    crate::runtime::writeback_debt::settle_for_mapping(
+        state,
+        host,
+        mapping_id,
+        crate::runtime::render_writeback::SettleSite::MappingRectWrite,
+    );
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_settle_us",
+        settle_started.elapsed().as_micros() as u64,
+    );
+    let vouch_started = std::time::Instant::now();
+    let vouched = vouch_for_write(state, host, mapping_id, "rect_raw");
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_vouch_us",
+        vouch_started.elapsed().as_micros() as u64,
+    );
+    let vouched = vouched?;
+    let contig_started = std::time::Instant::now();
+    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
+    crate::runtime::drain::note_store_route_us(
+        "rectwr_contig_us",
+        contig_started.elapsed().as_micros() as u64,
+    );
+    let (ptr, view_len) = contig?;
+    crate::runtime::drain::note_store_route("rectwr_contig_scatter_n");
+    // `contig_for_write` guarantees the view covers `span_end`, and the window
+    // `[base_off, span_end)` is cut against the view's own length, so a view
+    // shorter than that refuses here rather than becoming a wild pointer.
+    let window = crate::runtime::guest_ram::GuestRun::in_mapping(
+        ptr,
+        view_len as u64,
+        base_off,
+        span_end.checked_sub(base_off)?,
+    )?;
+    crate::runtime::guest_ram::PackedGuestLayout::rows(
+        &[crate::runtime::guest_ram::WindowRun {
+            window_offset: 0,
+            run: window,
+        }],
+        height,
+        u64::from(surface_bpr),
+        u64::from(row_bytes),
+    )
 }
 
 #[cfg(test)]
