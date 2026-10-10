@@ -72,6 +72,9 @@
 use reims_vgpu_observe::{Decline, Emit};
 use reims_vgpu_protocol::checked::align_up_u64;
 
+pub mod packed;
+pub use packed::{PackedGuestLayout, PackedSegment, WindowRun};
+
 /// Exact physical footprint retained with one imported guest allocation.
 ///
 /// `pages` is the allocation order required by alias and ownership checks;
