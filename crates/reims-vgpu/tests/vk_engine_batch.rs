@@ -23,7 +23,8 @@ use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
     IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
-    SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
+    SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
+    StorageBufferResource,
     TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
@@ -583,6 +584,94 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
         is_frag_color(&px[right..right + 4]),
         "B right half = {:?}",
         &px[right..right + 4]
+    );
+}
+
+/// A draw with a secondary colour attachment opens a batch and the next one
+/// joins it, the way a single-attachment draw does. macOS 26's compositor binds
+/// a memoryless texture as attachment 1 of nearly every pass, and while these
+/// draws were barred from batching each one ended its command buffer and
+/// submitted on its own.
+///
+/// The joiner LOADs the primary the opener cleared and drew into, across the
+/// pass boundary inside the one command buffer, so a missing dependency between
+/// the two passes reads as the opener's half lost. The secondary must be a
+/// ready resident afterwards, as the unbatched path leaves it.
+#[test]
+fn mrt_draws_open_and_join_one_batch() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let primary = TargetIdentity::Surface {
+        id: 990_301,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let secondary = TargetIdentity::Surface {
+        id: 990_302,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let mrt = |load_from_target: bool, left: bool| {
+        let mut req = batch_req(&vert, &frag, &primary, load_from_target, half_scissor(left));
+        req.secondary_targets.push(SecondaryColorTarget {
+            identity: secondary.clone(),
+            width: W,
+            height: H,
+            attachment: reims_vgpu::backend::vulkan::translate::pixel::color_attachment(
+                reims_vgpu::protocol::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            )
+            .expect("RGBA8 is renderable")
+            .0
+            .with_clear([0.0, 0.0, 1.0, 1.0]),
+            load: false,
+            blend: None,
+            color_write_mask: Default::default(),
+        });
+        req
+    };
+
+    let before = engine::counter_snapshot();
+    match engine::execute_draw_request(engine_device(), &mrt(false, true)) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("MRT opener draw: {msg}");
+        }
+    }
+    engine::execute_draw_request(engine_device(), &mrt(true, false)).expect("MRT joiner draw");
+    let mid = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(mid.batch_opens, 1, "an MRT draw opens a batch");
+    assert_eq!(mid.batch_joins, 1, "and the next MRT draw joins it");
+    assert_eq!(mid.batch_flushes, 0, "no flush before a consumer arrives");
+
+    let px = engine::read_target(&primary)
+        .expect("read_target flushes the batch")
+        .into_rgba8()
+        .expect("an eight-bit colour readback");
+    let after = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(after.batch_flushes, 1, "read_target submitted the batch");
+    assert_eq!(after.batch_flush_draws, 2, "the one submit carried both draws");
+    for y in [0u32, H / 2, H - 1] {
+        for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {
+            let i = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&px[i..i + 4]),
+                "batched MRT composite at ({x},{y}) = {:?}",
+                &px[i..i + 4]
+            );
+        }
+    }
+    assert!(
+        engine::resident_content_ready(&secondary),
+        "the secondary attachment must be a ready resident after its batch"
     );
 }
 

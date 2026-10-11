@@ -2226,7 +2226,14 @@ unsafe fn upload_buffer_to_sampled_image(
 struct JoinTerms {
     force_loss: bool,
     quirk: bool,
-    is_mrt: bool,
+    /// A multi-attachment draw whose submit may not be deferred.
+    ///
+    /// The same story as `depth_barred`: the rung guarded the per-draw ad-hoc
+    /// framebuffer an MRT pass used to build, which a deferred draw leaked.
+    /// Both submit paths dispose through [`dispose_ad_hoc_attachments`] and the
+    /// framebuffer is owned by the ad-hoc cache, so the term is only what
+    /// [`crate::config::BATCH_MRT`] restores for an A/B.
+    mrt_barred: bool,
     /// A depth draw whose submit may not be deferred.
     ///
     /// Depth itself is not the reason and never was. A depth pass builds a
@@ -2319,6 +2326,37 @@ fn depth_bars_batching(has_depth: bool) -> bool {
     has_depth && batch_depth_disabled()
 }
 
+/// Whether [`crate::config::BATCH_MRT`] is switched off, read once per process.
+///
+/// Latched for the same reason [`batch_depth_disabled`] is.
+fn batch_mrt_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::BATCH_MRT);
+        match state {
+            crate::config::Switch::Off => {
+                crate::observe::off("batch_mrt reason=batch_mrt_disabled_by_env");
+                true
+            }
+            crate::config::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "batch_mrt reason=batch_mrt_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::config::Switch::On | crate::config::Switch::Unset => false,
+        }
+    })
+}
+
+/// The `mrt_barred` term, as the draw path computes it. A function for the same
+/// reason [`depth_bars_batching`] is one: a test reaches the decision itself.
+fn mrt_bars_batching(is_mrt: bool) -> bool {
+    is_mrt && batch_mrt_disabled()
+}
+
 /// Hand this draw's ad-hoc attachment handles to the graveyard.
 ///
 /// **Both submit paths call this and neither may inline it.** They differ only in
@@ -2393,7 +2431,7 @@ impl JoinTerms {
     const LADDER: [JoinRefusal; 12] = [
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
-        (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
+        (|t| t.mrt_barred, JoinScope::Draw, "nojoin_mrt"),
         (|t| t.depth_barred, JoinScope::Draw, "nojoin_depth"),
         (|t| t.reads_back, JoinScope::Draw, "nojoin_reads_back"),
         (|t| t.has_query, JoinScope::Draw, "nojoin_query"),
@@ -2702,7 +2740,7 @@ pub(crate) unsafe fn execute_draw_inner(
     pools.ensure_init(ctx, counters)?;
 
     // Draw batching (deferred submit): a draw that hands the CPU nothing
-    // (skip_readback + resident target, no MRT) leaves its CB in recording
+    // (skip_readback + resident target) leaves its CB in recording
     // state for same-target successors; a successor whose work folds into the
     // open CB (LoadFromTarget — no CPU/GPU seed, not sampling its own target,
     // same identity/geometry/format) appends to it, skipping slot claim and
@@ -2876,7 +2914,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let terms = JoinTerms {
         force_loss,
         quirk: ctx.caps.quirks.no_deferred_draw_batching,
-        is_mrt,
+        mrt_barred: mrt_bars_batching(is_mrt),
         depth_barred: depth_bars_batching(req.depth.is_some()),
         reads_back: !req.skip_readback,
         has_query: req.occlusion_query.is_some(),
@@ -6662,7 +6700,7 @@ mod tests {
         JoinTerms {
             force_loss: b(0),
             quirk: b(1),
-            is_mrt: b(2),
+            mrt_barred: b(2),
             depth_barred: b(3),
             reads_back: b(4),
             has_query: b(5),
@@ -6732,6 +6770,28 @@ mod tests {
         };
         assert!(!barred.batch_eligible());
         assert_eq!(barred.refusal(), Some("nojoin_depth"));
+    }
+
+    /// A draw with secondary colour attachments must be able to defer its
+    /// submit, through the production predicate, and the env switch must still
+    /// restore the old bar under its own census name.
+    #[test]
+    fn a_secondary_attachment_alone_does_not_bar_batching() {
+        let mrt_only = JoinTerms {
+            mrt_barred: mrt_bars_batching(true),
+            ..join_terms(0)
+        };
+        assert!(
+            mrt_only.batch_eligible(),
+            "a draw carrying secondary attachments must be able to open or join a batch"
+        );
+        assert_eq!(mrt_only.refusal(), None);
+        let barred = JoinTerms {
+            mrt_barred: true,
+            ..join_terms(0)
+        };
+        assert!(!barred.batch_eligible());
+        assert_eq!(barred.refusal(), Some("nojoin_mrt"));
     }
 
     // There is deliberately no test that `batch_eligible` and `refusal` agree

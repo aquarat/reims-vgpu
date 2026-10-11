@@ -374,6 +374,20 @@ pub const BATCH_MIXED_TARGETS: &str = "REIMS_VGPU_BATCH_MIXED_TARGETS";
 /// Off is a refusal (`nojoin_depth`) and never a permission.
 pub const BATCH_DEPTH: &str = "REIMS_VGPU_BATCH_DEPTH";
 
+/// `off` bars a draw with more than one colour attachment from deferring its
+/// submit, the way every such draw was barred while its ad-hoc framebuffer was
+/// disposed only on the submitting path.
+///
+/// Like [`BATCH_DEPTH`], the bar was a leak guard and not a statement about MRT:
+/// the secondaries are registry residents whose reclaim parks in the graveyard
+/// against `open_slot_mask`, they are marked ready before the deferred return,
+/// the framebuffer comes from the ad-hoc cache, and the pass's external
+/// dependencies are written per stage rather than per attachment. On macOS 26
+/// guests the compositor binds a memoryless texture as attachment 1 of nearly
+/// every pass, so this rung alone forced about half of all draws to submit on
+/// their own. Off is a refusal (`nojoin_mrt`) and never a permission.
+pub const BATCH_MRT: &str = "REIMS_VGPU_BATCH_MRT";
+
 /// `off` stages the guest bytes of a `[[buffer(n)]]` bind even when the stage's
 /// own reflection says the shader never dereferences it.
 ///
