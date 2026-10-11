@@ -13,8 +13,9 @@ below, and `vendor/qemu` points at
 `master` (upstream QEMU, steelbrain's vmapple work and Asahi KVM support).
 metal2vulkan comes from
 [aquarat/metal2vulkan](https://github.com/aquarat/metal2vulkan): steelbrain's
-metal2vulkan plus one commit (a narrower vector load from a union, used by
-macOS 26 Core Animation shaders).
+metal2vulkan plus two commits: a narrower vector load from a union (macOS 26
+Core Animation shaders) and a byte pointee kept as bytes at the load (packed
+vertex attributes read through a byte-record GEP).
 
 This build is the GPU of a macOS CI runner setup that runs production CI
 daily: one runner slot with the GPU serves an iOS app's UI tests. The host
@@ -39,13 +40,24 @@ side (kernel patches, images, runners) is in
   its tranche when a vCPU waits and takes busy channels in turns.
 - Logging: overridable, capped log sink paths; the AIR of a failed
   translation captured in the m2v cache.
+- Copy path: guest data moves directly between guest RAM and mapped Vulkan
+  memory instead of through an intermediate buffer. A packed buffer laid
+  over the guest runs that hold a buffer's bytes, one page walk for every
+  span copier, sampled linear levels gathered straight into staging and
+  storage readbacks scattered straight into their surface mapping. A
+  binding the resident already holds sends no zero-filled placeholder, and
+  the translation cache's bucket digest uses a fast fold instead of SipHash.
+- Rendering on macOS 26: render pipelines with no fragment function (Skia's
+  stencil passes), a slot's type checked before it is asked for a texture
+  view, and metal2vulkan's byte-record attribute loads, so Compose/Skia
+  apps draw their real UI.
 - `vendor/qemu`: tracks aquarat/qemu-reims-vgpu `master`.
 
 `git log` has the details of each.
 
 ## Running on Asahi
 
-Use Mesa's Honeykrisp (Asahi Vulkan) driver with the 16-bit varying patch
+Use Mesa's Honeykrisp (Asahi Vulkan) driver with the 16-bit varying patches
 from the host repository (`patches/mesa/`, built by
 `scripts/build-mesa-honeykrisp.sh`) and point `VK_DRIVER_FILES` at it. Stock
 Honeykrisp aborts on the iOS simulator's 16-bit varyings. llvmpipe
@@ -75,11 +87,15 @@ in the host repository.
 
 ## Known gaps
 
-- Pipelines with no fragment function are refused, so screenshots of
-  Compose/Skia apps are mostly flat colour. UI tests that use accessibility
-  are not affected. Being fixed.
-- `memcpy` is 70 % of the drain's CPU time after compaction; part of it is an
-  extra copy through an intermediate buffer, which can go.
+- A cold app launch takes 20–40 s before its UI settles. The drain is
+  saturated by the per-draw path (one queue submission per draw), not by the
+  GPU or shader compilation.
+- `memcpy` is still about two thirds of the drain's CPU time. Honeykrisp
+  cannot import guest RAM (no `VK_EXT_external_memory_host`), so guest data
+  is copied into and out of Vulkan memory once each way.
+- Honeykrisp needs the 16-bit flat fragment input patch as well
+  (`patches/mesa/0002-*` in the host repository); without it a Compose
+  app's shaders abort the driver.
 
 ## Taking upstream changes
 
