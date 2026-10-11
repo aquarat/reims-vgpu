@@ -653,6 +653,21 @@ fn storage_buffer_offset_alignment(limits: &vk::PhysicalDeviceLimits) -> u64 {
     limits.min_storage_buffer_offset_alignment
 }
 
+/// Minimum spacing of two pipeline-cache serializations; see
+/// [`DeviceContext::persist_pipeline_cache`].
+pub(crate) const PIPELINE_CACHE_SAVE_INTERVAL_US: u64 = 1_000_000;
+
+/// When a deferred pipeline-cache save falls due (`observe::elapsed_us`), or 0
+/// when none is owed. A process global rather than a context field so the
+/// end-of-tranche tail can ask without taking the engine lock.
+static PIPELINE_CACHE_SAVE_DUE_US: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a deferred pipeline-cache save is owed and due.
+pub(crate) fn pipeline_cache_save_due() -> bool {
+    let due = PIPELINE_CACHE_SAVE_DUE_US.load(Ordering::Acquire);
+    due != 0 && crate::observe::elapsed_us() >= due
+}
+
 pub(crate) struct DeviceContext {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
@@ -800,6 +815,9 @@ pub(crate) struct DeviceContext {
     /// Byte length of the last persisted cache blob — the growth debounce
     /// for [`Self::persist_pipeline_cache`].
     pub pipeline_cache_saved_len: AtomicUsize,
+    /// When the last serialize ran (`observe::elapsed_us`, 0 = never): the
+    /// time debounce for [`Self::persist_pipeline_cache`].
+    pub pipeline_cache_saved_at_us: AtomicU64,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
     #[cfg(feature = "host-window")]
     pub swapchain: bool,
@@ -1481,6 +1499,7 @@ impl DeviceContext {
             queue_owner,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
+            pipeline_cache_saved_at_us: AtomicU64::new(0),
             #[cfg(feature = "host-window")]
             swapchain,
         })
@@ -1488,12 +1507,49 @@ impl DeviceContext {
 
     /// Persist the pipeline cache to disk when it has grown since the last
     /// save. Called after each actual pipeline creation (cache misses only —
-    /// warm hits never reach this). The serialize under the engine lock is a
-    /// memcpy; the filesystem work is handed to [`persist`], the process's one
-    /// persistence owner, so nothing on the draw path blocks on disk. Saving on
-    /// creation rather than at context destroy is deliberate: the testing boot
-    /// SIGKILLs QEMU, so destroy never runs there.
+    /// warm hits never reach this). The filesystem work is handed to
+    /// [`persist`], the process's one persistence owner, so nothing on the draw
+    /// path blocks on disk. Saving on creation rather than at context destroy
+    /// is deliberate: the testing boot SIGKILLs QEMU, so destroy never runs
+    /// there.
+    ///
+    /// # At most one serialize a second
+    ///
+    /// The serialize is not the memcpy it looks like. `vkGetPipelineCacheData`
+    /// walks and copies the whole blob (7.5 MB on a warm macOS 26 host), and
+    /// it ran once per compile: a cold app launch creates pipelines in bursts
+    /// of dozens, and the serializations were 3 % of the drain thread. A save
+    /// inside [`PIPELINE_CACHE_SAVE_INTERVAL_US`] of the previous one is owed
+    /// instead, and the end-of-tranche tail
+    /// ([`super::flush_batched_draws`]) pays it once the interval has passed —
+    /// so a burst costs one serialize a second and its last pipelines reach
+    /// the disk about a second after it ends, not never.
     pub(crate) fn persist_pipeline_cache(&self) {
+        let now = crate::observe::elapsed_us();
+        let last = self.pipeline_cache_saved_at_us.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < PIPELINE_CACHE_SAVE_INTERVAL_US {
+            let _ = PIPELINE_CACHE_SAVE_DUE_US.compare_exchange(
+                0,
+                last + PIPELINE_CACHE_SAVE_INTERVAL_US,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+        self.persist_pipeline_cache_now(now);
+    }
+
+    /// Pay a save [`Self::persist_pipeline_cache`] deferred, once it is due.
+    pub(crate) fn persist_pipeline_cache_if_due(&self) {
+        if pipeline_cache_save_due() {
+            self.persist_pipeline_cache_now(crate::observe::elapsed_us());
+        }
+    }
+
+    fn persist_pipeline_cache_now(&self, now: u64) {
+        PIPELINE_CACHE_SAVE_DUE_US.store(0, Ordering::Release);
+        self.pipeline_cache_saved_at_us
+            .store(now.max(1), Ordering::Relaxed);
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
         };

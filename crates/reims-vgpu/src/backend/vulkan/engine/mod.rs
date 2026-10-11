@@ -1387,7 +1387,8 @@ pub fn flush_batched_draws(state: &crate::model::DeviceState) {
     if !end_of_tranche_requires_engine(
         BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire),
         device_lost::device_lost_seen(),
-    ) {
+    ) && !context::pipeline_cache_save_due()
+    {
         return;
     }
     // The tail flush itself touches no cache. It takes the device's caches
@@ -1432,6 +1433,9 @@ fn flush_batched_draws_with(caches: &mut ObjectCaches) {
         let Some(ctx) = owner.ctx.as_ref() else {
             return;
         };
+        // The pipeline-cache save a compile burst deferred; a no-op unless one
+        // is owed and due.
+        ctx.persist_pipeline_cache_if_due();
         // The lock-free publication can race an in-engine consumer that
         // flushes before this caller acquires the lock. Only a batch observed
         // here belongs in the tail population.
