@@ -3,9 +3,13 @@
 //! This is a transcription of the arms `device_gfx_read` / `device_gfx_write`
 //! already take without the device lock: the read-to-clear interrupt-status
 //! words, the fault and FIFO-consumer words, the status clears and the child
-//! doorbells. Everything else in the gfx window is posted (the in-process
-//! queue path), and the IOSurface window is synchronous, as its handler takes
-//! the device lock and may read the publishing vCPU's registers.
+//! doorbells. Every other access in both windows is synchronous, as it was in
+//! process: a gfx write is applied on the spot when the device lock is free
+//! (and queued inside the device otherwise), and a guest that writes a
+//! register and reads it straight back (the version handshake does) must see
+//! its own write. Measured, those are a few dozen accesses per boot; the
+//! doorbells and interrupt-status reads, hundreds per second, never leave the
+//! VMM.
 
 use reims_vgpu::remote as dev;
 use reims_vgpu::remote::HotWordBlock;
@@ -39,7 +43,7 @@ pub fn behaviours() -> Vec<Behaviour> {
         Behaviour {
             window: wire::WINDOW_GFX as u8,
             read_kind: wire::R_SYNC,
-            write_kind: wire::W_POSTED,
+            write_kind: wire::W_SYNC,
             flags: wire::B_HARVEST,
             offset: wire::OFFSET_DEFAULT,
             ..Default::default()
@@ -54,8 +58,8 @@ pub fn behaviours() -> Vec<Behaviour> {
         },
         gfx(dev::GFX_REG_INTR_STATUS_DISP, wire::R_XCHG0, wire::W_ANDNOT, disp, 0, 0),
         gfx(dev::GFX_REG_INTR_STATUS_GPU, wire::R_XCHG0, wire::W_ANDNOT, gpu, 0, 0),
-        gfx(dev::GFX_REG_INTR_FAULT, wire::R_LOAD, wire::W_POSTED, fault, 0, 0),
-        gfx(dev::GFX_REG_FIFO_READ, wire::R_LOAD, wire::W_POSTED, fifo, 0, 0),
+        gfx(dev::GFX_REG_INTR_FAULT, wire::R_LOAD, wire::W_SYNC, fault, 0, 0),
+        gfx(dev::GFX_REG_FIFO_READ, wire::R_LOAD, wire::W_SYNC, fifo, 0, 0),
         gfx(
             dev::GFX_REG_CHILD_DOORBELL,
             wire::R_SYNC,
