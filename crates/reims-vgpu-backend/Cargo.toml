@@ -9,6 +9,14 @@ license = "LGPL-3.0-or-later"
 name = "reims-vgpu-backend"
 path = "src/main.rs"
 
+[features]
+# The in-process QEMU build compiles the device with host-window, and a few
+# engine paths are shaped by that feature even when no window is open. Built
+# the same way so the two are compared like for like; this process never opens
+# a window (yet).
+default = ["host-window"]
+host-window = ["reims-vgpu/host-window"]
+
 [dependencies]
 reims-vgpu = { path = "../reims-vgpu", default-features = false, features = ["backend-vulkan"] }
 reims-vgpu-proxy-wire = { path = "../reims-vgpu-proxy-wire" }
