@@ -7,6 +7,9 @@
 //!
 //! usage: reims-vgpu-backend --socket PATH
 //!        reims-vgpu-backend --listen-fd N      (an already listening socket)
+//!        reims-vgpu-backend --fold-breadcrumbs (after an instance died: move a
+//!            driver-call breadcrumb left in REIMS_VGPU_BREADCRUMB_DIR into the
+//!            host's driver quarantine; prints the call it was, if any)
 
 mod backend;
 mod dirty;
@@ -257,6 +260,20 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut listener: Option<OwnedFd> = None;
     let mut i = 1;
+    if args.get(1).map(String::as_str) == Some("--fold-breadcrumbs") {
+        use reims_vgpu::config;
+        let meta = config::dir_path(config::BREADCRUMB_DIR)
+            .map(|d| d.join("reims-vgpu-driver-breadcrumb.txt"))
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        if reims_vgpu::remote::fold_driver_breadcrumbs() {
+            let what = meta
+                .as_deref()
+                .and_then(|m| m.lines().find_map(|l| l.strip_prefix("what=")))
+                .unwrap_or("unknown");
+            println!("driver call quarantined: {what}");
+        }
+        std::process::exit(0);
+    }
     while i < args.len() {
         match args[i].as_str() {
             "--socket" if i + 1 < args.len() => {
