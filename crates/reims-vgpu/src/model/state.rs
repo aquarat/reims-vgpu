@@ -3315,6 +3315,10 @@ pub struct DeviceState {
     pub host_writes: crate::runtime::host_writes::HostWrites,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
+    /// The translation-cache change epoch and time of the last full pass of
+    /// `drain::pump_translations`; see there for why the pump skips a pass when
+    /// neither has moved.
+    pub translation_pump_seen: Option<(u64, std::time::Instant)>,
     /// Byte-exact revalidated memo for ref-texture serialized texture views
     /// (media IOSurface planes). Same contract as
     /// [`Self::guest_linear_memo`]: every bind re-reads the native plane
@@ -3625,6 +3629,7 @@ impl DeviceState {
             sampled_content_gen: 0,
             host_writes: crate::runtime::host_writes::HostWrites::new(page_shift),
             guest_linear_scratch: Vec::new(),
+            translation_pump_seen: None,
             ref_texture_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             mapper_ref_texture_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             mapper_ref_texture_memo_scratch: Vec::new(),

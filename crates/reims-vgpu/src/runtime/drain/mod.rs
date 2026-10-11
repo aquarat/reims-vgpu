@@ -2568,7 +2568,65 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
 ///
 /// Nothing here runs anything. It moves pipelines to `Ready`, and readying a
 /// pipeline is what the model turns into released work.
+/// How long `pump_translations` may skip passes on an unmoved translation epoch.
+const TRANSLATION_PUMP_IDLE_PASS: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Whether `pump_translations` owes a full pass: the translation cache changed
+/// since the last one, there was none yet, or the idle bound has elapsed.
+fn translation_pump_pass_due(
+    seen: Option<(u64, std::time::Instant)>,
+    epoch: u64,
+    now: std::time::Instant,
+) -> bool {
+    match seen {
+        None => true,
+        Some((seen_epoch, at)) => {
+            seen_epoch != epoch || now.duration_since(at) >= TRANSLATION_PUMP_IDLE_PASS
+        }
+    }
+}
+
+#[cfg(test)]
+mod translation_pump_gate_tests {
+    use super::{translation_pump_pass_due, TRANSLATION_PUMP_IDLE_PASS};
+
+    /// The first pass always runs; a pass on the same epoch inside the idle
+    /// bound is skipped; a moved epoch or an elapsed bound runs one.
+    #[test]
+    fn a_pass_is_owed_by_a_new_epoch_or_the_idle_bound_only() {
+        let t0 = std::time::Instant::now();
+        assert!(translation_pump_pass_due(None, 7, t0));
+        assert!(!translation_pump_pass_due(Some((7, t0)), 7, t0));
+        assert!(translation_pump_pass_due(Some((7, t0)), 8, t0));
+        assert!(translation_pump_pass_due(
+            Some((7, t0)),
+            7,
+            t0 + TRANSLATION_PUMP_IDLE_PASS
+        ));
+    }
+}
+
 fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // A parked position's preflight can only change answer when a translation
+    // lands (or a transient failure is forgotten so it can be retried), and
+    // every such change bumps `m2v_cache::change_epoch`. A position parked
+    // since the last pass was preflighted at admission against the epoch of
+    // its admission, so a pass with the epoch unmoved would re-walk every
+    // waiting plan to reach the same pending answer — and `settle_model_work`
+    // calls this on every turn of its loop. On a macOS 26 cold launch, with
+    // ~250 translations in flight for tens of seconds, those re-walks (guest
+    // reads of each pipeline's descriptor and both MTLB containers) were
+    // 7.6 % of the drain thread. The epoch is read before the pass, so a
+    // translation landing during it triggers the next one. A full pass still
+    // runs every `TRANSLATION_PUMP_IDLE_PASS` regardless, so a change this gate
+    // does not model costs latency and never a lost wakeup.
+    let epoch = crate::runtime::m2v_cache::change_epoch();
+    let now = std::time::Instant::now();
+    if !translation_pump_pass_due(state.translation_pump_seen, epoch, now) {
+        note_store_route("translation_pump_skipped");
+        return;
+    }
+    state.translation_pump_seen = Some((epoch, now));
     for ingress in state.parked.waiting_in_order() {
         let Some((submission, resolved)) = state.parked.planning(ingress) else {
             continue;

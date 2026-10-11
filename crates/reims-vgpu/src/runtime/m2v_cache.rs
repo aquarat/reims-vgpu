@@ -118,6 +118,17 @@ impl M2vCacheDecline {
     }
 }
 
+/// Bumped by every change to a cache entry — a translation filed (ready or
+/// failed), a transient failure forgotten. Whether a shader is translated can
+/// only change when this moves, which is what lets
+/// `drain::pump_translations` skip re-walking parked packets in between.
+static CHANGE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`CHANGE_EPOCH`].
+pub fn change_epoch() -> u64 {
+    CHANGE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Hand a stored failure to its caller, and drop it if a later ask could get a
 /// different answer.
 ///
@@ -616,6 +627,7 @@ impl Cache {
     /// reaches it first and every later ask reports the translation still
     /// pending.
     fn put(&mut self, id: ShaderId<'_>, air: &Arc<[u8]>, entry: Entry) {
+        CHANGE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
         let bucket = self.entries.entry(id.digest).or_default();
         match bucket.iter_mut().find(|s| s.is(id)) {
             Some(slot) => slot.entry = entry,
@@ -631,6 +643,7 @@ impl Cache {
     /// Drop the entry filed under `id`, and the bucket with it if it was the
     /// last — so a forgotten transient failure leaves nothing behind to walk.
     fn forget(&mut self, id: ShaderId<'_>) {
+        CHANGE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
         let std::collections::hash_map::Entry::Occupied(mut bucket) = self.entries.entry(id.digest)
         else {
             return;
