@@ -5078,6 +5078,21 @@ pub(crate) unsafe fn execute_draw_inner(
         if feedback && req.continues_render_pass && pools.open_pass_echoes(&echo) {
             continue;
         }
+        // A secondary a previous pass's colour store left at the resting layout
+        // needs no barrier, for the reason `pass_exit_needs_no_barrier` gives for
+        // slot 0: there is no transition to place, and the pass's incoming
+        // external dependency (written per stage, so it covers every colour
+        // attachment) already orders that store before this pass's load and
+        // writes. Recording one anyway closed any pass the predecessor left open,
+        // which on macOS 26 guests — memoryless attachment 1 on nearly every
+        // compositor pass — kept every such draw out of pass continuation.
+        if !feedback
+            && !pass_key.color_input(attachment_index)
+            && pass_exit_needs_no_barrier(*access)
+            && access.layout() == pass_key.color_layout(attachment_index)
+        {
+            continue;
+        }
         let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
             | if feedback {
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER
