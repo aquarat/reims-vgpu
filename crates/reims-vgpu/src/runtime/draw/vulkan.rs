@@ -5450,6 +5450,35 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     ))
 }
 
+/// Whether every byte is zero, a machine word at a time.
+///
+/// `note_guest_rung_blank` asks this of every sampled texture served off the
+/// guest's pages, so it runs over the whole converted blob on every draw that
+/// binds one: the byte-at-a-time `any` it replaces was 3.4 % of the drain
+/// thread on a macOS 26 cold launch. Same answer, early exit on the first
+/// non-zero word.
+fn bytes_all_zero(bytes: &[u8]) -> bool {
+    let (words, rest) = bytes.as_chunks::<16>();
+    words.iter().all(|word| u128::from_ne_bytes(*word) == 0) && rest.iter().all(|&b| b == 0)
+}
+
+#[cfg(test)]
+mod bytes_all_zero_tests {
+    /// Agrees with the byte-wise answer for a non-zero byte at every offset of
+    /// lengths that end inside, and on, a word.
+    #[test]
+    fn agrees_with_the_bytewise_scan() {
+        for len in [0usize, 1, 15, 16, 17, 33, 64] {
+            assert!(super::bytes_all_zero(&vec![0u8; len]));
+            for i in 0..len {
+                let mut v = vec![0u8; len];
+                v[i] = 0x80;
+                assert!(!super::bytes_all_zero(&v), "len {len} offset {i}");
+            }
+        }
+    }
+}
+
 /// Report a sampled texture served entirely as zeroes out of the guest's pages
 /// while the host cache holds an entry for the same address.
 ///
@@ -5551,7 +5580,7 @@ fn note_guest_rung_blank<H: HostMemory>(
     if host_entry {
         crate::runtime::drain::note_store_route("lin_rung_host_entry");
     }
-    if rgba.is_empty() || rgba.iter().any(|&b| b != 0) {
+    if rgba.is_empty() || !bytes_all_zero(rgba) {
         return;
     }
     crate::runtime::drain::note_store_route("lin_rung_guest_blank");
@@ -5573,7 +5602,7 @@ fn note_guest_rung_blank<H: HostMemory>(
     // zeroes agrees with the guest's pages, so nothing was lost and there is
     // nothing upstream to repair; only a cache entry holding content while the
     // guest alias reads zero is a coherence loss.
-    let host_blank = host_bytes.iter().all(|&b| b == 0);
+    let host_blank = bytes_all_zero(host_bytes);
     crate::runtime::drain::note_store_route(if host_blank {
         "lin_rung_blank_host_agrees"
     } else {
