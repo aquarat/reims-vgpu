@@ -48,6 +48,14 @@ pub struct Backend {
     pub irqs: Vec<OwnedFd>,
     pub events: OwnedFd,
     posted_lock: Mutex<()>,
+    /// What QEMU's BQL was to the in-process shim. Its MMIO handlers, its poll
+    /// timer and its action BH all ran under the BQL and so never overlapped;
+    /// the drain worker ran without it. The device relies on that: a register
+    /// read takes the device lock with try_lock and falls back to a cached
+    /// value, which a concurrent poll would turn into a wrong answer (the
+    /// guest's first version read came back 0). Held by exactly those three
+    /// paths here, and by reset; never by the drain worker.
+    pub vmm_lock: Mutex<()>,
     actions_pending: Mutex<bool>,
     actions_cv: Condvar,
     next_buffer: AtomicU32,
@@ -121,6 +129,7 @@ impl Backend {
             irqs,
             events,
             posted_lock: Mutex::new(()),
+            vmm_lock: Mutex::new(()),
             actions_pending: Mutex::new(false),
             actions_cv: Condvar::new(),
             next_buffer: AtomicU32::new(0),
@@ -283,8 +292,12 @@ impl Backend {
                 break;
             }
             self.hdr_u64(16).store(sys::now_ns(libc::CLOCK_MONOTONIC), Ordering::Release);
-            // SAFETY: valid handle.
-            if unsafe { rabi::reims_vgpu_qemu_device_poll(self.handle()) } == rabi::REIMS_VGPU_QEMU_OK {
+            let polled = {
+                let _vmm = self.vmm_lock.lock().unwrap();
+                // SAFETY: valid handle.
+                unsafe { rabi::reims_vgpu_qemu_device_poll(self.handle()) }
+            };
+            if polled == rabi::REIMS_VGPU_QEMU_OK {
                 self.wake_actions();
             }
             std::thread::sleep(std::time::Duration::from_millis(4));
@@ -303,6 +316,7 @@ impl Backend {
             if self.stopping.load(Ordering::Acquire) {
                 break;
             }
+            let _vmm = self.vmm_lock.lock().unwrap();
             self.deliver_actions();
         }
     }
@@ -439,6 +453,7 @@ impl Backend {
 
     /// Device reset (the VMM's reset handler waits for this).
     pub fn reset(&self) {
+        let _vmm = self.vmm_lock.lock().unwrap();
         {
             let _g = self.posted_lock.lock().unwrap();
             let ring = self.ring();

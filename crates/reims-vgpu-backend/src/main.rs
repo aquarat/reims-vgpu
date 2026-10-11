@@ -188,6 +188,8 @@ fn mem_table(b: &Backend, msg: sys::Msg) -> io::Result<()> {
 fn access(b: &Backend, ctl: RawFd, msg: &sys::Msg, write: bool) -> io::Result<()> {
     let a = wire::Access::read_from(&msg.payload)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short access"))?;
+    // The in-process handler ran under QEMU's BQL; see Backend::vmm_lock.
+    let _vmm = b.vmm_lock.lock().unwrap();
     // Everything the guest posted before this access happened before it.
     b.apply_posted();
     let h = b.handle();
