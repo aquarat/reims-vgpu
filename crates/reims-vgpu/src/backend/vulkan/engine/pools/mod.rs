@@ -5,7 +5,7 @@
 use ash::vk;
 use ash::vk::Handle;
 use std::collections::{HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -3338,23 +3338,129 @@ impl CbBind {
 /// 128-bit content fingerprint for the sampled cache.
 ///
 /// The sampled cache matches an incoming blob to a retained VkImage by this
-/// fingerprint alone — it no longer keeps a byte copy to `memcmp` against, so
-/// the width must make an accidental collision (different content, identical
-/// digest, identical geometry/format key) astronomically unlikely: at 128 bits
-/// the birthday bound across the 64-entry cache is ~2^-116, far below the host
-/// GPU's own soft-error rate. Two independently salted `DefaultHasher`
-/// (SipHash-1-3) passes over the *warm* source bytes are still strictly cheaper
-/// than the old one-hash-plus-cold-full-frame-`memcmp` (which pulled the
-/// retained 8 MiB copy back through DRAM on every hit).
+/// fingerprint plus a byte compare against the retained copy, so the width only
+/// has to make an accidental collision (different content, identical digest,
+/// identical geometry/format key) vanishingly unlikely. Guest content is not an
+/// adversary here in any way the old digest resisted either: `DefaultHasher`
+/// with no random keys is just as forgeable.
+///
+/// It was two salted `DefaultHasher` (SipHash-1-3) passes over the whole blob,
+/// and that was the largest single cost of a macOS 26 cold launch after the
+/// submit itself: 9.5 % of the drain thread's cycles (lookup and admission each
+/// hash), at roughly 1.5 GB/s per pass over ~3.7 GB of sampled bytes a minute.
+/// This is two lanes of the folded-multiply construction (wyhash/rapidhash
+/// family) over 16-byte blocks. Both lanes read every word under different
+/// keys, so any change reaches both 64-bit halves, and each block costs two
+/// 64x64->128 multiplies, so the hash runs well above memory bandwidth.
 fn sampled_content_hash(bytes: &[u8]) -> u128 {
-    let mut lo = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut lo);
-    let mut hi = std::collections::hash_map::DefaultHasher::new();
-    // Distinct salt so the two digests are independent (else both hashers see
-    // the same input and finish() to correlated values, collapsing to 64 bits).
-    hi.write_u64(0x9e37_79b9_7f4a_7c15);
-    bytes.hash(&mut hi);
-    ((hi.finish() as u128) << 64) | lo.finish() as u128
+    const K: [u64; 6] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+        0x1d8e_4e27_c47d_124f,
+        0x9e37_79b9_7f4a_7c15,
+    ];
+    #[inline(always)]
+    fn fold(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        (product as u64) ^ ((product >> 64) as u64)
+    }
+    #[inline(always)]
+    fn mix(lo: &mut u64, hi: &mut u64, w0: u64, w1: u64) {
+        *lo = fold(w0 ^ K[0] ^ *lo, w1 ^ K[1]);
+        *hi = fold(w1 ^ K[2] ^ *hi, w0 ^ K[3]);
+    }
+    let len = bytes.len() as u64;
+    let mut lo = K[4] ^ len;
+    let mut hi = K[5] ^ len.rotate_left(32);
+    let (blocks, rest) = bytes.as_chunks::<16>();
+    for block in blocks {
+        let (words, _) = block.as_chunks::<8>();
+        mix(
+            &mut lo,
+            &mut hi,
+            u64::from_le_bytes(words[0]),
+            u64::from_le_bytes(words[1]),
+        );
+    }
+    if !rest.is_empty() {
+        let mut tail = [0u8; 16];
+        tail[..rest.len()].copy_from_slice(rest);
+        let (a, b) = tail.split_at(8);
+        mix(
+            &mut lo,
+            &mut hi,
+            u64::from_le_bytes(a.try_into().expect("8 bytes")) ^ rest.len() as u64,
+            u64::from_le_bytes(b.try_into().expect("8 bytes")),
+        );
+    }
+    // Cross the lanes and finish each with the SplitMix64 finalizer, so every
+    // input bit reaches every output bit of both halves.
+    fn finish(mut x: u64) -> u64 {
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    }
+    let a = finish(fold(lo ^ K[2], hi ^ K[3] ^ len));
+    let b = finish(fold(hi ^ K[0], lo ^ K[1]) ^ len.rotate_left(17));
+    (u128::from(b) << 64) | u128::from(a)
+}
+
+#[cfg(test)]
+mod sampled_content_hash_tests {
+    use super::sampled_content_hash;
+
+    fn bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(131) ^ (i >> 3)) as u8).collect()
+    }
+
+    /// Every single-bit change, at every offset of buffers that end inside a
+    /// block and on a block boundary, moves *both* 64-bit halves. A lane that
+    /// missed a word would leave one half unchanged here.
+    #[test]
+    fn every_bit_flip_moves_both_halves() {
+        for len in [1usize, 15, 16, 17, 31, 32, 33, 100] {
+            let base = bytes(len);
+            let h0 = sampled_content_hash(&base);
+            for i in 0..len {
+                for bit in 0..8 {
+                    let mut v = base.clone();
+                    v[i] ^= 1 << bit;
+                    let h = sampled_content_hash(&v);
+                    assert_ne!(h as u64, h0 as u64, "low half missed len={len} byte={i} bit={bit}");
+                    assert_ne!(
+                        (h >> 64) as u64,
+                        (h0 >> 64) as u64,
+                        "high half missed len={len} byte={i} bit={bit}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Zero padding is not invisible: a blob and the same blob with trailing
+    /// zeroes (a texture re-presented at a larger allocation) differ.
+    #[test]
+    fn trailing_zeroes_change_the_digest() {
+        let mut seen = std::collections::HashSet::new();
+        for len in 0..80usize {
+            assert!(seen.insert(sampled_content_hash(&vec![0u8; len])), "len {len} collided");
+        }
+        let base = bytes(20);
+        let mut padded = base.clone();
+        padded.extend_from_slice(&[0, 0, 0, 0]);
+        assert_ne!(sampled_content_hash(&base), sampled_content_hash(&padded));
+    }
+
+    /// Same input, same digest: the cache depends on it across draws.
+    #[test]
+    fn the_digest_is_a_function_of_the_bytes() {
+        let a = bytes(4099);
+        assert_eq!(sampled_content_hash(&a), sampled_content_hash(&a.clone()));
+    }
 }
 
 /// Which pool asked for a `vkAllocateMemory`.
