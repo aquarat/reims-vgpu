@@ -388,6 +388,13 @@ pub const BATCH_DEPTH: &str = "REIMS_VGPU_BATCH_DEPTH";
 /// their own. Off is a refusal (`nojoin_mrt`) and never a permission.
 pub const BATCH_MRT: &str = "REIMS_VGPU_BATCH_MRT";
 
+/// `off` makes a draw that submits on its own (it could not open or join a
+/// batch) wait for the host driver's `vkQueueSubmit` on the drain thread, as
+/// every such draw did before. The default hands it to the ordered queue owner
+/// like an ended batch whenever nothing waits on its fence afterwards (no tail
+/// readback, no occlusion query). Off is the A/B arm and never a permission.
+pub const SOLO_SUBMIT_ASYNC: &str = "REIMS_VGPU_SOLO_SUBMIT_ASYNC";
+
 /// `off` stages the guest bytes of a `[[buffer(n)]]` bind even when the stage's
 /// own reflection says the shader never dereferences it.
 ///

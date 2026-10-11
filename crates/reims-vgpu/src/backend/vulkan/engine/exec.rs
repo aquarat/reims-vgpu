@@ -2326,6 +2326,30 @@ fn depth_bars_batching(has_depth: bool) -> bool {
     has_depth && batch_depth_disabled()
 }
 
+/// Whether [`crate::config::SOLO_SUBMIT_ASYNC`] is switched off, read once per
+/// process: `true` puts every unbatched draw back on the synchronous submit.
+fn solo_submit_sync() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::config::read(crate::config::SOLO_SUBMIT_ASYNC);
+        match state {
+            crate::config::Switch::Off => {
+                crate::observe::off("solo_submit reason=solo_submit_async_disabled_by_env");
+                true
+            }
+            crate::config::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "solo_submit reason=solo_submit_async_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::config::Switch::On | crate::config::Switch::Unset => false,
+        }
+    })
+}
+
 /// Whether [`crate::config::BATCH_MRT`] is switched off, read once per process.
 ///
 /// Latched for the same reason [`batch_depth_disabled`] is.
@@ -5688,7 +5712,20 @@ pub(crate) unsafe fn execute_draw_inner(
 
     if !defer_submit {
         let cbs = [cb];
-        match ctx.submit_guest_work(&cbs, fence) {
+        // A draw that waits on nothing after its submit — no tail readback, no
+        // occlusion count — has no reason to hold the drain thread for the host
+        // driver's `vkQueueSubmit` (~170 us a call on Honeykrisp). It goes
+        // through the ordered queue owner exactly as an ended batch does, so
+        // submission order against every later queue operation is unchanged, and
+        // a failure latches and takes the device-loss path the batch flush
+        // already relies on. A draw that does wait keeps the synchronous call,
+        // so its error stays this draw's own.
+        let submitted = if readback.is_none() && occlusion.is_none() && !solo_submit_sync() {
+            ctx.submit_guest_work_async(&cbs, fence)
+        } else {
+            ctx.submit_guest_work(&cbs, fence)
+        };
+        match submitted {
             Ok(()) => {}
             Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
                 return Err(DrawError::DeviceLost(DeviceLostDecline::Driver {

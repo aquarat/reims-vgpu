@@ -675,6 +675,64 @@ fn mrt_draws_open_and_join_one_batch() {
     );
 }
 
+/// A draw that cannot batch and waits on nothing after its submit goes to the
+/// ordered queue owner without holding the caller for `vkQueueSubmit`; a draw
+/// that reads its pixels back keeps the synchronous submit, because it waits on
+/// its own fence next and its error must stay its own.
+#[test]
+fn a_solo_draw_that_waits_on_nothing_submits_asynchronously() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_401,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    // No identity: refused by `nojoin_no_identity`, so it submits alone.
+    let mut solo = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    solo.target_identity = None;
+    let before = engine::counter_snapshot();
+    match engine::execute_draw_request(engine_device(), &solo) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("solo draw: {msg}");
+        }
+    }
+    // The owner counts a submit when it executes it; retiring the ring waits
+    // for that, so the count below is settled.
+    engine::test_quiesce_ring();
+    let mid = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(mid.batch_opens, 0, "the draw did not batch");
+    assert_eq!(
+        mid.queue_async_submits, 1,
+        "a solo draw with nothing to wait for must not wait for the driver's submit"
+    );
+
+    // A readback draw waits on its fence, so it keeps the synchronous submit
+    // and still returns the pixels it drew.
+    let mut readback = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    readback.target_identity = None;
+    readback.skip_readback = false;
+    let out = engine::execute_draw_request(engine_device(), &readback).expect("readback draw");
+    let after = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        after.queue_async_submits, 1,
+        "a draw that waits on its own fence submits synchronously"
+    );
+    let px = out.pixels;
+    assert_eq!(px.len(), (W * H * 4) as usize);
+    let left = ((10 * W + 8) * 4) as usize;
+    assert!(!is_zero(&px[left..left + 4]), "readback draw = {:?}", &px[left..left + 4]);
+    engine::test_quiesce_ring();
+}
+
 /// The prefetch pool submits its GPU→host copy on a dedicated CB/fence,
 /// bypassing begin_entry — arming MUST flush the open batch first, or the
 /// copy would be queued ahead of the batched draws producing the content.
