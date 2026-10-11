@@ -787,14 +787,22 @@ fn fold_air(tag: u64, air: &[u8], extra: &[u32]) -> u64 {
 }
 
 /// Process-local temp dir for m2v path-based translate (reused across draws).
+///
+/// Ensured on every call, not once per process. Translations run seconds or
+/// hours apart, and the directory lives under `$TMPDIR`, which something else
+/// may clean in between. Created once, a removed directory turned every later
+/// translation into a scratch-write failure — which is transient by design, so
+/// it was forgotten and re-queued by the next preflight, and the drain spun at
+/// full duty re-queueing the same few pipelines tens of thousands of times a
+/// second while nothing rendered. One `mkdir` per translation is noise beside
+/// the translation.
 fn tmp_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        let p = std::env::temp_dir().join(format!("reims-vgpu-m2v-cache-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&p);
-        p
-    })
-    .clone()
+    let p = DIR.get_or_init(|| {
+        std::env::temp_dir().join(format!("reims-vgpu-m2v-cache-{}", std::process::id()))
+    });
+    let _ = std::fs::create_dir_all(p);
+    p.clone()
 }
 
 fn translation_lock() -> &'static Mutex<()> {
@@ -1770,6 +1778,21 @@ mod tests {
     /// The scratch writes are the host filesystem at one instant; everything
     /// else is a property of the AIR blob this cache is keyed by, and is reached
     /// again by every later ask.
+    /// A scratch directory removed under a running process comes back on the
+    /// next translation instead of failing every translation from then on.
+    #[test]
+    fn the_scratch_dir_is_recreated_after_removal() {
+        // Held so no translation in a concurrent test is using the directory.
+        let _guard = super::translation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = super::tmp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+        assert_eq!(super::tmp_dir(), dir);
+        assert!(dir.is_dir(), "the scratch dir must be ensured on every call");
+    }
+
     #[test]
     fn only_the_scratch_writes_are_transient() {
         let detail = || "ENOSPC".to_string();
