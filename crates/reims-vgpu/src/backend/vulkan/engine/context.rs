@@ -1412,6 +1412,15 @@ impl DeviceContext {
         // incompatible cache, and the header is validated before use
         // (passing a blob not produced by vkGetPipelineCacheData for this
         // device is a Vulkan valid-usage violation, not a soft fallback).
+        // The driver identity every quarantine key carries (see
+        // `driver_breadcrumb::quarantine`): known from here on, and before any
+        // pipeline is compiled.
+        super::driver_breadcrumb::quarantine::set_driver_identity(
+            props.vendor_id,
+            props.device_id,
+            props.driver_version,
+            &props.pipeline_cache_uuid,
+        );
         let pipeline_cache_path = pipeline_cache_disk_path(&props.pipeline_cache_uuid);
         let initial_blob = match read_pipeline_cache_blob(&pipeline_cache_path, &props) {
             Ok(blob) => blob,

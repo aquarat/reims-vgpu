@@ -1272,6 +1272,37 @@ pub const FAIL_LOG_PATH: &str = "REIMS_VGPU_FAIL_LOG";
 /// spellings as [`FAIL_LOG_PATH`]. Unset keeps `/tmp/reims-vgpu-draw.log`.
 pub const DRAW_LOG_PATH: &str = "REIMS_VGPU_DRAW_LOG_PATH";
 
+/// The directory holding the driver quarantine: the persistent list of driver
+/// calls a process ended inside (`driver_breadcrumb::quarantine`). Unset keeps
+/// [`state_dir`]. It is per host, not per instance: every device on the host
+/// reads it and appends to it, so one crash protects every slot.
+pub const QUARANTINE_DIR: &str = "REIMS_VGPU_QUARANTINE_DIR";
+
+/// Where a driver-call breadcrumb is written while the call is in flight.
+/// Unset keeps the temp dir. Set per instance when several devices share a
+/// host, so one instance's crash evidence is not another's to clear.
+pub const BREADCRUMB_DIR: &str = "REIMS_VGPU_BREADCRUMB_DIR";
+
+/// Read `name` as a directory path; `None` when unset or empty.
+pub fn dir_path(name: &str) -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os(name)?;
+    let value = raw.to_string_lossy().trim().to_owned();
+    if value.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(value))
+    }
+}
+
+/// This user's state directory for the device: `$XDG_STATE_HOME/reims-vgpu`,
+/// else `$HOME/.local/state/reims-vgpu`; `None` when neither is set.
+pub fn state_dir() -> Option<std::path::PathBuf> {
+    if let Some(xdg) = dir_path("XDG_STATE_HOME") {
+        return Some(xdg.join("reims-vgpu"));
+    }
+    dir_path("HOME").map(|home| home.join(".local/state/reims-vgpu"))
+}
+
 /// Where an operator asked a log sink to write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SinkPath {

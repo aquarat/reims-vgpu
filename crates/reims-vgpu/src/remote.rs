@@ -44,3 +44,17 @@ pub fn note_doorbells_lock_free(count: u64) {
 pub fn note_out_of_range_doorbell(channel: u32) {
     let _ = model::accept_child_channel(channel, "proxy_child_doorbell");
 }
+
+/// Fold a driver-call breadcrumb left in this process's breadcrumb directory
+/// (`REIMS_VGPU_BREADCRUMB_DIR`) into the host's driver quarantine, and report
+/// whether there was one. Run by the backend's `--fold-breadcrumbs` mode when an
+/// instance has died, so the next device on the host refuses the call that
+/// killed it without waiting to be the one that reuses the directory.
+pub fn fold_driver_breadcrumbs() -> bool {
+    let had = crate::config::dir_path(crate::config::BREADCRUMB_DIR)
+        .map(|d| d.join("reims-vgpu-driver-breadcrumb.txt").exists())
+        .unwrap_or(false);
+    #[cfg(feature = "backend-vulkan")]
+    crate::backend::vulkan::engine::fold_driver_breadcrumbs();
+    had
+}

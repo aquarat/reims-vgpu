@@ -111,13 +111,25 @@ fn prefix() -> String {
 /// one set of files to look at, and so a previous boot's leftovers cannot
 /// accumulate.
 fn path(stage: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{}-breadcrumb-{stage}.spv", prefix()))
+    breadcrumb_dir().join(format!("{}-breadcrumb-{stage}.spv", prefix()))
+}
+
+/// The temp dir unless the operator gave this instance a directory of its own
+/// ([`crate::config::BREADCRUMB_DIR`]). Never under test: a test must not touch
+/// a live instance's evidence.
+fn breadcrumb_dir() -> PathBuf {
+    #[cfg(not(test))]
+    if let Some(dir) = crate::config::dir_path(crate::config::BREADCRUMB_DIR) {
+        let _ = std::fs::create_dir_all(&dir);
+        return dir;
+    }
+    std::env::temp_dir()
 }
 
 /// The metadata file beside them, so a reader knows what the modules were for
 /// without disassembling anything.
 fn meta_path() -> PathBuf {
-    std::env::temp_dir().join(format!("{}-breadcrumb.txt", prefix()))
+    breadcrumb_dir().join(format!("{}-breadcrumb.txt", prefix()))
 }
 
 /// Live for the duration of a driver call that could take the process down or

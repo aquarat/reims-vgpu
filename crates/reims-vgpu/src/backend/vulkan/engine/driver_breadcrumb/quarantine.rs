@@ -75,10 +75,36 @@ pub(crate) struct Quarantined {
     pub(crate) previously: String,
 }
 
-/// The persistent list. In the temp dir beside the breadcrumb it is derived
-/// from, so one `rm reims-vgpu-driver-*` clears the whole mechanism.
+/// The persistent list: one per host user, in [`crate::config::QUARANTINE_DIR`]
+/// or the user's state directory, so it survives reboots and every instance on
+/// the host shares it. Under test (and with no state directory at all) it stays
+/// in the temp dir beside the breadcrumbs.
 pub(crate) fn list_path() -> PathBuf {
+    #[cfg(not(test))]
+    {
+        let dir = crate::config::dir_path(crate::config::QUARANTINE_DIR)
+            .or_else(crate::config::state_dir);
+        if let Some(dir) = dir {
+            let _ = std::fs::create_dir_all(&dir);
+            return dir.join("quarantine");
+        }
+    }
     std::env::temp_dir().join(format!("{}-quarantine", super::prefix()))
+}
+
+/// Which driver made the calls this process keys: vendor, device, driver
+/// version and pipeline-cache UUID. Part of every key, so a driver update
+/// re-tries a call an older driver could not survive instead of refusing it
+/// forever, exactly as a translator change already does through the module
+/// digests. Set once the device is up; a key made before then says `unknown`.
+static DRIVER_IDENTITY: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn set_driver_identity(vendor: u32, device: u32, driver_version: u32, cache_uuid: &[u8; 16]) {
+    let mut uuid = String::with_capacity(32);
+    for b in cache_uuid {
+        uuid.push_str(&format!("{b:02x}"));
+    }
+    let _ = DRIVER_IDENTITY.set(format!("{vendor:04x}.{device:04x}.{driver_version:08x}.{uuid}"));
 }
 
 /// The digest list identifying one driver call's inputs.
@@ -88,27 +114,36 @@ pub(crate) fn list_path() -> PathBuf {
 /// reused — a second digest function would be a second opinion about identity
 /// and there is no reason to have one.
 pub(crate) fn key_of(modules: &[(&'static str, &[u32])]) -> String {
-    let mut key = String::new();
+    let mut key = format!(
+        "drv:{}",
+        DRIVER_IDENTITY.get().map(String::as_str).unwrap_or("unknown")
+    );
     for (stage, spirv) in modules {
-        if !key.is_empty() {
-            key.push('+');
-        }
+        key.push('+');
         let d = super::super::digest::Digest128::of_u32_words(spirv);
         key.push_str(&format!("{stage}:{:016x}{:016x}{:x}", d.a, d.b, d.len));
     }
     key
 }
 
-/// The quarantine as this process sees it: loaded once, folding in whatever the
-/// previous process left behind.
-fn entries() -> &'static HashMap<String, String> {
-    static ENTRIES: OnceLock<HashMap<String, String>> = OnceLock::new();
-    ENTRIES.get_or_init(|| {
+/// The quarantine as this process sees it: folding in whatever the previous
+/// process left behind on first use, and re-read whenever the shared file
+/// changes, so a call another instance on this host died in is refused here too.
+fn entries() -> std::sync::MutexGuard<'static, (Option<std::time::SystemTime>, HashMap<String, String>)> {
+    static ENTRIES: OnceLock<std::sync::Mutex<(Option<std::time::SystemTime>, HashMap<String, String>)>> =
+        OnceLock::new();
+    let cell = ENTRIES.get_or_init(|| {
         fold_surviving_breadcrumb();
+        std::sync::Mutex::new((None, HashMap::new()))
+    });
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    let mtime = std::fs::metadata(list_path()).and_then(|m| m.modified()).ok();
+    if mtime != guard.0 {
+        let first = guard.0.is_none();
         let map = std::fs::read_to_string(list_path())
             .map(|text| parse_list(&text))
             .unwrap_or_default();
-        if !map.is_empty() {
+        if first && !map.is_empty() {
             crate::observe::fail(format!(
                 "driver_quarantine reason=driver_quarantine_loaded calls={} path={} \
                  (each one ended a process that was inside the driver; delete the file to try \
@@ -117,8 +152,9 @@ fn entries() -> &'static HashMap<String, String> {
                 list_path().display()
             ));
         }
-        map
-    })
+        *guard = (mtime, map);
+    }
+    guard
 }
 
 /// A breadcrumb still on disk means the process that armed it never returned
@@ -127,7 +163,7 @@ fn entries() -> &'static HashMap<String, String> {
 ///
 /// Called from the one-time load, before the file is read, so a crash and the
 /// boot that follows it are separated by nothing the caller has to sequence.
-fn fold_surviving_breadcrumb() {
+pub(crate) fn fold_surviving_breadcrumb() {
     let Ok(meta) = std::fs::read_to_string(super::meta_path()) else {
         return;
     };
@@ -197,7 +233,13 @@ fn append(key: &str, what: &str) {
         .open(list_path());
     match opened {
         Ok(mut f) => {
-            if let Err(e) = writeln!(f, "{key}\t{what}") {
+            // Several instances on one host append to the same list. One
+            // locked write of the whole line keeps their lines whole.
+            let _ = f.lock();
+            let line = format!("{key}\t{what}\n");
+            let written = f.write_all(line.as_bytes());
+            let _ = f.unlock();
+            if let Err(e) = written {
                 crate::observe::fail(format!(
                     "driver_quarantine reason=driver_quarantine_write_failed key={key} err={e}"
                 ));
@@ -212,7 +254,7 @@ fn append(key: &str, what: &str) {
 /// Whether this device has already lost a process to this exact call.
 pub(crate) fn check(modules: &[(&'static str, &[u32])]) -> Option<Quarantined> {
     let key = key_of(modules);
-    entries().get(&key).map(|previously| Quarantined {
+    entries().1.get(&key).map(|previously| Quarantined {
         key,
         previously: previously.clone(),
     })

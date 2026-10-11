@@ -21,6 +21,14 @@ mod draw_phase;
 mod draw_preparation;
 pub(crate) mod draw_validation;
 mod driver_breadcrumb;
+
+/// Fold a breadcrumb a dead process left in this process's breadcrumb
+/// directory into the host's driver quarantine (see `driver_breadcrumb`).
+/// What the next process on the same directory does on first use; exposed so
+/// a supervisor can do it the moment the process that died is known.
+pub(crate) fn fold_driver_breadcrumbs() {
+    driver_breadcrumb::quarantine::fold_surviving_breadcrumb();
+}
 mod exec;
 mod exec_compute;
 mod facade_decline;
