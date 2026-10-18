@@ -5,10 +5,12 @@
 //! (`reims-vgpu-proxy-wire/include/apv-gpu-proxy-protocol.h`). One connection,
 //! one device; when the VMM goes away, so does this process.
 //!
-//! usage: reims-vgpu-backend --socket PATH [--max-refresh-hz HZ]
+//! usage: reims-vgpu-backend --socket PATH [--max-refresh-hz HZ] [--frame-pacing on|off]
 //!        reims-vgpu-backend --listen-fd N      (an already listening socket)
 //!        --max-refresh-hz: the display refresh-rate cap, as
 //!            REIMS_VGPU_MAX_REFRESH_HZ (default 60; 0 = uncapped)
+//!        --frame-pacing: pace guest surfaces to that cap, as
+//!            REIMS_VGPU_FRAME_PACING (default off)
 //!        reims-vgpu-backend --fold-breadcrumbs (after an instance died: move a
 //!            driver-call breadcrumb left in REIMS_VGPU_BREADCRUMB_DIR into the
 //!            host's driver quarantine; prints the call it was, if any)
@@ -319,6 +321,11 @@ fn main() {
                 std::env::set_var(reims_vgpu::config::MAX_REFRESH_HZ, &args[i + 1]);
                 i += 2;
             }
+            "--frame-pacing" if i + 1 < args.len() => {
+                // REIMS_VGPU_FRAME_PACING: pace guest surfaces to the cap.
+                std::env::set_var(reims_vgpu::config::FRAME_PACING, &args[i + 1]);
+                i += 2;
+            }
             "--listen-fd" if i + 1 < args.len() => {
                 let fd: RawFd = args[i + 1].parse().unwrap_or(-1);
                 // SAFETY: the caller hands us this fd.
@@ -326,14 +333,14 @@ fn main() {
                 i += 2;
             }
             _ => {
-                eprintln!("usage: reims-vgpu-backend (--socket PATH | --listen-fd N) [--max-refresh-hz HZ]");
+                eprintln!("usage: reims-vgpu-backend (--socket PATH | --listen-fd N) [--max-refresh-hz HZ] [--frame-pacing on|off]");
                 std::process::exit(2);
             }
         }
     }
     let Some(listener) = listener else {
         eprintln!(
-            "usage: reims-vgpu-backend (--socket PATH | --listen-fd N) [--max-refresh-hz HZ]"
+            "usage: reims-vgpu-backend (--socket PATH | --listen-fd N) [--max-refresh-hz HZ] [--frame-pacing on|off]"
         );
         std::process::exit(2);
     };

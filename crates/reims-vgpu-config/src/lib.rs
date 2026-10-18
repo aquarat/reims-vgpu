@@ -1185,6 +1185,19 @@ pub const COLOR_GENERAL: &str = "REIMS_VGPU_COLOR_GENERAL";
 /// outcome a tiling compositor already produces. `host_window::present`'s
 /// `WindowMode` owns both halves.
 pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
+
+/// **Off unless switched on.** Pace guest surfaces to the refresh-rate cap
+/// ([`MAX_REFRESH_HZ`]): a packet that writes a guest IOSurface completes at
+/// most once per refresh interval per surface, its channel's later completion
+/// words held behind it in order.
+///
+/// It is off by default because of what it costs. A compositor that queues
+/// frames ahead — the iOS simulator's queues dozens — is only held to the cap
+/// once its queue is full, and from then on every completion on its channel
+/// trails its work by up to that depth in refreshes, about a second; on macOS
+/// 26 every guest client shares that channel. Measured on simulator UI tests,
+/// that costs about 10 % of UI-test time while it saves unit-test time.
+pub const FRAME_PACING: &str = "REIMS_VGPU_FRAME_PACING";
 }
 
 counts! {
@@ -1224,9 +1237,9 @@ pub const FAIL_LOG_MAX_BYTES: &str = "REIMS_VGPU_FAIL_LOG_MAX_BYTES";
 pub const DRAW_LOG_MAX_BYTES: &str = "REIMS_VGPU_DRAW_LOG_MAX_BYTES";
 
 /// **A rate, read with [`rate_cap`].** The most frames a second this device's
-/// display shows, and the fastest the guest's surfaces are refreshed: the
-/// refresh rate its display modes advertise, the display VBL cadence, and the
-/// pace at which work that writes a guest IOSurface completes.
+/// display shows: the refresh rate its display modes advertise and the display
+/// VBL cadence, and with [`FRAME_PACING`] on, the pace at which work that
+/// writes a guest IOSurface completes.
 ///
 /// Unset, the cap is the device's compiled default (60). `0` removes it, which
 /// restores the device's native rate (120) and no more; any other value from 1
@@ -1235,9 +1248,10 @@ pub const DRAW_LOG_MAX_BYTES: &str = "REIMS_VGPU_DRAW_LOG_MAX_BYTES";
 /// default is itself a narrowing of the native rate, and `0` only takes that
 /// narrowing back.
 ///
-/// Why a guest needs it: a compositor whose display sleeps, or a simulator
-/// with no window, renders as fast as completions come back, and spends a
-/// faster device on frames nobody sees instead of on the guest's work.
+/// Why a guest needs it: a compositor paced by the display — macOS 13's
+/// WindowServer takes its frame clock from this VBL — draws no faster than
+/// the cap. One whose display sleeps, or the iOS simulator's, is paced only by
+/// [`FRAME_PACING`].
 pub const MAX_REFRESH_HZ: &str = "REIMS_VGPU_MAX_REFRESH_HZ";
 }
 

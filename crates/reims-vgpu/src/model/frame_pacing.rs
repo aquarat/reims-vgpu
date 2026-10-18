@@ -1,38 +1,38 @@
-//! The display refresh-rate cap: how fast this device's display refreshes, and
-//! how fast a guest surface may be refreshed.
-//!
-//! # Why a device needs one
-//!
-//! A real display paces the compositors drawing for it: a frame cannot be shown
-//! sooner than the next refresh, so a compositor that is ahead of the panel
-//! waits. Nothing in a headless guest does that. When the guest's display
-//! sleeps — and a CI guest's always does — and when the iOS simulator runs
-//! without a window, the compositors are paced by nothing except how soon this
-//! device reports their frames complete. Measured on a macOS 26 guest running
-//! the simulator (4 vCPU, 8 GB), the simulator's screen surface was redrawn
-//! about 68 times a second with the device in process and about 88 times a
-//! second out of process, where completions reach the guest sooner. The faster
-//! device bought frames nobody sees, and the guest CPU they cost came out of
-//! the tests.
+//! The display refresh-rate cap: how fast this device's display refreshes, and,
+//! when switched on, how fast a guest surface may be refreshed.
 //!
 //! # What is capped
 //!
 //! - The display modes this device advertises, and the VBL cadence it delivers,
-//!   are at most [`max_refresh_hz`].
-//! - A packet whose work writes a guest IOSurface (a mapper-ref texture or a
-//!   mapping's pages — what a compositor's frame is) is a **frame** of each
-//!   surface it writes. A surface's frames complete at most once per refresh
-//!   interval:
-//!   the completion words of a frame that arrives early are held, in channel
+//!   are at most [`max_refresh_hz`]: 60 unless the operator sets
+//!   `REIMS_VGPU_MAX_REFRESH_HZ` (`0` = uncapped, which is the native 120).
+//!   A compositor that takes its frame clock from this display's VBL — macOS
+//!   13's WindowServer does — draws no faster than that.
+//! - With `REIMS_VGPU_FRAME_PACING` on, a packet whose work writes a guest
+//!   IOSurface (a mapper-ref texture or a mapping's pages — what a
+//!   compositor's frame is) is a **frame** of each surface it writes, and a
+//!   surface's frames complete at most once per refresh interval: the
+//!   completion words of a frame that arrives early are held, in channel
 //!   order, until its refresh comes round, and so is every later word of that
 //!   channel. Nothing is dropped and nothing is reordered; the work itself
-//!   runs when it arrives. A compositor that queues frames ahead — the iOS
-//!   simulator's queues dozens — is held to the cap once its queue is full,
-//!   and from then on its channel's completions trail its work by up to that
-//!   queue's depth in refreshes.
+//!   runs when it arrives.
 //!
-//! The cap is [`DEFAULT_MAX_REFRESH_HZ`] unless the operator sets
-//! `REIMS_VGPU_MAX_REFRESH_HZ` (`0` = uncapped, which is the native rate).
+//! # Why surface pacing exists, and why it is off by default
+//!
+//! Nothing paces a headless guest's other compositors. macOS 26 never arms
+//! this device's VBL or present-complete events, and a CI guest's display
+//! sleeps; the iOS simulator's screen composite (a full-screen compute into two
+//! guest IOSurfaces) then redraws as fast as the guest's CPU allows — about 67
+//! times a second with the device in process and 92 out of process on a
+//! 4-vCPU guest — spending CPU the tests need on frames nobody sees.
+//!
+//! That compositor queues dozens of frames ahead, and nothing short of a full
+//! queue holds it back: a hold bounded at one interval changed nothing. So
+//! once its queue is full every completion on its channel trails its work by
+//! up to that queue's depth in refreshes, about a second — and on macOS 26
+//! every guest client shares that channel. Measured (simulator unit tests and
+//! UI tests, 2026-10-18), pacing saves unit-test time and costs about 10 % of
+//! UI-test time, so it is an operator's choice rather than the default.
 
 use std::collections::VecDeque;
 
@@ -64,6 +64,15 @@ pub fn max_refresh_hz() -> u32 {
                 DEFAULT_MAX_REFRESH_HZ
             }
         }
+    })
+}
+
+/// Whether guest surfaces are paced to the cap (`REIMS_VGPU_FRAME_PACING`,
+/// off unless switched on), read once.
+pub fn surface_pacing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::config::read(crate::config::FRAME_PACING).0 == crate::config::Switch::On
     })
 }
 
@@ -137,8 +146,14 @@ pub struct FramePacing {
 }
 
 impl Default for FramePacing {
+    /// Paced at the cap when surface pacing is switched on; otherwise it only
+    /// counts surface refreshes for the census.
     fn default() -> Self {
-        Self::new(max_refresh_hz())
+        Self::new(if surface_pacing_enabled() {
+            max_refresh_hz()
+        } else {
+            0
+        })
     }
 }
 

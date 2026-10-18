@@ -8,9 +8,11 @@ KVM. Nothing here is submitted upstream, and this file describes only this
 fork.
 
 This fork's `master` is steelbrain-bot/reims-vgpu `master` plus the commits
-below, and `vendor/qemu` points at
-[aquarat/qemu-reims-vgpu](https://github.com/aquarat/qemu-reims-vgpu)
-`master` (upstream QEMU, steelbrain's vmapple work and Asahi KVM support).
+below. The device runs either inside QEMU or as its own program
+(`reims-vgpu-backend`, below). For the in-process build `vendor/qemu` pins
+[aquarat/qemu-reims-vgpu](https://github.com/aquarat/qemu-reims-vgpu) at
+6740a49344, the last commit with the in-process shims; that repository's
+`master` has only the out-of-process device.
 metal2vulkan comes from
 [aquarat/metal2vulkan](https://github.com/aquarat/metal2vulkan): steelbrain's
 metal2vulkan plus two commits: a narrower vector load from a union (macOS 26
@@ -51,7 +53,14 @@ side (kernel patches, images, runners) is in
   stencil passes), a slot's type checked before it is asked for a texture
   view, and metal2vulkan's byte-record attribute loads, so Compose/Skia
   apps draw their real UI.
-- `vendor/qemu`: tracks aquarat/qemu-reims-vgpu `master`.
+- Out of process: `reims-vgpu-backend`, the device as its own program,
+  serving QEMU's `apv-gpu-proxy` device over a unix socket, shared memory
+  and eventfds; the hot register words in memory both processes map; a
+  driver quarantine per host, keyed by the driver build.
+- A display refresh-rate cap (`REIMS_VGPU_MAX_REFRESH_HZ`) and optional
+  surface pacing (`REIMS_VGPU_FRAME_PACING`), below.
+- `vendor/qemu`: aquarat/qemu-reims-vgpu 6740a49344, for the in-process
+  build.
 
 `git log` has the details of each.
 
@@ -66,6 +75,38 @@ iOS simulator uses.
 
 Guest RAM must be a shared memfd (`memory-backend-memfd,share=on`), so the
 device can map scattered guest pages.
+
+### Out of process
+
+```sh
+cargo build --release -p reims-vgpu-backend
+target/release/reims-vgpu-backend --socket /run/gpu.sock &
+qemu-system-aarch64 -M vmapple,gfx-device=apv-gpu-proxy,aux-ram-share=on \
+    -global apv-gpu-proxy.socket=/run/gpu.sock ...
+```
+
+with a QEMU built from aquarat/qemu-reims-vgpu `master`, which contains no
+Reims, Rust or Vulkan code. The backend takes the same `REIMS_VGPU_*`
+settings and `VK_DRIVER_FILES` from its environment. If the host GPU driver
+crashes, only the backend dies: QEMU stops the guest with the reason, and the
+driver call that was in flight is quarantined so later runs refuse it until
+the driver changes. The host repository's `launch-kvm.sh` runs it all with
+`GPU_BACKEND_BIN`, and `MODE=oop scripts/build-qemu.sh` builds both programs.
+
+### Refresh-rate cap
+
+`REIMS_VGPU_MAX_REFRESH_HZ` (default 60; `0` = the native 120;
+`reims-vgpu-backend --max-refresh-hz` is the same setting) caps the refresh
+rate the display modes advertise and the VBL cadence.
+
+`REIMS_VGPU_FRAME_PACING=on` (`--frame-pacing on`; off by default) also paces
+guest surfaces to that rate: work that writes a guest IOSurface completes at
+most once per refresh interval per surface, holding its channel's later
+completion words in order. A headless guest's other compositors — a sleeping
+display's, the iOS simulator's — otherwise redraw as fast as the guest's CPU
+allows. The simulator's queues dozens of frames ahead, so pacing it makes the
+channel's completions trail by up to about a second; on simulator benchmarks
+that saved unit-test time and cost about 10 % of UI-test time.
 
 ## Performance
 
@@ -102,11 +143,9 @@ in the host repository.
 ```sh
 git remote add upstream https://github.com/steelbrain-bot/reims-vgpu.git
 git fetch upstream master && git merge upstream/master
-# after updating aquarat/qemu-reims-vgpu master:
-git -C vendor/qemu fetch origin master && git -C vendor/qemu checkout origin/master
-git add vendor/qemu && git commit -m "vendor/qemu: bump"
 ```
 
 Merges keep upstream's `.gitmodules` URL changes in view: keep ours
-(aquarat/qemu-reims-vgpu, branch master). `scripts/sync-upstream.sh` in the
-host repository automates both forks.
+(aquarat/qemu-reims-vgpu). `vendor/qemu` stays at 6740a49344 for the
+in-process build; aquarat/qemu-reims-vgpu `master` no longer carries the
+in-process shims, so bumping the submodule to it would break that build.
