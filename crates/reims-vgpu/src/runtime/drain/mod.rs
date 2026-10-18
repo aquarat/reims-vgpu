@@ -2064,6 +2064,78 @@ fn publish_word<H: HostMemory + HostOps>(
     write_stamp(state, host, slot, value);
 }
 
+/// [`publish_word`], unless the channel's word has to wait for a refresh.
+///
+/// `frame_due` is when the packet this word completes may complete, if it is
+/// a frame that came early. A word of a channel that is already holding words
+/// queues behind them whatever it completes, so a channel's words still reach
+/// the guest in the order the model published them.
+fn publish_word_paced<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    domain: u32,
+    slot: u32,
+    value: u32,
+    frame_due: Option<u64>,
+) {
+    let now = crate::observe::elapsed_us();
+    if state.frame_pacing.hold(domain, slot, value, frame_due, now) {
+        note_store_route("stamp_held_for_refresh");
+        return;
+    }
+    publish_word(state, host, domain, slot, value);
+}
+
+/// Publish every completion word whose refresh has come
+/// (`model::frame_pacing`), and once a second say what the pacer did.
+///
+/// Called from the poll tick, which runs whether or not the guest submits
+/// anything, and before each drain tranche.
+pub fn release_paced_words<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    let now = crate::observe::elapsed_us();
+    if state.frame_pacing.holding() {
+        for (domain, word) in state.frame_pacing.take_due(now) {
+            publish_word(state, host, domain, word.slot, word.value);
+        }
+    }
+    let pacing = &mut state.frame_pacing;
+    if !pacing.window_frames.is_empty()
+        && now.saturating_sub(pacing.census_reported_us) >= 1_000_000
+    {
+        let window_ms = (now - pacing.census_reported_us) / 1_000;
+        pacing.census_reported_us = now;
+        // The busiest surfaces' refresh rates over the window, which is what
+        // the cap is about whether or not it is on.
+        let mut rates: Vec<(u32, u32)> = std::mem::take(&mut pacing.window_frames)
+            .into_iter()
+            .collect();
+        rates.sort_by(|a, b| b.1.cmp(&a.1));
+        let rates: Vec<String> = rates
+            .iter()
+            .take(4)
+            .map(|(mid, n)| {
+                format!(
+                    "{mid}:{:.0}",
+                    f64::from(*n) * 1000.0 / window_ms.max(1) as f64
+                )
+            })
+            .collect();
+        let c = pacing.census;
+        crate::observe::off(format!(
+            "frame_pacing max_hz={} surface_hz=[{}] frames={} paced={} held_ms={} max_hold_us={} \
+             words_held={} max_queue={}",
+            crate::model::frame_pacing::max_refresh_hz(),
+            rates.join(","),
+            c.frames,
+            c.paced,
+            c.held_us / 1_000,
+            c.max_hold_us,
+            c.words_held,
+            c.max_queue,
+        ));
+    }
+}
+
 /// Everything the device does with one arrived packet *before* the model
 /// judges it.
 ///
@@ -2632,6 +2704,9 @@ fn run_parked<H: HostMemory + HostOps>(
     work: &crate::runtime::parked::ParkedWork,
 ) {
     let domain = work.domain();
+    // When this packet's completion may be published, if it is a frame that
+    // came before its refresh (`model::frame_pacing`).
+    let mut frame_due = None;
     if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
         process_root_packet(state, host, work.packet());
     } else {
@@ -2649,6 +2724,9 @@ fn run_parked<H: HostMemory + HostOps>(
         let started = std::time::Instant::now();
         let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
+        frame_due = state
+            .frame_pacing
+            .frame_done(domain, crate::observe::elapsed_us());
         if was_draining == 0 {
             state.draining_mask &= !bit;
         }
@@ -2676,7 +2754,14 @@ fn run_parked<H: HostMemory + HostOps>(
                 match release.stamp {
                     Some(stamp) => {
                         note_store_route("stamp_published_by_channel");
-                        publish_word(state, host, domain, stamp.slot.0, stamp.value.0);
+                        publish_word_paced(
+                            state,
+                            host,
+                            domain,
+                            stamp.slot.0,
+                            stamp.value.0,
+                            frame_due,
+                        );
                     }
                     // A position whose channel released it owing no word. It is
                     // the denominator: without it a channel that published
@@ -2827,7 +2912,14 @@ fn note_unadmitted<H: HostMemory + HostOps>(
     });
     for release in released {
         if let Some(stamp) = release.stamp {
-            publish_word(state, host, fifo.domain().0, stamp.slot.0, stamp.value.0);
+            publish_word_paced(
+                state,
+                host,
+                fifo.domain().0,
+                stamp.slot.0,
+                stamp.value.0,
+                None,
+            );
         }
     }
 }
@@ -4264,7 +4356,9 @@ fn shared_w32<H: HostMemory + HostOps>(host: &mut H, gpa: u64, off: u64, v: u32,
 ///: `+0x208` is the timing-element **count**, not a
 /// pixel width. Modes are 1920×1080, 1440×1080, 1280×1024 (apple-gfx A/B
 /// reference geometry) plus 3840×2160 (4K UHD), each advertised at
-/// `DISPLAY_REFRESH_HZ` (120 Hz), so the guest always latches the 120 Hz mode.
+/// the display's refresh rate — `DISPLAY_REFRESH_HZ` (120 Hz) natively, or the
+/// refresh-rate cap (`model::frame_pacing`, 60 Hz by default) — so the guest
+/// always latches that rate. The measurements below were taken at 120 Hz.
 ///
 /// # "Always" is measured, and it holds on the boots that look like it does not
 ///
@@ -4299,7 +4393,8 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
     if gpa == 0 {
         return;
     }
-    let Some(refresh) = display_refresh_hz_1616(DISPLAY_REFRESH_HZ) else {
+    let Some(refresh) = display_refresh_hz_1616(crate::model::frame_pacing::display_refresh_hz())
+    else {
         return;
     };
     let psz = page_size as usize;
@@ -7097,15 +7192,19 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
 /// active-console polls at the rate we advertise, without aliasing a
 /// heartbeat-only workload down to half rate.
 ///
-/// **Derived from [`DISPLAY_REFRESH_HZ`], not written down.** This was a
+/// **Derived from the display's rate, not written down.** This was a
 /// millisecond grid with a hardcoded `8`, which is 125 Hz — so the device
 /// advertised 120 Hz in its timing table and then delivered VBL 4.2% faster.
 /// The guest honours what is delivered, not what is advertised: a driven
 /// Safari measured its own `requestAnimationFrame` at exactly 125 Hz. 120 Hz is
 /// 8333 µs and is simply not expressible on an integer-millisecond grid, so the
 /// units are part of the fix rather than incidental to it.
-pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
-    1_000_000 / crate::model::DISPLAY_REFRESH_HZ as u64;
+///
+/// The rate is the display's, so under a refresh-rate cap
+/// (`model::frame_pacing`) the interval is the cap's.
+pub(crate) fn display_vbl_min_interval_us() -> u64 {
+    crate::model::frame_pacing::display_refresh_interval_us()
+}
 
 /// Atomically claim the next display VBL for either the locked or lock-free
 /// poll path. A single shared timestamp makes the cadence independent of device
@@ -7129,13 +7228,14 @@ pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
 pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: u64) -> bool {
     let last = last_us.load(std::sync::atomic::Ordering::Acquire);
     let gap = now_us.saturating_sub(last);
-    if gap < DISPLAY_VBL_MIN_INTERVAL_US {
+    let interval = display_vbl_min_interval_us();
+    if gap < interval {
         return false;
     }
-    let next = if gap >= 2 * DISPLAY_VBL_MIN_INTERVAL_US {
+    let next = if gap >= 2 * interval {
         now_us
     } else {
-        last + DISPLAY_VBL_MIN_INTERVAL_US
+        last + interval
     };
     last_us
         .compare_exchange(
@@ -7148,7 +7248,7 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
 }
 
 /// Pulse VBL at the phase-locked ~120 Hz cadence (grid interval
-/// [`DISPLAY_VBL_MIN_INTERVAL_US`]; see [`claim_display_vbl`]).
+/// [`display_vbl_min_interval_us`]; see [`claim_display_vbl`]).
 ///
 /// Writes pending bit 0, sets 0x1014 display bit, and raises MSI after ONLINE
 /// has been acked. The limiter is owned outside `DeviceState` so this locked

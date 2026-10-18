@@ -563,6 +563,8 @@ pub fn device_drain(id: u64) -> bool {
     // can say how late in this tranche it happened without threading a start
     // time through every call. See `census::tranche_elapsed_us`.
     crate::runtime::drain::note_tranche_started(crate::observe::elapsed_us());
+    // Completion words whose refresh has come go out before new work runs.
+    crate::runtime::drain::release_paced_words(&mut device.state, &mut host);
     device.drain(&mut host);
     // The tail is timed apart from `Device::drain` because it is inside
     // `drain_us` and inside no `DrainPhase`, and that residue is a third of the
@@ -711,6 +713,9 @@ pub fn device_poll(id: u64) -> bool {
     // lock-free ring lands in only once folded. Without this the Dekker rescue
     // could not see the very channels the doorbell rail is responsible for.
     crate::runtime::drain::fold_rung_child_doorbells(&mut device.state);
+    // The refresh-rate cap's clock: words held for a refresh are published
+    // here when no drain is running to do it.
+    crate::runtime::drain::release_paced_words(&mut device.state, &mut host);
     crate::runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
     crate::runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base

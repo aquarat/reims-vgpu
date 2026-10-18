@@ -229,6 +229,11 @@ pub(super) fn mapper_ref_texture_destination<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("compute_dst_no_writeback");
         return ComputeImageDestination::Host;
     };
+    // A dispatch that writes a guest surface makes its packet a frame,
+    // whichever rail lands the bytes.
+    state
+        .frame_pacing
+        .note_surface_write(state.draining_mask, state.draining_channel, *mapping_id);
     // The window this bind staged against, not one resolved here. It is already
     // plane-correct for a ref-texture view and already a sub-rectangle where the
     // dispatch writes one, and it is the same window the readback rail lands

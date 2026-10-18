@@ -3422,6 +3422,10 @@ pub struct DeviceState {
     /// `drain_other_child_fifos` must skip **all** bits set — otherwise it can
     /// re-enter a mid-packet channel and re-process the same head.
     pub draining_mask: u32,
+    /// The display refresh-rate cap: which packets are frames and which
+    /// completion words wait for their refresh. See
+    /// [`crate::model::frame_pacing`].
+    pub frame_pacing: crate::model::frame_pacing::FramePacing,
     /// Contiguous mapping views (`MappingEntry::contig_ptr`) whose page tables
     /// changed. `DeviceState` cannot unmap (no HostOps); the runtime flushes
     /// these via `HostOps::unmap_pages` after retiring the backend objects and
@@ -3610,6 +3614,7 @@ impl DeviceState {
             fence_generations: BTreeMap::new(),
             draining_channel: 0,
             draining_mask: 0,
+            frame_pacing: Default::default(),
             retired_views: Vec::new(),
             retired_guest_imports: Vec::new(),
             retired_guest_write_tokens: Vec::new(),
@@ -5800,6 +5805,9 @@ impl DeviceState {
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
         };
+        // A guest surface written by a channel's packet: that packet is a frame.
+        self.frame_pacing
+            .note_surface_write(self.draining_mask, self.draining_channel, mapping_id);
         m.content_generation = m.content_generation.wrapping_add(1);
         if m.content_generation == 0 {
             m.content_generation = 1;

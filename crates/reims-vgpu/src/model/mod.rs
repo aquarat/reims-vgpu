@@ -4,6 +4,7 @@
 //! ApplePV-shaped model. No parsing of wire bytes here; no backend execution.
 
 pub(crate) mod content_cache;
+pub mod frame_pacing;
 pub(crate) mod hot_word;
 mod lru_memo;
 mod regs;

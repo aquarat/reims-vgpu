@@ -925,7 +925,17 @@ pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
         return None;
     }
     match resolve_render_target(state, host, task_id, att) {
-        Ok(rt) => Some(rt),
+        Ok(rt) => {
+            // Rendering into a guest surface makes this packet a frame.
+            if rt.mapping_id != 0 {
+                state.frame_pacing.note_surface_write(
+                    state.draining_mask,
+                    state.draining_channel,
+                    rt.mapping_id,
+                );
+            }
+            Some(rt)
+        }
         Err(refusal) => {
             // Per attachment, per check: the guest re-issues the same pass every
             // frame, so an undeduped line here is a flood at draw rate. The two

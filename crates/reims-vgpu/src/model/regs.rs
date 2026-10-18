@@ -957,12 +957,16 @@ pub fn display_dimension_mm(millimetres: u16) -> (f32, u16) {
     let narrowed = millimetres as f32;
     (narrowed, (narrowed as f64 + 0.5) as u16)
 }
+/// The display's native refresh: the most any timing element advertises. What
+/// is advertised is this or the refresh-rate cap, whichever is lower
+/// (`model::frame_pacing::display_refresh_hz`, 60 Hz by default).
+///
 /// Advertised refresh of every timing element. macOS paces CoreAnimation /
 /// rAF to the display's advertised rate, so 60 here caps the guest at 60 fps
 /// regardless of how fast VBL is signalled. 120 requests ProMotion-class
 /// pacing; it must be matched by the VBL limiter and enough poll opportunities
 /// (`REIMS_VGPU_PCI_HEARTBEAT_MS` = 4). The limiter now *derives* its interval
-/// from this constant (`DISPLAY_VBL_MIN_INTERVAL_US`) rather than restating it,
+/// from the same rate (`display_vbl_min_interval_us`) rather than restating it,
 /// because the two were allowed to drift apart: a hardcoded 8 ms delivered
 /// 125 Hz against the 120 advertised here, and the guest paces to what is
 /// delivered.

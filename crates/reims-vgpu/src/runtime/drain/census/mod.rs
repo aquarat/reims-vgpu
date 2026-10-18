@@ -20,7 +20,7 @@
 // (`backend::{metal,vulkan}::census`). This module owns the *order* of the
 // census window and asks the rail through `Backend::emit_census`, so nothing
 // here mentions a rail.
-use super::DISPLAY_VBL_MIN_INTERVAL_US;
+use super::display_vbl_min_interval_us;
 use crate::backend::{Backend as _, CensusSite};
 /// Delivered-VBL rate, reported from the branch that decides it.
 ///
@@ -347,7 +347,7 @@ impl VblCensus {
             self.arms[VBL_NOT_CLAIMED].load(Relaxed),
             self.arms[VBL_NOT_ONLINE].load(Relaxed),
             self.arms[VBL_NOT_ENABLED].load(Relaxed),
-            1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64,
+            1_000_000.0 / display_vbl_min_interval_us() as f64,
         ))
     }
 }
@@ -1786,12 +1786,12 @@ pub(crate) struct DrainDutyCensus {
 
 /// A tranche at or above this held the device lock for a whole guest frame.
 ///
-/// Derived from the VBL cadence we actually deliver, because that *is* the
-/// budget: the vCPU blocks on the same mutex this tranche holds, so a tranche
-/// longer than one frame interval is one the guest cannot have serviced in
-/// time. Deriving it also means it tracks the refresh rate instead of becoming
-/// a stale constant beside it.
-const DRAIN_TRANCHE_SLOW_US: u64 = DISPLAY_VBL_MIN_INTERVAL_US;
+/// Derived from the display's native VBL cadence, the fastest this device
+/// delivers, because that *is* the budget: the vCPU blocks on the same mutex
+/// this tranche holds, so a tranche longer than one frame interval is one the
+/// guest cannot have serviced in time. It stays at the native rate under a
+/// refresh-rate cap so the census means the same thing on every run.
+const DRAIN_TRANCHE_SLOW_US: u64 = 1_000_000 / crate::model::DISPLAY_REFRESH_HZ as u64;
 
 impl DrainDutyCensus {
     /// Count one skipped tranche (lock never taken).

@@ -1222,6 +1222,23 @@ pub const FAIL_LOG_MAX_BYTES: &str = "REIMS_VGPU_FAIL_LOG_MAX_BYTES";
 /// **A count, not a switch.** [`FAIL_LOG_MAX_BYTES`] for the verbose sink, with
 /// the same default keyed on [`DRAW_LOG_PATH`].
 pub const DRAW_LOG_MAX_BYTES: &str = "REIMS_VGPU_DRAW_LOG_MAX_BYTES";
+
+/// **A rate, read with [`rate_cap`].** The most frames a second this device's
+/// display shows, and the fastest the guest's surfaces are refreshed: the
+/// refresh rate its display modes advertise, the display VBL cadence, and the
+/// pace at which work that writes a guest IOSurface completes.
+///
+/// Unset, the cap is the device's compiled default (60). `0` removes it, which
+/// restores the device's native rate (120) and no more; any other value from 1
+/// to the native rate narrows to that rate. Nothing can raise the display past
+/// its native rate, so this cannot widen what the device does — the compiled
+/// default is itself a narrowing of the native rate, and `0` only takes that
+/// narrowing back.
+///
+/// Why a guest needs it: a compositor whose display sleeps, or a simulator
+/// with no window, renders as fast as completions come back, and spends a
+/// faster device on frames nobody sees instead of on the guest's work.
+pub const MAX_REFRESH_HZ: &str = "REIMS_VGPU_MAX_REFRESH_HZ";
 }
 
 choices! {
@@ -1397,6 +1414,42 @@ pub fn count(name: &str, ceiling: u64) -> Count {
     }
 }
 
+/// A rate cap as the operator stated it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RateCap {
+    /// Nothing set. The caller keeps the cap it compiled with.
+    Unset,
+    /// `0`: no cap below the native rate.
+    Uncapped,
+    /// A cap the caller may adopt: at least one and no more than its native rate.
+    Capped(u64),
+    /// Set to something unusable, carrying the raw text so the refusal can
+    /// quote what it rejected.
+    Refused(String),
+}
+
+/// Read `name` as a rate cap of at most `native`, where `0` means "uncapped".
+///
+/// Separate from [`count`] because zero means something here: a refresh rate of
+/// zero is not a display that never refreshes, it is the absence of a cap,
+/// which [`count`] refuses by design. A value above `native` is refused rather
+/// than clamped, for the reason [`count`] gives.
+pub fn rate_cap(name: &str, native: u64) -> RateCap {
+    let Some(raw) = std::env::var_os(name) else {
+        return RateCap::Unset;
+    };
+    let value = raw.to_string_lossy().into_owned();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return RateCap::Unset;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => RateCap::Uncapped,
+        Ok(n) if n <= native => RateCap::Capped(n),
+        _ => RateCap::Refused(value),
+    }
+}
+
 /// Which of a fixed set of named alternatives the operator asked for, or why
 /// the value was not usable.
 ///
@@ -1553,6 +1606,20 @@ mod tests {
         let out = body();
         unsafe { std::env::remove_var(PROBE) };
         out
+    }
+
+    /// Zero uncaps, a value up to the native rate caps, and anything else is
+    /// refused verbatim rather than clamped.
+    #[test]
+    fn a_rate_cap_reads_zero_as_uncapped_and_refuses_past_native() {
+        let read = |v| with_probe(v, || rate_cap("REIMS_VGPU_TEST_PROBE", 120));
+        assert_eq!(read(None), RateCap::Unset);
+        assert_eq!(read(Some(" ")), RateCap::Unset);
+        assert_eq!(read(Some("0")), RateCap::Uncapped);
+        assert_eq!(read(Some("60")), RateCap::Capped(60));
+        assert_eq!(read(Some(" 120 ")), RateCap::Capped(120));
+        assert_eq!(read(Some("121")), RateCap::Refused("121".to_owned()));
+        assert_eq!(read(Some("fast")), RateCap::Refused("fast".to_owned()));
     }
 
     #[test]
