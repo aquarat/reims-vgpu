@@ -99,12 +99,19 @@ pub(crate) fn list_path() -> PathBuf {
 /// digests. Set once the device is up; a key made before then says `unknown`.
 static DRIVER_IDENTITY: OnceLock<String> = OnceLock::new();
 
-pub(crate) fn set_driver_identity(vendor: u32, device: u32, driver_version: u32, cache_uuid: &[u8; 16]) {
+pub(crate) fn set_driver_identity(
+    vendor: u32,
+    device: u32,
+    driver_version: u32,
+    cache_uuid: &[u8; 16],
+) {
     let mut uuid = String::with_capacity(32);
     for b in cache_uuid {
         uuid.push_str(&format!("{b:02x}"));
     }
-    let _ = DRIVER_IDENTITY.set(format!("{vendor:04x}.{device:04x}.{driver_version:08x}.{uuid}"));
+    let _ = DRIVER_IDENTITY.set(format!(
+        "{vendor:04x}.{device:04x}.{driver_version:08x}.{uuid}"
+    ));
 }
 
 /// The digest list identifying one driver call's inputs.
@@ -116,7 +123,10 @@ pub(crate) fn set_driver_identity(vendor: u32, device: u32, driver_version: u32,
 pub(crate) fn key_of(modules: &[(&'static str, &[u32])]) -> String {
     let mut key = format!(
         "drv:{}",
-        DRIVER_IDENTITY.get().map(String::as_str).unwrap_or("unknown")
+        DRIVER_IDENTITY
+            .get()
+            .map(String::as_str)
+            .unwrap_or("unknown")
     );
     for (stage, spirv) in modules {
         key.push('+');
@@ -129,15 +139,19 @@ pub(crate) fn key_of(modules: &[(&'static str, &[u32])]) -> String {
 /// The quarantine as this process sees it: folding in whatever the previous
 /// process left behind on first use, and re-read whenever the shared file
 /// changes, so a call another instance on this host died in is refused here too.
-fn entries() -> std::sync::MutexGuard<'static, (Option<std::time::SystemTime>, HashMap<String, String>)> {
-    static ENTRIES: OnceLock<std::sync::Mutex<(Option<std::time::SystemTime>, HashMap<String, String>)>> =
-        OnceLock::new();
+fn entries(
+) -> std::sync::MutexGuard<'static, (Option<std::time::SystemTime>, HashMap<String, String>)> {
+    static ENTRIES: OnceLock<
+        std::sync::Mutex<(Option<std::time::SystemTime>, HashMap<String, String>)>,
+    > = OnceLock::new();
     let cell = ENTRIES.get_or_init(|| {
         fold_surviving_breadcrumb();
         std::sync::Mutex::new((None, HashMap::new()))
     });
     let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-    let mtime = std::fs::metadata(list_path()).and_then(|m| m.modified()).ok();
+    let mtime = std::fs::metadata(list_path())
+        .and_then(|m| m.modified())
+        .ok();
     if mtime != guard.0 {
         let first = guard.0.is_none();
         let map = std::fs::read_to_string(list_path())

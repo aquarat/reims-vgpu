@@ -360,11 +360,7 @@ mod tests {
         for line in HEADER.lines() {
             let mut it = line.split_whitespace();
             if it.next() == Some("#define") && it.next() == Some(full.as_str()) {
-                let v: String = it
-                    .next()
-                    .expect("value")
-                    .trim_end_matches('u')
-                    .into();
+                let v: String = it.next().expect("value").trim_end_matches('u').into();
                 return if let Some(h) = v.strip_prefix("0x") {
                     u64::from_str_radix(h, 16).expect("hex")
                 } else {
@@ -438,6 +434,9 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("#define APV_PROXY_"))
             .count();
-        assert_eq!(defines, mirrored, "a define was added to the header without a mirror");
+        assert_eq!(
+            defines, mirrored,
+            "a define was added to the header without a mirror"
+        );
     }
 }

@@ -101,19 +101,27 @@ impl Backend {
         let mut sv = [0 as RawFd; 2];
         // SAFETY: plain syscall into a 2-element array.
         if unsafe {
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr())
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            )
         } != 0
         {
             return Err(sys::last_err("socketpair"));
         }
         use std::os::fd::FromRawFd;
         // SAFETY: fresh fds from socketpair.
-        let (events, events_peer) = unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
+        let (events, events_peer) =
+            unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) };
 
         // The hot words must be in place before the device exists: the
         // device's register state takes them at creation.
         // SAFETY: the block lies inside the device page, which is never unmapped.
-        let block = unsafe { &*(page.add(HOT_BLOCK_OFFSET as usize) as *const reims_vgpu::remote::HotWordBlock) };
+        let block = unsafe {
+            &*(page.add(HOT_BLOCK_OFFSET as usize) as *const reims_vgpu::remote::HotWordBlock)
+        };
         if !reims_vgpu::remote::install_external_hot_words(block) {
             return Err(std::io::Error::other("hot words already installed"));
         }
@@ -143,8 +151,12 @@ impl Backend {
 
         // Page header.
         backend.hdr_u32(4).store(wire::VERSION, Ordering::Relaxed);
-        backend.hdr_u32(8).store(wire::STATE_STARTING, Ordering::Relaxed);
-        backend.hdr_u32(0).store(wire::PAGE_MAGIC, Ordering::Release);
+        backend
+            .hdr_u32(8)
+            .store(wire::STATE_STARTING, Ordering::Relaxed);
+        backend
+            .hdr_u32(0)
+            .store(wire::PAGE_MAGIC, Ordering::Release);
 
         let ops = crate::host_ops::table(backend);
         let ops: &'static _ = Box::leak(Box::new(ops));
@@ -195,7 +207,8 @@ impl Backend {
     }
 
     pub fn set_running(&self) {
-        self.hdr_u32(8).store(wire::STATE_RUNNING, Ordering::Release);
+        self.hdr_u32(8)
+            .store(wire::STATE_RUNNING, Ordering::Release);
     }
 
     fn ring(&self) -> *mut PostedRing {
@@ -238,7 +251,9 @@ impl Backend {
             }
             // SAFETY: entry index within the ring; the producer published it
             // before advancing head (acquire above).
-            let e = unsafe { std::ptr::read_volatile(&(*ring).entries[(t % wire::POSTED_ENTRIES) as usize]) };
+            let e = unsafe {
+                std::ptr::read_volatile(&(*ring).entries[(t % wire::POSTED_ENTRIES) as usize])
+            };
             // SAFETY: valid handle.
             unsafe {
                 match e.window {
@@ -266,7 +281,9 @@ impl Backend {
         let refused = self.hdr_u64(32).load(Ordering::Relaxed);
         let rseen = self.refused_seen.swap(refused, Ordering::Relaxed);
         if refused > rseen {
-            reims_vgpu::remote::note_out_of_range_doorbell(self.hdr_u32(40).load(Ordering::Relaxed));
+            reims_vgpu::remote::note_out_of_range_doorbell(
+                self.hdr_u32(40).load(Ordering::Relaxed),
+            );
         }
     }
 
@@ -291,7 +308,8 @@ impl Backend {
             if self.stopping.load(Ordering::Acquire) {
                 break;
             }
-            self.hdr_u64(16).store(sys::now_ns(libc::CLOCK_MONOTONIC), Ordering::Release);
+            self.hdr_u64(16)
+                .store(sys::now_ns(libc::CLOCK_MONOTONIC), Ordering::Release);
             let polled = {
                 let _vmm = self.vmm_lock.lock().unwrap();
                 // SAFETY: valid handle.
@@ -326,7 +344,9 @@ impl Backend {
         loop {
             let mut a = HostAction::default();
             // SAFETY: valid handle and out pointer.
-            if unsafe { rabi::reims_vgpu_qemu_device_pop_action(h, &mut a) } != rabi::REIMS_VGPU_QEMU_OK {
+            if unsafe { rabi::reims_vgpu_qemu_device_pop_action(h, &mut a) }
+                != rabi::REIMS_VGPU_QEMU_OK
+            {
                 break;
             }
             self.apply_action(&a);
@@ -337,7 +357,9 @@ impl Backend {
         match a.kind {
             HostActionKind::IrqGfxPulse => self.raise(0),
             HostActionKind::IrqIosfcPulse => self.raise(1),
-            HostActionKind::ScanoutUpdate => self.scanout(a.a0 as u32, a.a1 as u32, a.a2 as u32, a.a3 as u32),
+            HostActionKind::ScanoutUpdate => {
+                self.scanout(a.a0 as u32, a.a1 as u32, a.a2 as u32, a.a3 as u32)
+            }
             HostActionKind::CursorUpdate => {
                 let ev = wire::Cursor {
                     x: a.a0 as i32,
@@ -405,7 +427,9 @@ impl Backend {
         if rc != rabi::REIMS_VGPU_QEMU_OK {
             // EMPTY: unchanged, the frame already shown stands.
             if rc != rabi::REIMS_VGPU_QEMU_EMPTY {
-                eprintln!("reims-vgpu-backend: scanout_copy mapping={mapping} {width}x{height} rc={rc}");
+                eprintln!(
+                    "reims-vgpu-backend: scanout_copy mapping={mapping} {width}x{height} rc={rc}"
+                );
             }
             return;
         }
@@ -425,18 +449,27 @@ impl Backend {
         let mut info = GlyphInfo::default();
         // SAFETY: valid handle; GlyphInfo is the layout twin of the ABI's
         // CursorGlyphInfo (whose type this crate cannot name).
-        if unsafe { rabi::reims_vgpu_qemu_cursor_glyph_info(h, (&mut info as *mut GlyphInfo).cast()) }
-            != rabi::REIMS_VGPU_QEMU_OK
+        if unsafe {
+            rabi::reims_vgpu_qemu_cursor_glyph_info(h, (&mut info as *mut GlyphInfo).cast())
+        } != rabi::REIMS_VGPU_QEMU_OK
         {
             return;
         }
         let n = u64::from(info.pixel_count);
-        if info.width == 0 || info.height == 0 || n != u64::from(info.width) * u64::from(info.height) || n > GLYPH_MAX_PIXELS {
+        if info.width == 0
+            || info.height == 0
+            || n != u64::from(info.width) * u64::from(info.height)
+            || n > GLYPH_MAX_PIXELS
+        {
             return;
         }
         // SAFETY: the glyph area holds GLYPH_MAX_PIXELS u32s.
         let rc = unsafe {
-            rabi::reims_vgpu_qemu_cursor_glyph_copy(h, self.scanout.add(GLYPH_OFFSET as usize) as *mut u32, n as usize)
+            rabi::reims_vgpu_qemu_cursor_glyph_copy(
+                h,
+                self.scanout.add(GLYPH_OFFSET as usize) as *mut u32,
+                n as usize,
+            )
         };
         if rc != rabi::REIMS_VGPU_QEMU_OK {
             return;

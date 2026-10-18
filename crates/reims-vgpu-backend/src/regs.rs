@@ -27,17 +27,19 @@ pub fn behaviours() -> Vec<Behaviour> {
     let fault = word(std::mem::offset_of!(HotWordBlock, intr_fault));
     let fifo = word(std::mem::offset_of!(HotWordBlock, fifo_read));
     let rung = word(std::mem::offset_of!(HotWordBlock, child_doorbell_rung));
-    let gfx = |offset: u64, read_kind: u8, write_kind: u8, word: u32, arg_lo: u16, arg_hi: u16| Behaviour {
-        window: wire::WINDOW_GFX as u8,
-        read_kind,
-        write_kind,
-        // Every write harvests first, as both in-process shims did before
-        // handing the device anything.
-        flags: wire::B_HARVEST | wire::B_SIZE4,
-        offset: offset as u32,
-        word,
-        arg_lo,
-        arg_hi,
+    let gfx = |offset: u64, read_kind: u8, write_kind: u8, word: u32, arg_lo: u16, arg_hi: u16| {
+        Behaviour {
+            window: wire::WINDOW_GFX as u8,
+            read_kind,
+            write_kind,
+            // Every write harvests first, as both in-process shims did before
+            // handing the device anything.
+            flags: wire::B_HARVEST | wire::B_SIZE4,
+            offset: offset as u32,
+            word,
+            arg_lo,
+            arg_hi,
+        }
     };
     vec![
         Behaviour {
@@ -56,10 +58,38 @@ pub fn behaviours() -> Vec<Behaviour> {
             offset: wire::OFFSET_DEFAULT,
             ..Default::default()
         },
-        gfx(dev::GFX_REG_INTR_STATUS_DISP, wire::R_XCHG0, wire::W_ANDNOT, disp, 0, 0),
-        gfx(dev::GFX_REG_INTR_STATUS_GPU, wire::R_XCHG0, wire::W_ANDNOT, gpu, 0, 0),
-        gfx(dev::GFX_REG_INTR_FAULT, wire::R_LOAD, wire::W_SYNC, fault, 0, 0),
-        gfx(dev::GFX_REG_FIFO_READ, wire::R_LOAD, wire::W_SYNC, fifo, 0, 0),
+        gfx(
+            dev::GFX_REG_INTR_STATUS_DISP,
+            wire::R_XCHG0,
+            wire::W_ANDNOT,
+            disp,
+            0,
+            0,
+        ),
+        gfx(
+            dev::GFX_REG_INTR_STATUS_GPU,
+            wire::R_XCHG0,
+            wire::W_ANDNOT,
+            gpu,
+            0,
+            0,
+        ),
+        gfx(
+            dev::GFX_REG_INTR_FAULT,
+            wire::R_LOAD,
+            wire::W_SYNC,
+            fault,
+            0,
+            0,
+        ),
+        gfx(
+            dev::GFX_REG_FIFO_READ,
+            wire::R_LOAD,
+            wire::W_SYNC,
+            fifo,
+            0,
+            0,
+        ),
         gfx(
             dev::GFX_REG_CHILD_DOORBELL,
             wire::R_SYNC,

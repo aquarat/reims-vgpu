@@ -73,12 +73,18 @@ impl GuestRam {
     pub fn read(&self, mut gpa: u64, buf: &mut [u8]) -> bool {
         let mut done = 0usize;
         while done < buf.len() {
-            let Some(r) = self.find(gpa) else { return false };
+            let Some(r) = self.find(gpa) else {
+                return false;
+            };
             let off = gpa - r.gpa;
             let n = ((r.size - off) as usize).min(buf.len() - done);
             // SAFETY: source within the region mapping, destination within buf.
             unsafe {
-                std::ptr::copy_nonoverlapping(r.hva.add(off as usize), buf.as_mut_ptr().add(done), n)
+                std::ptr::copy_nonoverlapping(
+                    r.hva.add(off as usize),
+                    buf.as_mut_ptr().add(done),
+                    n,
+                )
             };
             done += n;
             gpa += n as u64;
@@ -89,7 +95,9 @@ impl GuestRam {
     pub fn write(&self, mut gpa: u64, buf: &[u8]) -> bool {
         let mut done = 0usize;
         while done < buf.len() {
-            let Some(r) = self.find(gpa) else { return false };
+            let Some(r) = self.find(gpa) else {
+                return false;
+            };
             let off = gpa - r.gpa;
             let n = ((r.size - off) as usize).min(buf.len() - done);
             // SAFETY: destination within the region mapping, source within buf.
@@ -118,7 +126,9 @@ impl GuestRam {
         let mut hvas = Vec::with_capacity(gpas.len());
         let mut owners = Vec::with_capacity(gpas.len());
         for (i, &gpa) in gpas.iter().enumerate() {
-            let Some(r) = self.find(gpa) else { return Err((INVALID, i as u64, 0)) };
+            let Some(r) = self.find(gpa) else {
+                return Err((INVALID, i as u64, 0));
+            };
             let off = gpa - r.gpa;
             if off % page != 0 || page > r.size - off {
                 return Err((INVALID, i as u64, 0));
@@ -144,7 +154,11 @@ impl GuestRam {
             )
         };
         if view == libc::MAP_FAILED {
-            return Err((RESERVATION, 0, io::Error::last_os_error().raw_os_error().unwrap_or(0)));
+            return Err((
+                RESERVATION,
+                0,
+                io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            ));
         }
         let mut i = 0;
         while i < gpas.len() {

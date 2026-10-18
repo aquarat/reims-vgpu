@@ -242,11 +242,17 @@ pub fn recv(fd: RawFd) -> io::Result<Option<Msg>> {
         }
     }
     if n < HDR || mh.msg_flags & libc::MSG_TRUNC != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short or truncated message"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short or truncated message",
+        ));
     }
     let hdr = Hdr::read_from(&buf).unwrap();
     if hdr.size as usize != n - HDR {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "size field disagrees"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "size field disagrees",
+        ));
     }
     buf.truncate(n);
     buf.drain(..HDR);

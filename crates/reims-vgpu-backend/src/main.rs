@@ -42,7 +42,10 @@ fn listen(path: &str) -> io::Result<OwnedFd> {
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let bytes = path.as_bytes();
     if bytes.len() >= addr.sun_path.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
     }
     for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
         *d = *s as libc::c_char;
@@ -68,7 +71,14 @@ fn listen(path: &str) -> io::Result<OwnedFd> {
 fn accept(listener: RawFd) -> io::Result<OwnedFd> {
     loop {
         // SAFETY: plain syscall.
-        let fd = unsafe { libc::accept4(listener, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) };
+        let fd = unsafe {
+            libc::accept4(
+                listener,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
         if fd >= 0 {
             // SAFETY: fresh fd.
             return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -99,11 +109,17 @@ fn hello(ctl: RawFd, msg: &sys::Msg) -> io::Result<&'static Backend> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short HELLO"))?;
     if h.version != wire::VERSION {
         reply_err(ctl, &msg.hdr, -libc::EPROTO)?;
-        return Err(io::Error::other(format!("protocol version {} (want {})", h.version, wire::VERSION)));
+        return Err(io::Error::other(format!(
+            "protocol version {} (want {})",
+            h.version,
+            wire::VERSION
+        )));
     }
     if h.window_size[wire::WINDOW_GFX as usize] < reims_vgpu::remote::GFX_MMIO_SIZE {
         reply_err(ctl, &msg.hdr, -libc::EINVAL)?;
-        return Err(io::Error::other("gfx window smaller than the device's register file"));
+        return Err(io::Error::other(
+            "gfx window smaller than the device's register file",
+        ));
     }
     let nr_irqs = h.nr_irqs.clamp(1, 8);
     let (b, shared) = Backend::create(h.page_shift, nr_irqs)?;
@@ -170,7 +186,10 @@ fn mem_table(b: &Backend, msg: sys::Msg) -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short MEM_TABLE"))?;
     let nr = t.nr as usize;
     if msg.fds.len() != nr {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "MEM_TABLE fd count"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MEM_TABLE fd count",
+        ));
     }
     let base = std::mem::size_of::<wire::MemTable>();
     let rsz = std::mem::size_of::<wire::MemRegion>();
@@ -201,10 +220,18 @@ fn access(b: &Backend, ctl: RawFd, msg: &sys::Msg, write: bool) -> io::Result<()
     // SAFETY: valid handle and out pointer.
     let rc = unsafe {
         match (a.window, write) {
-            (wire::WINDOW_GFX, false) => rabi::reims_vgpu_qemu_gfx_read(h, a.offset, a.size, &mut value),
-            (wire::WINDOW_GFX, true) => rabi::reims_vgpu_qemu_gfx_write(h, a.offset, a.data, a.size),
-            (wire::WINDOW_IOSFC, false) => rabi::reims_vgpu_qemu_iosfc_read(h, a.offset, a.size, &mut value),
-            (wire::WINDOW_IOSFC, true) => rabi::reims_vgpu_qemu_iosfc_write(h, a.offset, a.data, a.size),
+            (wire::WINDOW_GFX, false) => {
+                rabi::reims_vgpu_qemu_gfx_read(h, a.offset, a.size, &mut value)
+            }
+            (wire::WINDOW_GFX, true) => {
+                rabi::reims_vgpu_qemu_gfx_write(h, a.offset, a.data, a.size)
+            }
+            (wire::WINDOW_IOSFC, false) => {
+                rabi::reims_vgpu_qemu_iosfc_read(h, a.offset, a.size, &mut value)
+            }
+            (wire::WINDOW_IOSFC, true) => {
+                rabi::reims_vgpu_qemu_iosfc_write(h, a.offset, a.data, a.size)
+            }
             _ => rabi::REIMS_VGPU_QEMU_ERR_ARGS,
         }
     };

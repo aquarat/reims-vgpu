@@ -143,7 +143,9 @@ impl Dirty {
     /// Return slots the VMM has finished releasing to the free pool.
     fn reclaim(&self, a: &mut Alloc) {
         for i in 0..NR_SLOTS {
-            if a.own[i as usize] == Own::Releasing && self.state(i).load(Ordering::Acquire) == wire::DIRTY_FREE {
+            if a.own[i as usize] == Own::Releasing
+                && self.state(i).load(Ordering::Acquire) == wire::DIRTY_FREE
+            {
                 a.own[i as usize] = Own::Free;
                 let r = a.ranges[i as usize];
                 if r.1 != 0 {
@@ -192,16 +194,20 @@ impl Dirty {
         };
         let slot = slot as u32;
         for (k, &gpa) in pages.iter().enumerate() {
-            self.page_gpa(first + k as u32).store(gpa, Ordering::Relaxed);
+            self.page_gpa(first + k as u32)
+                .store(gpa, Ordering::Relaxed);
             self.page_gen(first + k as u32).store(0, Ordering::Relaxed);
         }
         let off = self.slot_off(slot);
-        self.u32_at(off + 4).store(page_size as u32, Ordering::Relaxed);
+        self.u32_at(off + 4)
+            .store(page_size as u32, Ordering::Relaxed);
         self.u32_at(off + 8).store(first, Ordering::Relaxed);
         self.u32_at(off + 12).store(count, Ordering::Relaxed);
-        self.u64_at(off + 16).store(self.harvests() + 1, Ordering::Relaxed);
+        self.u64_at(off + 16)
+            .store(self.harvests() + 1, Ordering::Relaxed);
         self.set_gen(slot).store(0, Ordering::Relaxed);
-        self.state(slot).store(wire::DIRTY_PENDING, Ordering::Release);
+        self.state(slot)
+            .store(wire::DIRTY_PENDING, Ordering::Release);
         // DirtyHeader.slots_used: the VMM scans slots below it.
         self.u32_at(44).fetch_max(slot + 1, Ordering::Release);
         let incarnation = a.next_incarnation;
@@ -214,7 +220,8 @@ impl Dirty {
     pub fn untrack(&self, token: u64) {
         let mut a = self.alloc.lock().unwrap();
         if let Some(slot) = Self::live_slot(&a, token) {
-            self.state(slot).store(wire::DIRTY_RELEASING, Ordering::Release);
+            self.state(slot)
+                .store(wire::DIRTY_RELEASING, Ordering::Release);
             a.own[slot as usize] = Own::Releasing;
         }
     }
@@ -234,7 +241,9 @@ impl Dirty {
     pub fn written_since(&self, token: u64, since: u64, out: &mut [u64]) -> i64 {
         let a = self.alloc.lock().unwrap();
         self.note_read();
-        let Some(slot) = Self::live_slot(&a, token) else { return -1 };
+        let Some(slot) = Self::live_slot(&a, token) else {
+            return -1;
+        };
         if since == 0 || self.set_gen(slot).load(Ordering::Acquire) == 0 {
             return -1;
         }
@@ -258,7 +267,8 @@ impl Dirty {
         let mut a = self.alloc.lock().unwrap();
         for i in 0..NR_SLOTS {
             if let Own::Live { .. } = a.own[i as usize] {
-                self.state(i).store(wire::DIRTY_RELEASING, Ordering::Release);
+                self.state(i)
+                    .store(wire::DIRTY_RELEASING, Ordering::Release);
                 a.own[i as usize] = Own::Releasing;
             }
         }

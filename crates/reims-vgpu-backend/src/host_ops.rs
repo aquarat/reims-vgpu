@@ -140,7 +140,9 @@ unsafe extern "C" fn read_kva(_ctx: *mut c_void, kva: u64, buf: *mut u8, len: us
         let ram = backend.ram.read().unwrap();
         let mut done = 0usize;
         while done < len {
-            let Some((pa, avail)) = call.translate(kva + done as u64) else { return -1 };
+            let Some((pa, avail)) = call.translate(kva + done as u64) else {
+                return -1;
+            };
             let n = (avail as usize).min(len - done);
             // SAFETY: caller passes a valid buffer of len bytes.
             let dst = unsafe { std::slice::from_raw_parts_mut(buf.add(done), n) };
@@ -225,7 +227,11 @@ unsafe extern "C" fn is_ram_gpa(ctx: *mut c_void, gpa: u64) -> i32 {
     i32::from(be(ctx).ram.read().unwrap().is_ram(gpa))
 }
 
-unsafe extern "C" fn guest_ram_regions(ctx: *mut c_void, out: *mut GuestRamRegion, max: usize) -> i32 {
+unsafe extern "C" fn guest_ram_regions(
+    ctx: *mut c_void,
+    out: *mut GuestRamRegion,
+    max: usize,
+) -> i32 {
     const ERR_ARGS: i32 = -1;
     const ERR_NO_RAM: i32 = -2;
     if out.is_null() || max == 0 {
@@ -249,7 +255,12 @@ unsafe extern "C" fn guest_ram_regions(ctx: *mut c_void, out: *mut GuestRamRegio
     regions.len() as i32
 }
 
-unsafe extern "C" fn track_guest_writes(ctx: *mut c_void, gpas: *const u64, count: usize, page_size: usize) -> u64 {
+unsafe extern "C" fn track_guest_writes(
+    ctx: *mut c_void,
+    gpas: *const u64,
+    count: usize,
+    page_size: usize,
+) -> u64 {
     if gpas.is_null() || count == 0 {
         return 0;
     }
