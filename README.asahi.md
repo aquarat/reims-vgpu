@@ -105,8 +105,9 @@ most once per refresh interval per surface, holding its channel's later
 completion words in order. A headless guest's other compositors — a sleeping
 display's, the iOS simulator's — otherwise redraw as fast as the guest's CPU
 allows. The simulator's queues dozens of frames ahead, so pacing it makes the
-channel's completions trail by up to about a second; on simulator benchmarks
-that saved unit-test time and cost about 10 % of UI-test time.
+channel's completions trail by up to about a second. On the simulator
+unit-test benchmark it made no clear difference (161.7–166.8 s paced, against
+157.8 and 163.6 s), and it cost about 10 % of UI-test time, so it stays off.
 
 ## Performance
 
@@ -122,6 +123,13 @@ this fork at 71029b4d00 with QEMU 6740a49344 (drain on a worker thread):
   dependency-graph compaction); vCPU wait for the device lock 17–19 s per
   session (100–135 s).
 - 5 of 5 sustained stress runs with no guest panic and no host GPU hang.
+
+Out of process (40c5bc1c38 as `reims-vgpu-backend`, QEMU c6d87a8406, Mesa
+with both patches; in production since 2026-10-19): simulator unit tests
+157.8 and 163.6 s against 156.8–158.6 s for the same tree in process (one
+more out-of-process run took 209.7 s, a host-side slowdown that did not
+repeat); the app's suite 690–801 s over three sustained runs with no backend
+loss. A backend killed mid-job fails that job in 2 s with the reason.
 
 Charts, data and method: [PERFORMANCE.md](https://github.com/aquarat/experiment-macos-arm64-on-asahi-linux-arm64/blob/master/docs/PERFORMANCE.md)
 in the host repository.
