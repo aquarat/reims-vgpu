@@ -8,6 +8,8 @@
 //!   (level 0, slice 0, depth 1) via mapping page tables; multi-plane (biplanar)
 //!   sample windows from cached `sIOSurfaceDeviceDescriptor` selected by texture
 //!   geometry (width/height/bpe), not a wire plane index
+//! - **Buffer-backed textures** (texture-view opcode 9 / 0x37) as copy endpoints: one
+//!   linear level over the buffer at the guest's `bytesPerRow`
 //! - **Texture-view texture views** as copy endpoints: unswizzled views over normal-texture
 //!   or mapper-ref-texture bases; multi-level / array / non-2D Metal types when geometry matches
 //!   (mapper-ref-texture bases remain single-level / single-slice — see below)
@@ -43,11 +45,13 @@ use crate::model::DeviceState;
 use crate::protocol::pixel_format::BlitAspect;
 use crate::protocol::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
 use crate::runtime::decode::resource::{
-    decode_buffer_descriptor, decode_iosurface_texture_descriptor, decode_texture_descriptor,
-    decode_texture_view_descriptor, texture_view_type_is_3d, texture_view_type_supported,
+    decode_buffer_descriptor, decode_buffer_texture_descriptor,
+    decode_iosurface_texture_descriptor, decode_texture_descriptor, decode_texture_view_descriptor,
+    texture_view_opcode, texture_view_type_is_3d, texture_view_type_supported,
     texture_view_type_uses_slices, Descriptor as ResourceDescriptor, OBJECT_TYPE_BUFFER,
     OBJECT_TYPE_MAPPER_REF_TEXTURE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
-    OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_VIEW_MTL_TYPE_2D,
+    OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_VIEW_MTL_TYPE_2D, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE,
 };
 use crate::runtime::draw::{self, host_alloc_len};
 use crate::runtime::fence_exec::{self, FenceStatus};
@@ -511,6 +515,100 @@ fn resolve_buffer<M: HostMemory + HostOps>(
     Ok(LinearBuffer { gva, size })
 }
 
+/// The guest bytes of a buffer-backed texture
+/// (`newTextureWithDescriptor:offset:bytesPerRow:` on a buffer, texture-view
+/// opcode 9 or its wide form): one linear level whose rows are `bytesPerRow`
+/// apart, starting `offset` bytes into the buffer.
+///
+/// That is the whole contract, and it is a [`TextureBacking::Linear`] level
+/// over the buffer's allocation, so every rail that takes one (texture to
+/// buffer, buffer to texture, texture to texture) addresses it with no special
+/// case. Rows are read and written at the guest's pitch; the alignment the
+/// guest held them to (device-info keys 13 and 40) is not this rail's concern.
+///
+/// The reading rules are the draw and compute twins': a declared
+/// `bytesPerRow` of 0 is tight rows, and a pitch shorter than one row of
+/// texels is refused. Metal makes these textures single-level, single-sample,
+/// uncompressed and one slice deep, so anything else is refused by name
+/// rather than given a layout this device would be inventing. The span the
+/// rows occupy must lie inside the buffer: a copy past its end would read or
+/// write whatever the guest keeps after it.
+fn resolve_buffer_texture_backing<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    bytes: &[u8],
+    level: u16,
+    slice: u16,
+) -> Result<TextureBacking, BlitStatus> {
+    let Ok(bt) = decode_buffer_texture_descriptor(bytes) else {
+        return Err(br(BlitFailure::MissingResource, "buftex_desc_decode"));
+    };
+    let desc = &bt.desc;
+    if level != 0 || slice != 0 {
+        return Err(br(BlitFailure::Bounds, "buftex_level_or_slice"));
+    }
+    if desc.mipmap_level_count > 1
+        || desc.sample_count > 1
+        || desc.array_length > 1
+        || desc.depth > 1
+    {
+        return Err(br(BlitFailure::Unsupported, "buftex_shape"));
+    }
+    if desc.width == 0 || desc.height == 0 {
+        return Err(br(BlitFailure::Bounds, "buftex_zero_geom"));
+    }
+    let Some(block) = pixel_format::block_geometry(desc.pixel_format) else {
+        return Err(br(BlitFailure::Unsupported, "buftex_bad_bpp"));
+    };
+    if block.is_compressed() {
+        return Err(br(BlitFailure::Unsupported, "buftex_compressed"));
+    }
+    let Some(tight) = pixel_format::tight_row_bytes(desc.width, desc.pixel_format) else {
+        return Err(br(BlitFailure::Unsupported, "buftex_bad_bpp"));
+    };
+    let tight = u64::from(tight);
+    let row_stride = if bt.bytes_per_row == 0 {
+        tight
+    } else {
+        bt.bytes_per_row
+    };
+    if row_stride < tight {
+        return Err(br(BlitFailure::Bounds, "buftex_bpr_short"));
+    }
+    // The buffer owns the storage, and a debt may be armed under its name as
+    // well as the texture's (the caller paid the texture's).
+    crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, bt.buffer_ref);
+    let buffer = resolve_buffer(state, host, task_id, bt.buffer_ref)?;
+    let end = row_stride
+        .checked_mul(u64::from(desc.height) - 1)
+        .and_then(|v| v.checked_add(tight))
+        .and_then(|v| v.checked_add(bt.offset))
+        .ok_or_else(|| br(BlitFailure::Capacity, "buftex_span_overflow"))?;
+    if end > buffer.size {
+        crate::observe::fail(format!(
+            "blit buftex span_oob ref={texture_ref} buf={} off={} bpr={row_stride} {}x{} end={end} size={}",
+            bt.buffer_ref, bt.offset, desc.width, desc.height, buffer.size
+        ));
+        return Err(br(BlitFailure::Bounds, "buftex_span_oob"));
+    }
+    Ok(TextureBacking::Linear(LinearTextureLevel {
+        base_gva: buffer.gva,
+        alloc_size: buffer.size,
+        level_offset: bt.offset,
+        row_stride,
+        block,
+        slice_stride: 0,
+        slice_index: 0,
+        width: desc.width,
+        height: desc.height,
+        depth: 1,
+        bpp: block.bytes,
+        pixel_format: desc.pixel_format,
+    }))
+}
+
 fn resolve_texture_backing<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -601,6 +699,24 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                 crate::observe::ladder_slug!("view", desc_read),
             ));
         };
+        // A buffer-backed texture shares this object type but is not a view of
+        // a texture: it is a view of a buffer's bytes, and its record has no
+        // base texture to follow. It was decoded as a view anyway, refused as
+        // `view_desc_decode`, and every blit naming one failed.
+        if matches!(
+            texture_view_opcode(&bytes),
+            Some(TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE | TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE_WIDE)
+        ) {
+            return resolve_buffer_texture_backing(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                &bytes,
+                level,
+                slice,
+            );
+        }
         let Ok(view) = decode_texture_view_descriptor(&bytes) else {
             return Err(br(
                 BlitFailure::MissingResource,

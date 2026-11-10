@@ -3240,3 +3240,245 @@ fn the_gpu_whole_plane_arm_compares_stored_texels_and_not_transfer_functions() {
         "three agreeing formats with no stored-texel layout are still not a byte copy"
     );
 }
+
+/// Install a buffer-backed texture: the 64-byte opcode-9 record
+/// (`newTextureWithDescriptor:offset:bytesPerRow:` on buffer `buffer_ref`), laid out
+/// as the live captures in `decodes_opcode9_buffer_texture_live_blobs` are.
+fn install_buffer_texture(
+    host: &mut FakeHost,
+    state: &mut DeviceState,
+    tex_ref: u32,
+    buffer_ref: u32,
+    offset: u64,
+    bytes_per_row: u64,
+    width: u32,
+    height: u32,
+    pixel_format: u16,
+) {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_TEXTURE_VIEW, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
+    };
+    let mut d = vec![0u8; 64];
+    st32(&mut d[0..], TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE);
+    st32(&mut d[4..], 64);
+    st32(&mut d[8..], tex_ref);
+    st32(&mut d[12..], buffer_ref);
+    st64(&mut d[16..], offset);
+    st64(&mut d[24..], bytes_per_row);
+    // Packed: pixel format, usage ShaderRead, 2D with GPU-optimized contents.
+    st32(
+        &mut d[32..],
+        (u32::from(pixel_format) << 16) | (0x01 << 8) | 0x42,
+    );
+    st32(&mut d[36..], width);
+    st32(&mut d[40..], height);
+    st32(&mut d[44..], 1); // depth
+    st16(&mut d[48..], 1); // mipmap levels
+    st16(&mut d[50..], 1); // samples
+    st16(&mut d[52..], 1); // array length
+    let desc_gva = 0x280u64 + u64::from(tex_ref) * 0x40;
+    write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &d);
+    write_list_entry(
+        host,
+        state,
+        tex_ref,
+        OBJECT_TYPE_TEXTURE_VIEW as u32,
+        64,
+        desc_gva,
+    );
+}
+
+/// The row pitches the guest-side probe drives: tight and padded 256, and the
+/// 16-aligned 80 and 64 a 256-byte linear-texture alignment used to refuse.
+const BUFFER_TEXTURE_PITCHES: [(u32, u64); 4] = [(64, 256), (20, 256), (20, 80), (16, 64)];
+
+/// A blit out of a buffer-backed texture reads its texels at the guest's pitch,
+/// from `offset` into the buffer, and none of the padding between rows.
+///
+/// It was refused as `view_desc_decode` at every pitch: the record shares the
+/// texture-view object type and was decoded as a view of a texture. The
+/// pattern runs through the padding too, so a copy that read at the wrong
+/// pitch, or folded padding in, lands different bytes.
+#[test]
+fn a_blit_out_of_a_buffer_texture_reads_rows_at_the_guests_pitch() {
+    for (width, bpr) in BUFFER_TEXTURE_PITCHES {
+        let (mut host, mut state) = blit_device();
+        let (height, offset) = (8u32, 0x40u64);
+        install_buffer(&mut host, &mut state, 1, 1, 4096);
+        install_buffer(&mut host, &mut state, 2, 2, 4096);
+        install_buffer_texture(
+            &mut host,
+            &mut state,
+            3,
+            1,
+            offset,
+            bpr,
+            width,
+            height,
+            MTL_FORMAT_RGBA8_UNORM,
+        );
+        let span = offset + bpr * u64::from(height);
+        let src: Vec<u8> = (0..span).map(|i| (i * 7 + 3) as u8).collect();
+        write_task_gva_arm64e(
+            &mut host,
+            &state.tasks[1],
+            1u64 << RESOURCE_PAGE_SHIFT,
+            &src,
+        );
+
+        let tight = u64::from(width) * 4;
+        let mut cmd = t2b(3, 2);
+        cmd.size = Size {
+            width: u64::from(width),
+            height: u64::from(height),
+            depth: 1,
+        };
+        cmd.bytes_per_row = tight;
+        assert_eq!(
+            execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureToBuffer(cmd)),
+            BlitStatus::Ok,
+            "{width}x{height} at pitch {bpr}"
+        );
+        let mut out = vec![0u8; (tight * u64::from(height)) as usize];
+        assert!(gva_mem::read_task_gva(
+            &host,
+            &state.tasks[1],
+            2u64 << RESOURCE_PAGE_SHIFT,
+            &mut out,
+            PAGE_SHIFT_ARM64E
+        )
+        .is_ok());
+        for y in 0..u64::from(height) {
+            let want = &src[(offset + y * bpr) as usize..(offset + y * bpr + tight) as usize];
+            let got = &out[(y * tight) as usize..((y + 1) * tight) as usize];
+            assert_eq!(got, want, "row {y} of {width}x{height} at pitch {bpr}");
+        }
+    }
+}
+
+/// A blit into a buffer-backed texture writes the buffer's bytes at the
+/// guest's pitch and leaves the padding between rows as it was.
+#[test]
+fn a_blit_into_a_buffer_texture_writes_rows_at_the_guests_pitch() {
+    for (width, bpr) in BUFFER_TEXTURE_PITCHES {
+        let (mut host, mut state) = blit_device();
+        let height = 8u32;
+        install_buffer(&mut host, &mut state, 1, 1, 4096);
+        install_buffer(&mut host, &mut state, 2, 2, 4096);
+        install_buffer_texture(
+            &mut host,
+            &mut state,
+            3,
+            1,
+            0,
+            bpr,
+            width,
+            height,
+            MTL_FORMAT_RGBA8_UNORM,
+        );
+        let tight = u64::from(width) * 4;
+        let before = vec![0xeeu8; (bpr * u64::from(height)) as usize];
+        write_task_gva_arm64e(
+            &mut host,
+            &state.tasks[1],
+            1u64 << RESOURCE_PAGE_SHIFT,
+            &before,
+        );
+        let src: Vec<u8> = (0..tight * u64::from(height))
+            .map(|i| (i * 5 + 1) as u8)
+            .collect();
+        write_task_gva_arm64e(
+            &mut host,
+            &state.tasks[1],
+            2u64 << RESOURCE_PAGE_SHIFT,
+            &src,
+        );
+
+        let mut cmd = b2t(2, 3);
+        cmd.bytes_per_row = tight;
+        cmd.size = Size {
+            width: u64::from(width),
+            height: u64::from(height),
+            depth: 1,
+        };
+        assert_eq!(
+            execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
+            BlitStatus::Ok,
+            "{width}x{height} at pitch {bpr}"
+        );
+        let mut out = vec![0u8; before.len()];
+        assert!(gva_mem::read_task_gva(
+            &host,
+            &state.tasks[1],
+            1u64 << RESOURCE_PAGE_SHIFT,
+            &mut out,
+            PAGE_SHIFT_ARM64E
+        )
+        .is_ok());
+        for y in 0..u64::from(height) {
+            let row = &out[(y * bpr) as usize..((y + 1) * bpr) as usize];
+            let want = &src[(y * tight) as usize..((y + 1) * tight) as usize];
+            assert_eq!(&row[..tight as usize], want, "row {y} at pitch {bpr}");
+            assert!(
+                row[tight as usize..].iter().all(|&b| b == 0xee),
+                "padding of row {y} at pitch {bpr} was written"
+            );
+        }
+    }
+}
+
+/// What a buffer-backed texture cannot be is refused by name: rows that run
+/// past the end of the buffer, a pitch shorter than a row, and any level or
+/// slice but the one it has.
+#[test]
+fn a_buffer_texture_the_buffer_cannot_hold_is_refused_by_name() {
+    let refused = |bpr: u64, buffer_size: u64, level: u16| {
+        let (mut host, mut state) = blit_device();
+        install_buffer(&mut host, &mut state, 1, 1, buffer_size);
+        install_buffer(&mut host, &mut state, 2, 2, 4096);
+        install_buffer_texture(
+            &mut host,
+            &mut state,
+            3,
+            1,
+            0,
+            bpr,
+            20,
+            8,
+            MTL_FORMAT_RGBA8_UNORM,
+        );
+        let mut cmd = t2b(3, 2);
+        cmd.source.level = level;
+        cmd.size = Size {
+            width: 20,
+            height: 8,
+            depth: 1,
+        };
+        cmd.bytes_per_row = 80;
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureToBuffer(cmd))
+    };
+    // 7 rows of 80 plus one of 80 is 640 bytes; a 600-byte buffer ends inside
+    // the last row.
+    assert_eq!(
+        refused(80, 600, 0),
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "buftex_span_oob",
+        }
+    );
+    assert_eq!(refused(80, 640, 0), BlitStatus::Ok);
+    assert_eq!(
+        refused(64, 4096, 0),
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "buftex_bpr_short",
+        }
+    );
+    assert_eq!(
+        refused(80, 4096, 1),
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "buftex_level_or_slice",
+        }
+    );
+}
