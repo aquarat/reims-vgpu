@@ -52,7 +52,11 @@ side (kernel patches, images, runners) is in
 - Rendering on macOS 26: render pipelines with no fragment function (Skia's
   stencil passes), a slot's type checked before it is asked for a texture
   view, and metal2vulkan's byte-record attribute loads, so Compose/Skia
-  apps draw their real UI.
+  apps draw their real UI. The linear-texture alignment (device-info keys
+  13 and 40) is served as Apple's 16 bytes instead of 256, so the guest's
+  Metal validation stops aborting `iconservicesagent` in a loop
+  ([found](https://github.com/aquarat/apple-macos-arm64-vm-guest/issues/1)
+  by Izzy Mansurov, sapoepsilon).
 - Out of process: `reims-vgpu-backend`, the device as its own program,
   serving QEMU's `apv-gpu-proxy` device over a unix socket, shared memory
   and eventfds; the hot register words in memory both processes map; a

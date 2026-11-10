@@ -1168,13 +1168,49 @@ pub const DEVICE_INFO_KEY_RGB10A2_GAMMA: u32 = 8;
 /// **Arithmetic, not a boolean.** The guest computes with this number; absent,
 /// it uses 16. Whatever this device publishes is what the guest's rows are laid
 /// out on, so it is a promise about what this device can address rather than a
-/// capability it can decline later.
+/// capability it can decline later. Served as [`DEVICE_INFO_LINEAR_TEXTURE_ALIGN`];
+/// that constant's doc says why it is 16 and not the 256 this table once held.
 ///
 /// Distinct from [`crate::protocol::iosurface_pages::ROW_BYTES_ALIGN`], which is
 /// an IOSurface row estimate for counting pages and is deliberately not a pitch.
 /// Do not relate the two: one is Metal's linear-texture rule and the other is
 /// IOSurface's allocator, and nothing says they are the same number.
 pub const DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN: u32 = 13;
+
+/// The value served for [`DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN`] and
+/// [`DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN`]: 16 bytes.
+///
+/// # Why 16
+///
+/// It is the guest's own answer when the key is absent, and what an Apple GPU
+/// reports for `linearTextureAlignmentBytes` and
+/// `minimumLinearTextureAlignmentForPixelFormat:`. The guest's Metal framework
+/// checks every `newTextureWithDescriptor:offset:bytesPerRow:` against the
+/// alignment this device publishes, and the clients that make such textures lay
+/// their rows out on Apple's 16, not on whatever this device says. The table
+/// held 256 here (a value from the first live capture, kept by the naming
+/// pass because it "is an alignment"), and on a macOS 26 guest that is a crash:
+/// `iconservicesagent` aborts in a loop in `_mtlValidateStrideTextureParameters`
+/// (from `-[IOGPUMetalTexture initWithBuffer:...]` via RenderBox), so app icons
+/// never load. Reported by Izzy Mansurov (sapoepsilon) in
+/// <https://github.com/aquarat/apple-macos-arm64-vm-guest/issues/1>.
+///
+/// # Why this device can serve it
+///
+/// Nothing here addresses a buffer-backed texture at the guest's pitch: the
+/// Vulkan rail de-pitches its rows into an image (`stage_buffer_texture`,
+/// `load_buffer_texture_rgba`) for any `bytesPerRow`, and the zero-copy linear
+/// imports compare the driver's pitch with the guest's and decline by name
+/// (`row_pitch_mismatch`) when they differ. 16 is also a multiple of every
+/// uncompressed texel size Metal has, so a 16-aligned row is a whole number of
+/// texels.
+pub const DEVICE_INFO_LINEAR_TEXTURE_ALIGN: u32 = 16;
+
+const _: () = assert!(
+    DEVICE_INFO_LINEAR_TEXTURE_ALIGN.is_power_of_two() && DEVICE_INFO_LINEAR_TEXTURE_ALIGN <= 16,
+    "a linear-texture alignment above the guest's own 16 makes the guest's Metal validation \
+     abort clients that lay rows out on Apple's rule"
+);
 
 /// Wire key 14 — one of the three terms of the guest's `supportsHeaps`.
 ///
@@ -1417,7 +1453,7 @@ pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u3
 /// The names below are decoded from the guests' own walkers and cross-checked
 /// against six values in this table that are self-describing under that reading
 /// (key 18 `0x20007` a packed 2.7, key 28 `7` exactly three declared bits, key
-/// 33 `4095` exactly twelve, key 37 `1009` an `MTLGPUFamily`, key 40 `256` an
+/// 33 `4095` exactly twelve, key 37 `1009` an `MTLGPUFamily`, key 40 an
 /// alignment, key 41 `7` three rounding modes).
 ///
 /// **Key 0 is not a key.** It terminates the walk and discards every remaining
@@ -1447,7 +1483,10 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
         crate::protocol::draw::EXECUTABLE_PRIMITIVE_TYPES,
     ),
     (DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES, 1),
-    (DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN, 256),
+    (
+        DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN,
+        DEVICE_INFO_LINEAR_TEXTURE_ALIGN,
+    ),
     (DEVICE_INFO_KEY_HEAPS, 1),
     (DEVICE_INFO_KEY_HEAP_BUFFER_GRANULARITY, 32),
     (DEVICE_INFO_KEY_HEAP_TEXTURES, 1),
@@ -1470,7 +1509,10 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (DEVICE_INFO_KEY_MAX_TEXTURE_LAYERS, 2048),
     (DEVICE_INFO_KEY_MAX_PREDICATED_NESTING, 16),
     (DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED, DEVICE_INFO_GPU_FAMILY),
-    (DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN, 256),
+    (
+        DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN,
+        DEVICE_INFO_LINEAR_TEXTURE_ALIGN,
+    ),
     (DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING, 7),
     (DEVICE_INFO_KEY_SUPPORT_FLAGS_2025, 2),
     (
@@ -1560,6 +1602,10 @@ pub const DEVICE_INFO_KEY_MAX_PREDICATED_NESTING: u32 = 36;
 pub const DEVICE_INFO_KEY_GPU_FAMILY_CLAMPED: u32 = 37;
 pub const DEVICE_INFO_KEY_ARGUMENT_BUFFERS_TIER: u32 = 38;
 pub const DEVICE_INFO_KEY_ARGUMENT_BUFFERS_MAX_SAMPLERS: u32 = 39;
+/// Wire key 40 — `minimumLinearTextureAlignmentForPixelFormat:`'s floor, the
+/// alignment the guest's Metal validation holds a buffer-backed texture's
+/// offset and `bytesPerRow` to. Served as [`DEVICE_INFO_LINEAR_TEXTURE_ALIGN`],
+/// like key 13. Reaches macOS 15 and newer (their parse ceilings are above 40).
 pub const DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN: u32 = 40;
 pub const DEVICE_INFO_KEY_TEXTURE_WRITE_ROUNDING: u32 = 41;
 /// Bit 0 `IndirectCommandBuffers`, bit 1 `ArgumentBuffers2025`, bit 2
@@ -1936,6 +1982,36 @@ mod tests {
         for &(key, _) in DEVICE_INFO_CAPS {
             assert_ne!(key, 0, "key 0 ends the guest's walk; it cannot be an entry");
             assert!(seen.insert(key), "key {key} appears twice");
+        }
+    }
+
+    /// Both linear-texture alignments reach the guest as Apple's 16, on any
+    /// host, at any protocol version.
+    ///
+    /// The guest's Metal validation aborts a client whose buffer-backed texture
+    /// rows are not a multiple of what this device publishes, and macOS's own
+    /// clients lay them out on 16 (`iconservicesagent` crash-looped on 256).
+    /// The `const` assertion binds the constant; this binds what is served, so a
+    /// later host reduction or a second literal in the table cannot reintroduce
+    /// a larger value.
+    #[test]
+    fn linear_texture_alignments_are_served_as_apples_16() {
+        let floor = DeviceInfoLimits {
+            max_sample_count: 1,
+            d24_stencil8: false,
+            max_threads_per_threadgroup: [128, 128, 64],
+            max_threadgroup_memory_bytes: 16384,
+            native_fp16: false,
+        };
+        for version in [0, VERSION_WITH_DUAL_PLANE] {
+            let served: std::collections::BTreeMap<u32, u32> =
+                device_info_caps(&floor, version).into_iter().collect();
+            for key in [
+                DEVICE_INFO_KEY_LINEAR_TEXTURE_ALIGN,
+                DEVICE_INFO_KEY_MIN_LINEAR_TEXTURE_ALIGN,
+            ] {
+                assert_eq!(served[&key], 16, "key {key} at version {version}");
+            }
         }
     }
 
