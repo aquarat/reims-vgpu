@@ -3988,6 +3988,9 @@ unsafe fn plan_guest_copy(
                     }),
                 scatter,
             }
+        } else if let Some(plan) = plan_padded_guest_scatter(ctx, pools, counters, dst)? {
+            counters.guest_write_padded.fetch_add(1, Ordering::Relaxed);
+            plan
         } else {
             let plan = GuestCopyPlan::Rectangles(plan_guest_copies(ctx, pools, dst)?);
             counters.guest_write_rects.fetch_add(1, Ordering::Relaxed);
@@ -4252,11 +4255,17 @@ pub fn probe_guest_backed_target(
 enum GuestCopyPlan {
     /// Straight from the image into guest RAM, as image-copy rectangles.
     ///
-    /// The only form that can express "write these texels and not the padding
-    /// between their rows", which is why a padded window must take it.
+    /// The transfer-only form that can express "write these texels and not the
+    /// padding between their rows". A padded window takes it only when the
+    /// padded scatter ([`plan_padded_guest_scatter`]) cannot express a run:
+    /// on Honeykrisp every rectangle is a dispatch of its own.
     Rectangles(Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>),
     /// Detile the whole frame once into a device-local scratch, then scatter
     /// it with plain byte ranges.
+    ///
+    /// A dense window is detiled tightly packed and scattered one range per
+    /// stretch. A padded one is detiled at the guest's pitch and scattered one
+    /// range per row part, so its padding is neither read nor written.
     ///
     /// # Why the extra hop is cheaper than the copy it removes
     ///
@@ -4461,11 +4470,11 @@ unsafe fn plan_guest_scatter_dispatches(
     dst: &GuestPageTarget,
     scratch: &pools::BufferSlot,
 ) -> Result<Option<Vec<ScatterGroup>>, DrawError> {
-    use guest_scatter::{build_run_tables, ScatterRun};
+    use guest_scatter::ScatterRun;
     use host_ram::GuestWriteDecline;
-    let Some(pipeline) = (unsafe { pools.scatter_pipeline(ctx) }) else {
+    if unsafe { pools.scatter_pipeline(ctx) }.is_none() {
         return Ok(None);
-    };
+    }
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ScatterRun>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
@@ -4482,11 +4491,166 @@ unsafe fn plan_guest_scatter_dispatches(
             },
         );
     }
+    unsafe { scatter_groups(ctx, pools, counters, &grouped, dst.window_bytes(), scratch) }
+}
+
+/// Every texel byte of a padded window, as scatter runs that skip the padding.
+///
+/// The padded counterpart of the one-run-per-stretch table the dense path
+/// builds: each guest stretch is cut at row boundaries, and only the part of
+/// each row that holds texels becomes a run. The scratch it reads is detiled at
+/// the guest's own pitch (`bufferRowLength = row_length_texels`), so window
+/// byte `o` sits at scratch byte `o` and every run's source is its window
+/// offset — the same identity the dense path relies on, with the padding left
+/// out on both sides rather than written.
+///
+/// # Why this replaces the rectangles on a padded window
+///
+/// The rectangle plan gives the driver one `VkBufferImageCopy` per part row and
+/// per block of whole rows inside each 16 KiB stretch — ~3 000 for an
+/// iPhone-sized surface. Honeykrisp runs every region as its own compute
+/// dispatch with its own image view: on the M1 Max that is 12.7 ms of GPU time
+/// and 4.1 ms of recording for one 1206x2622 frame, against 0.23 ms for the
+/// same bytes as one region. A surface written back at 60 Hz that way
+/// saturates the GPU, and with guest RAM imported as dma-bufs every compute
+/// output and render target landing in guest pages takes that path. The run
+/// table is one dispatch however many rows it holds.
+///
+/// Pure, so the planner's arithmetic is testable without a device. Runs are
+/// returned in window order.
+fn padded_window_runs(
+    pitch: u64,
+    row_bytes: u64,
+    extent_end: u64,
+    start: u64,
+    end: u64,
+) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    if pitch == 0 || row_bytes == 0 {
+        return out;
+    }
+    let end = end.min(extent_end);
+    let mut row = start / pitch;
+    loop {
+        let row_start = row * pitch;
+        if row_start >= end {
+            break;
+        }
+        let from = start.max(row_start);
+        let to = end.min(row_start + row_bytes);
+        if from < to {
+            out.push((from, to - from));
+        }
+        row += 1;
+    }
+    out
+}
+
+/// Plan a padded window as one detile at the guest's pitch and one scatter
+/// dispatch per destination buffer, or `Ok(None)` when it has to take the
+/// rectangles.
+///
+/// `Ok(None)` is a routing answer: [`plan_guest_copies`] lands the identical
+/// bytes. It is decided before the scratch is taken, so a declined plan does
+/// not hold a gather slot until its submission retires.
+unsafe fn plan_padded_guest_scatter(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    dst: &GuestPageTarget,
+) -> Result<Option<GuestCopyPlan>, DrawError> {
+    use guest_scatter::{ScatterRun, SCATTER_WORD};
+    use host_ram::GuestWriteDecline;
+    if !compute_scatter_enabled() || unsafe { pools.scatter_pipeline(ctx) }.is_none() {
+        return Ok(None);
+    }
+    let pitch = dst.pitch_bytes();
+    // `bufferRowLength` is in texels, so a pitch that is not a whole number of
+    // texels cannot be detiled at the guest's own layout.
+    if !pitch.is_multiple_of(dst.bytes_per_texel()) {
+        return Ok(None);
+    }
+    let row_bytes = u64::from(dst.width) * dst.bytes_per_texel();
+    let extent_end = dst.extent_end();
+    let mut grouped: Vec<(ash::vk::Buffer, Vec<ScatterRun>)> = Vec::new();
+    for run in &dst.runs {
+        let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
+            .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
+        let start = run.window_offset;
+        let end = start.saturating_add(run.guest.requested());
+        let base = bound.offset + bound.head;
+        for (from, len) in padded_window_runs(pitch, row_bytes, extent_end, start, end) {
+            // The kernel copies words; a run it cannot express goes to the
+            // rectangles whole, before anything is allocated.
+            if from % SCATTER_WORD != 0
+                || len % SCATTER_WORD != 0
+                || (base + from - start) % SCATTER_WORD != 0
+            {
+                return Ok(None);
+            }
+            group_by_buffer(
+                &mut grouped,
+                bound.buffer,
+                ScatterRun {
+                    src: from,
+                    dst: base + (from - start),
+                    len,
+                },
+            );
+        }
+    }
+    if grouped.is_empty() {
+        return Ok(None);
+    }
+    let scratch = unsafe { pools.acquire_guest_gather(ctx, dst.window_bytes(), counters) }?;
+    let Some(groups) =
+        (unsafe { scatter_groups(ctx, pools, counters, &grouped, dst.window_bytes(), &scratch) }?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(GuestCopyPlan::Linear {
+        scratch: scratch.buffer,
+        // At the guest's pitch, not tightly packed: window byte `o` is scratch
+        // byte `o`, padding included and never read.
+        detile: ash::vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(dst.row_length_texels.max(dst.width))
+            .buffer_image_height(0)
+            .image_subresource(color_subresource_layers())
+            .image_offset(ash::vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(ash::vk::Extent3D {
+                width: dst.width,
+                height: dst.height,
+                depth: 1,
+            }),
+        scatter: ScatterForm::Dispatches(groups),
+    }))
+}
+
+/// Turn grouped scatter runs into run tables, stage them, and allocate one
+/// descriptor set per table, or `Ok(None)` when a run cannot be dispatched.
+///
+/// # Safety
+///
+/// `ctx` must be the device `pools` belongs to; `scratch` must hold at least
+/// `src_have` bytes.
+unsafe fn scatter_groups(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &counters::EngineCounters,
+    grouped: &[(ash::vk::Buffer, Vec<guest_scatter::ScatterRun>)],
+    src_have: u64,
+    scratch: &pools::BufferSlot,
+) -> Result<Option<Vec<ScatterGroup>>, DrawError> {
+    use guest_scatter::build_run_tables;
+    let Some(pipeline) = (unsafe { pools.scatter_pipeline(ctx) }) else {
+        return Ok(None);
+    };
     // Planned for every group before anything is allocated, so a refusal in the
     // last group does not leave the first one's staging slot and descriptor set
     // sitting on the pools for a dispatch that will not be recorded.
     let mut tables = Vec::with_capacity(grouped.len());
-    for (buffer, runs) in &grouped {
+    for (buffer, runs) in grouped {
         match build_run_tables(
             runs,
             ctx.storage_buffer_offset_align,
@@ -4495,7 +4659,7 @@ unsafe fn plan_guest_scatter_dispatches(
             // up to a power-of-two bucket. Both bound the memory soundly; this
             // is the tighter, and it is the one that catches a run reaching past
             // what the detile actually wrote rather than merely past the slot.
-            dst.window_bytes(),
+            src_have,
         ) {
             Ok(built) => tables.extend(built.into_iter().map(|t| (*buffer, t))),
             Err(decline) => {
@@ -6693,5 +6857,70 @@ mod run_table_arena_tests {
         let (packed, places) = pack_run_tables(&[], 256);
         assert!(places.is_empty());
         assert_eq!(packed.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod padded_window_run_tests {
+    use super::padded_window_runs;
+
+    /// An iPhone-sized simulator surface: 1206 texels of 4 bytes in a 4864-byte
+    /// pitch, the shape whose rectangles cost Honeykrisp ~13 ms a frame.
+    const PITCH: u64 = 4864;
+    const ROW: u64 = 1206 * 4;
+    const HEIGHT: u64 = 2622;
+    const EXTENT: u64 = (HEIGHT - 1) * PITCH + ROW;
+
+    /// The texel bytes of `[start, end)` one by one, for comparison.
+    fn texel_bytes(start: u64, end: u64) -> Vec<u64> {
+        (start..end.min(EXTENT))
+            .filter(|o| o % PITCH < ROW)
+            .collect()
+    }
+
+    fn expand(runs: &[(u64, u64)]) -> Vec<u64> {
+        runs.iter()
+            .flat_map(|&(from, len)| from..from + len)
+            .collect()
+    }
+
+    #[test]
+    fn runs_cover_every_texel_byte_of_a_page_run_and_no_padding() {
+        // 16 KiB stretches, as the guest backs a surface, so stretch edges fall
+        // mid-row, mid-padding and on row starts.
+        let page = 16 * 1024;
+        let mut start = 0;
+        let mut all = Vec::new();
+        while start < EXTENT {
+            let end = start + page;
+            let runs = padded_window_runs(PITCH, ROW, EXTENT, start, end);
+            assert_eq!(expand(&runs), texel_bytes(start, end), "stretch at {start}");
+            for &(from, len) in &runs {
+                assert!(len > 0 && from >= start && from + len <= end);
+            }
+            all.extend(runs);
+            start = end;
+        }
+        // Over the whole window: one run per row part, each row's texels once.
+        assert_eq!(expand(&all), texel_bytes(0, EXTENT));
+        assert!(all.len() as u64 >= HEIGHT);
+    }
+
+    #[test]
+    fn a_stretch_inside_one_rows_padding_has_no_runs() {
+        let runs = padded_window_runs(PITCH, ROW, EXTENT, PITCH * 3 + ROW, PITCH * 4);
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn nothing_past_the_last_texel_is_planned() {
+        let runs = padded_window_runs(PITCH, ROW, EXTENT, EXTENT - 8, EXTENT + PITCH);
+        assert_eq!(runs, vec![(EXTENT - 8, 8)]);
+    }
+
+    #[test]
+    fn a_dense_window_is_one_run_per_row_part_with_nothing_skipped() {
+        let runs = padded_window_runs(ROW, ROW, ROW * 4, 100, ROW * 3);
+        assert_eq!(expand(&runs), (100..ROW * 3).collect::<Vec<_>>());
     }
 }

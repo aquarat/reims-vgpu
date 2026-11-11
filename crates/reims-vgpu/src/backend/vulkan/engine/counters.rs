@@ -770,8 +770,19 @@ engine_counters! {
         /// bytes then include padding this copy must not write, and a buffer
         /// copy has no way to skip it.
         guest_write_linear,
+        /// Guest-page writebacks whose rows carry padding that detiled at the
+        /// guest's pitch and scattered only the texel bytes with one dispatch
+        /// per destination buffer. Their region is the detile; their dispatches
+        /// are in `guest_write_dispatches`.
+        ///
+        /// The padded case `guest_write_rects` used to take whole. Read the two
+        /// as a share: a boot on Honeykrisp with guest RAM imported reads ~0
+        /// rectangles, because one rectangle-planned iPhone-sized frame is
+        /// ~3 000 regions and ~13 ms of that GPU's time.
+        guest_write_padded,
         /// Guest-page writebacks that went straight to guest RAM as image-copy
-        /// rectangles, because the window's rows carry padding.
+        /// rectangles, because the window's rows carry padding and the padded
+        /// dispatch above could not express a run (or the scatter is off).
         guest_write_rects,
         /// Copy regions submitted by the two above, summed.
         ///
