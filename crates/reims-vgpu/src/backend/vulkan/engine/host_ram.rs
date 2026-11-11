@@ -54,6 +54,9 @@ pub(crate) struct ImportedHostRam {
     /// Constructed HostOps alias backing this import. RAMBlock imports have no
     /// release; packed aliases are returned only after Vulkan destruction.
     pub alias: Option<(usize, usize)>,
+    /// Bytes this import pins as a udmabuf (the dma-buf rail), released with
+    /// the memory; 0 on the host-pointer rail.
+    pub pinned: u64,
 }
 
 impl ImportedHostRam {
@@ -69,6 +72,9 @@ impl ImportedHostRam {
         unsafe {
             device.destroy_buffer(self.buffer, None);
             device.free_memory(self.memory, None);
+        }
+        if self.pinned != 0 {
+            crate::runtime::guest_ram::dmabuf::note_pinned(-(self.pinned as i64));
         }
         if let Some(alias) = self.alias {
             super::release_host_alias(alias);
@@ -131,6 +137,12 @@ pub enum HostRamDecline {
     /// The reference did not survive its own bound. Carries the check that
     /// refused, from [`crate::runtime::guest_ram`].
     Bound { inner: GuestRamError },
+    /// The dma-buf rail: the process's source would not make a dma-buf of this
+    /// range (limits, not guest RAM, the kernel). Carries its refusal.
+    DmaBufSource {
+        host_base: usize,
+        refusal: crate::runtime::guest_ram::dmabuf::DmaBufRefusal,
+    },
 }
 
 impl Decline for HostRamDecline {
@@ -147,6 +159,7 @@ impl Decline for HostRamDecline {
             // The inner check is the diagnosis. Forwarding rather than adding a
             // slug keeps one name per check across the two modules.
             Self::Bound { inner } => inner.slug(),
+            Self::DmaBufSource { refusal, .. } => refusal.slug(),
         }
     }
 
@@ -195,6 +208,23 @@ impl Decline for HostRamDecline {
                 ("available", available.to_string()),
             ],
             Self::Bound { inner } => inner.fields(),
+            Self::DmaBufSource { host_base, refusal } => {
+                use crate::runtime::guest_ram::dmabuf::DmaBufRefusal as R;
+                let mut fields = vec![("host_base", format!("{host_base:#x}"))];
+                match refusal {
+                    R::OverSizeLimit { len, limit } => {
+                        fields.push(("len", len.to_string()));
+                        fields.push(("limit", limit.to_string()));
+                    }
+                    R::OverListLimit { runs, limit } => {
+                        fields.push(("runs", runs.to_string()));
+                        fields.push(("limit", limit.to_string()));
+                    }
+                    R::Kernel { errno } => fields.push(("errno", errno.to_string())),
+                    R::NotGuestRam | R::Unaligned => {}
+                }
+                fields
+            }
         }
     }
 }
@@ -477,6 +507,9 @@ unsafe fn import_ramblock(
     use std::time::Instant;
 
     let Some(loader) = ctx.external_memory_host.as_ref() else {
+        if let Some(fd_loader) = ctx.external_memory_fd.as_ref() {
+            return unsafe { import_dmabuf(ctx, fd_loader, import) };
+        }
         return Err(HostRamDecline::Unsupported {
             rung: ctx.caps.host_pointer.rung,
         });
@@ -581,6 +614,7 @@ unsafe fn import_ramblock(
                     host_base,
                     usize::try_from(size).expect("host allocation size fits this process"),
                 )),
+                pinned: 0,
             }),
             Err(result) => {
                 // Freeing the memory is what ends the GPU's access to the
@@ -610,6 +644,165 @@ unsafe fn import_ramblock(
         bound.is_ok(),
     ));
     bound
+}
+
+/// [`import_ramblock`] on the dma-buf rail: the process's source makes a
+/// udmabuf of exactly the import's host range (pinning its pages), and the
+/// device imports it with `VK_EXT_external_memory_dma_buf`. Everything after the
+/// import is the host-pointer rail's: one `VkBuffer` over the whole span, the
+/// same memory-type selector, the same bound.
+///
+/// # Safety
+///
+/// `fd_loader` must be the device's own `VK_KHR_external_memory_fd` entry
+/// points, loaded because [`HostGpuCaps::dmabuf_import`] resolved `Supported`.
+///
+/// [`HostGpuCaps::dmabuf_import`]: crate::backend::vulkan::caps::HostGpuCaps::dmabuf_import
+unsafe fn import_dmabuf(
+    ctx: &super::context::DeviceContext,
+    fd_loader: &ash::khr::external_memory_fd::Device,
+    import: &GuestRamImport,
+) -> Result<ImportedHostRam, HostRamDecline> {
+    use crate::backend::vulkan::caps::host_pointer::GUEST_IMPORT_USAGE;
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::time::Instant;
+    const HANDLE_TYPE: vk::ExternalMemoryHandleTypeFlags =
+        vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+
+    let host_base = import.host_base();
+    let size = import.len();
+    let Some(source) = crate::runtime::guest_ram::dmabuf::source() else {
+        return Err(HostRamDecline::Unsupported {
+            rung: ctx.caps.host_pointer.rung,
+        });
+    };
+    let started = Instant::now();
+    let fd = source
+        .dmabuf(host_base, size)
+        .map_err(|refusal| HostRamDecline::DmaBufSource { host_base, refusal })?;
+    let create_us = started.elapsed().as_micros() as u64;
+
+    let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+    // SAFETY: the extension's device-loaded entry point; a live dma-buf fd this
+    // function owns; an out-struct initialized by `default()`.
+    if let Err(result) =
+        unsafe { fd_loader.get_memory_fd_properties(HANDLE_TYPE, fd.as_raw_fd(), &mut fd_props) }
+    {
+        return Err(HostRamDecline::NoImportableMemoryType {
+            host_base,
+            refusal: ImportTypeRefusal::PointerDeclined { result },
+        });
+    }
+    let fd_types = fd_props.memory_type_bits;
+    let req = ctx
+        .caps
+        .memory_request(crate::backend::vulkan::caps::MemoryClass::Upload);
+    let pick = crate::backend::vulkan::caps::memory_topology::select_memory_type(
+        &ctx.memory_properties,
+        fd_types,
+        &req,
+        size,
+        ctx.caps.max_allocation_size,
+    )
+    .map_err(|refusal| HostRamDecline::NoImportableMemoryType {
+        host_base,
+        refusal: ImportTypeRefusal::NoTypeMeetsRequest {
+            pointer_types: fd_types,
+            refusal,
+        },
+    })?;
+    let memory_type_index = pick.index;
+
+    let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(HANDLE_TYPE);
+    let create = vk::BufferCreateInfo::default()
+        .size(size)
+        .usage(GUEST_IMPORT_USAGE)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push_next(&mut external);
+    let buffer = unsafe { ctx.device.create_buffer(&create, None) }
+        .map_err(|result| HostRamDecline::CreateBuffer { result })?;
+
+    let alloc_started = Instant::now();
+    let bound = (|| {
+        let reqs = unsafe { ctx.device.get_buffer_memory_requirements(buffer) };
+        if reqs.size > size {
+            // The dma-buf is exactly the import's pages: a larger requirement
+            // would reach past them.
+            return Err(HostRamDecline::TooSmall {
+                required: reqs.size,
+                available: size,
+            });
+        }
+        if reqs.memory_type_bits & (1u32 << memory_type_index) == 0 {
+            return Err(HostRamDecline::BufferExcludesMemoryType {
+                host_base,
+                picked: memory_type_index,
+                buffer_types: reqs.memory_type_bits,
+            });
+        }
+        let mut fd_import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(HANDLE_TYPE)
+            .fd(fd.as_raw_fd());
+        // Not a dedicated allocation: images that alias guest pages are bound
+        // into this memory too.
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut fd_import);
+        let memory = unsafe { ctx.device.allocate_memory(&allocate, None) }
+            .map_err(|result| HostRamDecline::AllocateMemory { result })?;
+        Ok(memory)
+    })();
+    let memory = match bound {
+        Ok(memory) => {
+            // A successful import owns the fd now; this process must not close
+            // it. The pages stay pinned until the memory is freed.
+            let _ = fd.into_raw_fd();
+            memory
+        }
+        Err(decline) => {
+            unsafe { ctx.device.destroy_buffer(buffer, None) };
+            // Dropping `fd` closes the dma-buf and unpins its pages.
+            drop(fd);
+            crate::observe::off(format!(
+                "dmabuf_import id={} bytes={size} ok=false create_us={create_us} decline={}",
+                import.id().get(),
+                decline.slug()
+            ));
+            return Err(decline);
+        }
+    };
+    let result = match unsafe { ctx.device.bind_buffer_memory(buffer, memory, 0) } {
+        Ok(()) => Ok(ImportedHostRam {
+            buffer,
+            memory,
+            memory_type_index,
+            size,
+            alias: import.gpa_base().is_none().then_some((
+                host_base,
+                usize::try_from(size).expect("host allocation size fits this process"),
+            )),
+            pinned: size,
+        }),
+        Err(result) => {
+            unsafe {
+                ctx.device.free_memory(memory, None);
+                ctx.device.destroy_buffer(buffer, None);
+            }
+            Err(HostRamDecline::BindBuffer { result })
+        }
+    };
+    crate::runtime::guest_ram::dmabuf::note_pinned(if result.is_ok() { size as i64 } else { 0 });
+    crate::observe::off(format!(
+        "dmabuf_import id={} bytes={size} mtype={memory_type_index} heap={} create_us={create_us} \
+         alloc_us={} ok={} pinned_mb={}",
+        import.id().get(),
+        pick.heap_index,
+        alloc_started.elapsed().as_micros() as u64,
+        result.is_ok(),
+        crate::runtime::guest_ram::dmabuf::pinned_bytes() >> 20,
+    ));
+    result
 }
 
 /// A check that stopped GPU-ordered access to the guest's own pages, so the
@@ -832,6 +1025,7 @@ mod tests {
             memory_type_index: 0,
             size: 0x4000,
             alias: Some((0x1000, 0x4000)),
+            pinned: 0,
         };
         let mut imports = HostRamImports::default();
         imports.live.insert(
@@ -885,6 +1079,7 @@ mod tests {
                     memory_type_index: 0,
                     size: 0x4000,
                     alias: Some((0x5000, 0x4000)),
+                    pinned: 0,
                 },
                 child_images: 0,
                 retired: false,

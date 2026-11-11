@@ -46,11 +46,13 @@
 pub mod api_floor;
 pub mod device_features;
 pub mod device_select;
+pub mod dmabuf_import;
 pub mod host_pointer;
 pub mod linear_sampled;
 pub mod linear_target;
 pub mod push_descriptor;
 
+pub(crate) use dmabuf_import::DmaBufImportCaps;
 pub(crate) use host_pointer::{HostPointerCaps, HostPointerImport};
 // Moved to `reims-vgpu-vulkan`, which is the layer the architecture names as
 // the only one that turns host capabilities into placement policy. Re-exported
@@ -105,6 +107,10 @@ pub struct HostGpuCaps {
     /// `runtime::guest_ram_map` through the granularity latch, by the import
     /// site, and by nothing else.
     pub host_pointer: HostPointerCaps,
+    /// Whether guest RAM may instead be imported as dma-bufs (udmabufs over
+    /// the VMM's memfds), for a device without the host-pointer rail. At most
+    /// one of the two rails is available.
+    pub dmabuf_import: DmaBufImportCaps,
     /// Whether descriptor writes may be recorded directly into a command
     /// buffer, and the maximum total descriptors in such a set layout.
     pub push_descriptor: PushDescriptorCaps,
@@ -118,6 +124,33 @@ pub struct HostGpuCaps {
 }
 
 impl HostGpuCaps {
+    /// Whether guest RAM can be imported at all, by either rail. The question
+    /// every zero-copy path asks before reaching for an import.
+    pub fn guest_import_available(&self) -> bool {
+        self.host_pointer.is_available() || self.dmabuf_import.is_available()
+    }
+
+    /// The granularity of the rail in use, or 0 when neither is.
+    pub fn guest_import_granularity(&self) -> u64 {
+        if self.host_pointer.is_available() {
+            self.host_pointer.min_alignment
+        } else if self.dmabuf_import.is_available() {
+            self.dmabuf_import.granularity
+        } else {
+            0
+        }
+    }
+
+    /// The external-memory handle type guest-RAM imports (and the images that
+    /// alias them) are made with on the rail in use.
+    pub fn guest_import_handle_type(&self) -> vk::ExternalMemoryHandleTypeFlags {
+        if self.dmabuf_import.is_available() {
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT
+        } else {
+            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT
+        }
+    }
+
     /// Flags to request for `class` on this device.
     pub fn memory_request(&self, class: MemoryClass) -> memory_topology::MemoryRequest {
         self.memory.topology.request(class)
@@ -129,7 +162,7 @@ impl HostGpuCaps {
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} max_alloc_mb={} push_descriptors={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} host_pointer_import={} host_pointer_align={} host_pointer_heap_mb={} dmabuf_import={} dmabuf_chunk_mb={} max_alloc_mb={} push_descriptors={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
@@ -139,6 +172,8 @@ impl HostGpuCaps {
             self.host_pointer.rung.slug(),
             self.host_pointer.min_alignment,
             self.host_pointer.heap_budget >> 20,
+            self.dmabuf_import.rung.slug(),
+            self.dmabuf_import.span_max >> 20,
             self.max_allocation_size >> 20,
             self.push_descriptor.max_descriptors,
             self.portability_subset,
@@ -166,6 +201,7 @@ mod tests {
                 heap_budget: 8 << 30,
                 span_max: host_pointer::IMPORT_SPAN_CEILING,
             },
+            dmabuf_import: DmaBufImportCaps::default(),
             push_descriptor: PushDescriptorCaps::default(),
             portability_subset: false,
             device_api_version: api,

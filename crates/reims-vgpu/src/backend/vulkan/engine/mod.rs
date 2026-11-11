@@ -1897,7 +1897,7 @@ pub fn write_completion_stamp(
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
-    if !ctx.caps.host_pointer.is_available() {
+    if !ctx.caps.guest_import_available() {
         return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
             rung: ctx.caps.host_pointer.rung,
         }));
@@ -3805,7 +3805,7 @@ pub fn copy_target_to_guest_pages(
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
-    if !ctx.caps.host_pointer.is_available() {
+    if !ctx.caps.guest_import_available() {
         return Err(DrawError::GuestPageWrite(GuestWriteDecline::Unsupported {
             rung: ctx.caps.host_pointer.rung,
         }));
@@ -5053,6 +5053,13 @@ pub fn warm_guest_ram_imports(
     let Some(ctx) = owner.ctx.as_ref() else {
         return (0, 0);
     };
+    // Not on the dma-buf rail: each import there is a udmabuf that pins its
+    // pages, so warming every chunk at the handshake would make all of the
+    // guest's RAM resident at boot. Chunks are imported when a draw first binds
+    // them, and the pinned total is what the GPU has touched.
+    if ctx.caps.dmabuf_import.is_available() {
+        return (0, 0);
+    }
     let mut warmed = 0usize;
     let mut bytes = 0u64;
     for import in imports {

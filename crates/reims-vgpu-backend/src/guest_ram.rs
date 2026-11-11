@@ -6,7 +6,7 @@
 //! shows up here at once, and nothing has to be copied or kept in sync.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Mutex;
 
 use crate::sys;
@@ -30,8 +30,25 @@ unsafe impl Sync for Region {}
 #[derive(Default)]
 pub struct GuestRam {
     regions: Vec<Region>,
-    /// Packed views handed out by map_pages: (address, length).
-    views: Mutex<Vec<(usize, usize)>>,
+    /// Packed views handed out by map_pages.
+    views: Mutex<Vec<View>>,
+}
+
+/// One packed view: its address and length, and the stretches of guest-RAM
+/// files it is made of, in view order.
+struct View {
+    addr: usize,
+    len: usize,
+    runs: Vec<FileRun>,
+}
+
+/// `len` bytes of a guest-RAM file at `offset`. The fd is a region's, and a
+/// region's fd lives for the process (a replaced table is leaked, not closed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileRun {
+    pub fd: RawFd,
+    pub offset: u64,
+    pub len: u64,
 }
 
 impl GuestRam {
@@ -161,6 +178,7 @@ impl GuestRam {
             ));
         }
         let mut i = 0;
+        let mut runs = Vec::new();
         while i < gpas.len() {
             let (fd, foff) = owners[i];
             let mut run = 1;
@@ -187,9 +205,18 @@ impl GuestRam {
                 unsafe { libc::munmap(view, len) };
                 return Err((ALIAS, i as u64, errno));
             }
+            runs.push(FileRun {
+                fd,
+                offset: foff,
+                len: (run * page_us) as u64,
+            });
             i += run;
         }
-        self.views.lock().unwrap().push((view as usize, len));
+        self.views.lock().unwrap().push(View {
+            addr: view as usize,
+            len,
+            runs,
+        });
         Ok(view as *mut u8)
     }
 
@@ -197,10 +224,10 @@ impl GuestRam {
     /// mapping of guest RAM and is left alone.
     pub fn unmap_pages(&self, ptr: *mut u8) {
         let mut views = self.views.lock().unwrap();
-        if let Some(i) = views.iter().position(|&(p, _)| p == ptr as usize) {
-            let (p, len) = views.swap_remove(i);
+        if let Some(i) = views.iter().position(|v| v.addr == ptr as usize) {
+            let v = views.swap_remove(i);
             // SAFETY: a view this type created.
-            unsafe { libc::munmap(p as *mut libc::c_void, len) };
+            unsafe { libc::munmap(v.addr as *mut libc::c_void, v.len) };
         }
     }
 
@@ -208,10 +235,86 @@ impl GuestRam {
     pub fn unmap_all(&self) -> usize {
         let mut views = self.views.lock().unwrap();
         let n = views.len();
-        for (p, len) in views.drain(..) {
+        for v in views.drain(..) {
             // SAFETY: views this type created.
-            unsafe { libc::munmap(p as *mut libc::c_void, len) };
+            unsafe { libc::munmap(v.addr as *mut libc::c_void, v.len) };
         }
         n
+    }
+
+    /// The guest-RAM file stretches behind `[host_va, host_va + len)` of this
+    /// process's view of guest RAM: one stretch inside a region's own mapping,
+    /// or the slice of a packed view's stretches. `None` when the range is in
+    /// neither, or straddles a region's end or a view's end.
+    pub fn file_runs(&self, host_va: usize, len: u64) -> Option<Vec<FileRun>> {
+        if len == 0 {
+            return None;
+        }
+        let end = (host_va as u64).checked_add(len)?;
+        for r in &self.regions {
+            let base = r.hva as u64;
+            if host_va as u64 >= base && end <= base + r.size {
+                return Some(vec![FileRun {
+                    fd: r.fd.as_raw_fd(),
+                    offset: r.fd_offset + (host_va as u64 - base),
+                    len,
+                }]);
+            }
+        }
+        let views = self.views.lock().unwrap();
+        let v = views
+            .iter()
+            .find(|v| host_va >= v.addr && end <= (v.addr + v.len) as u64)?;
+        Some(slice_runs(&v.runs, (host_va - v.addr) as u64, len))
+    }
+}
+
+/// The part of `runs` (laid end to end) covering `[start, start + len)`.
+fn slice_runs(runs: &[FileRun], start: u64, len: u64) -> Vec<FileRun> {
+    let end = start + len;
+    let mut out = Vec::new();
+    let mut at = 0u64;
+    for r in runs {
+        let (lo, hi) = (at, at + r.len);
+        at = hi;
+        if hi <= start || lo >= end {
+            continue;
+        }
+        let from = start.max(lo);
+        let to = end.min(hi);
+        out.push(FileRun {
+            fd: r.fd,
+            offset: r.offset + (from - lo),
+            len: to - from,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(fd: RawFd, offset: u64, len: u64) -> FileRun {
+        FileRun { fd, offset, len }
+    }
+
+    /// A slice of a packed view keeps each stretch's file and moves its offset
+    /// by how far into the stretch the slice begins.
+    #[test]
+    fn a_slice_of_a_view_keeps_files_and_offsets() {
+        let runs = [
+            run(3, 0x10000, 0x8000),
+            run(3, 0x40000, 0x4000),
+            run(4, 0, 0x8000),
+        ];
+        assert_eq!(slice_runs(&runs, 0, 0xc000), runs[..2].to_vec());
+        assert_eq!(slice_runs(&runs, 0, 0x14000), runs.to_vec());
+        assert_eq!(
+            slice_runs(&runs, 0x4000, 0x8000),
+            vec![run(3, 0x14000, 0x4000), run(3, 0x40000, 0x4000)]
+        );
+        assert_eq!(slice_runs(&runs, 0xc000, 0x4000), vec![run(4, 0, 0x4000)]);
+        assert_eq!(slice_runs(&runs, 0x14000, 0x1000), vec![]);
     }
 }

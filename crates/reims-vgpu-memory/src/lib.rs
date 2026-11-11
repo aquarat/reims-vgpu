@@ -72,6 +72,7 @@
 use reims_vgpu_observe::{Decline, Emit};
 use reims_vgpu_protocol::checked::align_up_u64;
 
+pub mod dmabuf;
 pub mod packed;
 pub use packed::{PackedGuestLayout, PackedSegment, WindowRun};
 

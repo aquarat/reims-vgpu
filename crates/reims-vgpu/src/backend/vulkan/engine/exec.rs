@@ -775,7 +775,7 @@ unsafe fn import_guest_buffer_window(
     src: &super::types::GuestRunSource,
     role: BufferGatherRole,
 ) -> Option<BoundBuffer> {
-    if !ctx.caps.host_pointer.is_available() {
+    if !ctx.caps.guest_import_available() {
         return None;
     }
     let stretch = src.single_stretch()?;
@@ -872,7 +872,7 @@ unsafe fn gather_guest_buffer_window(
     counters: &EngineCounters,
     src: &super::types::GuestRunSource,
 ) -> Result<Option<(BoundBuffer, PendingGuestGather)>, DrawError> {
-    if !ctx.caps.host_pointer.is_available() {
+    if !ctx.caps.guest_import_available() {
         return Ok(None);
     }
     let Some(stretches) = src.window_stretches() else {
@@ -1237,7 +1237,7 @@ unsafe fn import_sampled_guest_window(
     src: &super::types::GuestRunSource,
     gathers: &mut Vec<PendingGuestGather>,
 ) -> Result<Option<GuestTexels>, DrawError> {
-    if !ctx.caps.host_pointer.is_available() {
+    if !ctx.caps.guest_import_available() {
         return Ok(None);
     }
     // One stretch binds in place; anything longer is assembled by the GPU, the

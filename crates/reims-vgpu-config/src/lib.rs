@@ -203,6 +203,18 @@ switches! {
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// **On unless switched off.** On a device without host-pointer import (Mesa's
+/// Honeykrisp), guest RAM reaches the GPU as dma-bufs: udmabufs over the VMM's
+/// guest-RAM memfds, made with the `/dev/udmabuf` the VMM hands the
+/// out-of-process backend, a chunk at a time as the device first binds it.
+/// `off` keeps the copying rails, and the backend does not ask the VMM for
+/// `/dev/udmabuf`. [`GUEST_IMPORT`] `off` turns this rail off too.
+///
+/// A udmabuf pins the pages it covers for as long as the device holds the
+/// import, so the host memory a guest holds grows with what its GPU work has
+/// touched, up to its RAM size.
+pub const UDMABUF: &str = "REIMS_VGPU_UDMABUF";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.

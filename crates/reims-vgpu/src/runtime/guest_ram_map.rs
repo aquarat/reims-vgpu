@@ -1102,6 +1102,40 @@ mod tests {
         });
     }
 
+    /// The dma-buf rail's chunks: 64 MiB (the udmabuf module's stock
+    /// `size_limit_mb`) on a 16 KiB-page host. A guest object larger than a
+    /// chunk and placed across two seams resolves to one reference per chunk it
+    /// touches; every piece lies inside one import no longer than the limit (so
+    /// one udmabuf can back it), and the pieces tile the object exactly. The
+    /// consumers bind one piece in place and gather several on the GPU, so an
+    /// object across a seam is never bound as if it were one import.
+    #[test]
+    fn an_object_across_dma_buf_chunk_seams_is_split_into_pieces_each_a_udmabuf_can_back() {
+        const CHUNK: u64 = 64 << 20;
+        const PAGE: u64 = 0x4000;
+        with_span_max(PAGE, CHUNK, || {
+            let mut host = two_spans();
+            // 96 MiB starting 16 MiB below the first seam: it touches chunks 0,
+            // 1 and 2 of the first RAMBlock.
+            let start = CHUNK - (16 << 20);
+            let len = 96u64 << 20;
+            let gpas: Vec<u64> = (0..len / PAGE).map(|i| start + i * PAGE).collect();
+            let runs = references_for_runs(&mut host, &gpas, PAGE, 0, len)
+                .expect("all of it is guest RAM; seams are not refusals");
+            assert_eq!(runs.len(), 3, "one piece per chunk the object touches");
+            let mut want = 0u64;
+            for (i, r) in runs.iter().enumerate() {
+                assert_eq!(r.window_offset, want, "piece {i} does not continue the last");
+                assert!(r.guest.import().len() <= CHUNK, "an import longer than a udmabuf");
+                want += r.guest.requested();
+            }
+            assert_eq!(want, len, "the pieces do not cover the object");
+            let ids: std::collections::BTreeSet<_> =
+                runs.iter().map(|r| r.guest.import().id()).collect();
+            assert_eq!(ids.len(), 3, "each piece in an import of its own");
+        });
+    }
+
     /// The same run, with the seam moved out of its way, must stay one piece.
     /// Without this the test above would pass on an implementation that split
     /// every run in half.

@@ -24,6 +24,7 @@ pub const READ: u32 = 3;
 pub const WRITE: u32 = 4;
 pub const RESET: u32 = 5;
 pub const SHUTDOWN: u32 = 6;
+pub const UDMABUF: u32 = 7;
 pub const CB_XREGS: u32 = 16;
 pub const CB_XLATE: u32 = 17;
 pub const EV_SCANOUT: u32 = 32;
@@ -45,6 +46,8 @@ pub const W_BITSET: u8 = 3;
 pub const B_HARVEST: u8 = 0x1;
 pub const B_SIZE4: u8 = 0x2;
 pub const OFFSET_DEFAULT: u32 = 0xffff_ffff;
+
+pub const FEAT_UDMABUF: u32 = 0x1;
 
 pub const FD_DEVICE_PAGE: u32 = 0;
 pub const FD_KICK: u32 = 1;
@@ -132,6 +135,15 @@ pub struct MemRegion {
 pub struct MemTable {
     pub nr: u32,
     pub generation: u32,
+}
+
+/// UDMABUF request: the udmabuf module's limits; one fd, an open /dev/udmabuf.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Udmabuf {
+    pub size_limit: u64,
+    pub list_limit: u32,
+    pub flags: u32,
 }
 
 #[repr(C)]
@@ -285,6 +297,7 @@ const _: () = {
     assert!(size_of::<HelloReply>() == 48);
     assert!(size_of::<MemRegion>() == 32);
     assert!(size_of::<MemTable>() == 8);
+    assert!(size_of::<Udmabuf>() == 16);
     assert!(size_of::<Access>() == 24);
     assert!(size_of::<Xregs>() == 256);
     assert!(size_of::<XlateReply>() == 16);
@@ -337,6 +350,7 @@ unsafe impl Pod for Behaviour {}
 unsafe impl Pod for HelloReply {}
 unsafe impl Pod for MemRegion {}
 unsafe impl Pod for MemTable {}
+unsafe impl Pod for Udmabuf {}
 unsafe impl Pod for Access {}
 unsafe impl Pod for Value {}
 unsafe impl Pod for Xregs {}
@@ -386,6 +400,8 @@ mod tests {
             ("WRITE", WRITE.into()),
             ("RESET", RESET.into()),
             ("SHUTDOWN", SHUTDOWN.into()),
+            ("UDMABUF", UDMABUF.into()),
+            ("FEAT_UDMABUF", FEAT_UDMABUF.into()),
             ("CB_XREGS", CB_XREGS.into()),
             ("CB_XLATE", CB_XLATE.into()),
             ("EV_SCANOUT", EV_SCANOUT.into()),
@@ -429,7 +445,7 @@ mod tests {
 
     #[test]
     fn every_header_define_is_mirrored() {
-        let mirrored = 46;
+        let mirrored = 48;
         let defines = HEADER
             .lines()
             .filter(|l| l.starts_with("#define APV_PROXY_"))

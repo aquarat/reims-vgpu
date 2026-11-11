@@ -21,6 +21,7 @@ mod guest_ram;
 mod host_ops;
 mod regs;
 mod sys;
+mod udmabuf;
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -130,7 +131,12 @@ fn hello(ctl: RawFd, msg: &sys::Msg) -> io::Result<&'static Backend> {
     let behaviours = regs::behaviours();
     let rep = wire::HelloReply {
         version: wire::VERSION,
-        features: 0,
+        // Offered unless switched off; the VMM sends /dev/udmabuf only then.
+        features: if udmabuf_wanted() {
+            wire::FEAT_UDMABUF
+        } else {
+            0
+        },
         nr_behaviour: behaviours.len() as u32,
         nr_irqs,
         device_page_size: backend::DEVICE_PAGE_SIZE,
@@ -210,6 +216,36 @@ fn mem_table(b: &Backend, msg: sys::Msg) -> io::Result<()> {
     b.ram.write().unwrap().set_table(regions)
 }
 
+/// Whether to offer to make guest RAM into udmabufs (`REIMS_VGPU_UDMABUF`,
+/// on unless switched off).
+fn udmabuf_wanted() -> bool {
+    reims_vgpu::config::read(reims_vgpu::config::UDMABUF).0 != reims_vgpu::config::Switch::Off
+}
+
+/// The VMM's `/dev/udmabuf` and the udmabuf limits: register this process's
+/// dma-buf source, which the GPU backend asks when it imports guest RAM.
+fn udmabuf(b: &'static Backend, msg: sys::Msg) -> io::Result<()> {
+    let u = wire::Udmabuf::read_from(&msg.payload)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short UDMABUF"))?;
+    let mut fds = msg.fds;
+    if fds.len() != 1 || u.flags != 0 || u.size_limit == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "malformed UDMABUF",
+        ));
+    }
+    if !udmabuf_wanted() {
+        return Err(io::Error::other("REIMS_VGPU_UDMABUF is off"));
+    }
+    let source = udmabuf::Udmabuf::new(fds.remove(0), u.size_limit, u.list_limit, b);
+    let line = reims_vgpu::runtime::guest_ram::dmabuf::DmaBufSource::describe(&source);
+    if !reims_vgpu::runtime::guest_ram::dmabuf::register_source(Box::new(source)) {
+        return Err(io::Error::other("a udmabuf source is already registered"));
+    }
+    eprintln!("reims-vgpu-backend: guest RAM may reach the GPU as dma-bufs ({line})");
+    Ok(())
+}
+
 /// Serve one register access a vCPU is waiting on.
 fn access(b: &Backend, ctl: RawFd, msg: &sys::Msg, write: bool) -> io::Result<()> {
     let a = wire::Access::read_from(&msg.payload)
@@ -265,6 +301,18 @@ fn serve(ctl: RawFd) -> io::Result<()> {
                     Ok(()) => reply(ctl, &hdr, &wire::Value::default())?,
                     Err(e) => {
                         eprintln!("reims-vgpu-backend: MEM_TABLE: {e}");
+                        reply_err(ctl, &hdr, -libc::EINVAL)?;
+                    }
+                }
+            }
+            (wire::UDMABUF, Some(dev)) => {
+                let hdr = msg.hdr;
+                match udmabuf(dev, msg) {
+                    Ok(()) => reply(ctl, &hdr, &wire::Value::default())?,
+                    Err(e) => {
+                        eprintln!(
+                            "reims-vgpu-backend: UDMABUF: {e}; guest RAM is copied to the GPU"
+                        );
                         reply_err(ctl, &hdr, -libc::EINVAL)?;
                     }
                 }

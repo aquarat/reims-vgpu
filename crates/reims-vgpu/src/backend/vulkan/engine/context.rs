@@ -674,6 +674,10 @@ pub(crate) struct DeviceContext {
     /// `None` is the answer on every host without the extension, and the import
     /// site declines by name when it sees one.
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    /// `VK_KHR_external_memory_fd` entry points, loaded only where
+    /// [`HostGpuCaps::dmabuf_import`] resolved to `Supported`: the dma-buf
+    /// import rail's `vkGetMemoryFdPropertiesKHR`.
+    pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
     /// `VK_KHR_push_descriptor` entry points, present only when the extension
     /// was advertised, queried, and enabled for this device.
     pub push_descriptor: Option<ash::khr::push_descriptor::Device>,
@@ -1112,6 +1116,13 @@ impl DeviceContext {
             &has_device_extension,
             max_allocation_size,
         );
+        let dmabuf_import = crate::backend::vulkan::caps::dmabuf_import::query(
+            &instance,
+            pd,
+            &has_device_extension,
+            max_allocation_size,
+            host_pointer.rung.is_available(),
+        );
         let push_descriptor = crate::backend::vulkan::caps::push_descriptor::query(
             &instance,
             pd,
@@ -1130,8 +1141,34 @@ impl DeviceContext {
                     host_pointer.span_max,
                 );
             }
+            _ if dmabuf_import.rung.is_available() => {
+                crate::runtime::guest_ram::latch_import_limits(
+                    dmabuf_import.granularity,
+                    dmabuf_import.heap_budget,
+                    dmabuf_import.span_max,
+                );
+            }
             _ => crate::runtime::guest_ram::forget_import_limits(),
         }
+        // One line per device: which rail guest RAM takes to the GPU, and why
+        // not the other. Every refusal below the rail is per chunk and named
+        // where it happens.
+        crate::observe::fail(format!(
+            "vk_guest_ram_rail rail={} host_pointer={} dmabuf={} dmabuf_chunk_mb={} source={}",
+            if host_pointer.rung.is_available() {
+                "host_pointer"
+            } else if dmabuf_import.rung.is_available() {
+                "dmabuf"
+            } else {
+                "copy"
+            },
+            host_pointer.rung.slug(),
+            dmabuf_import.rung.slug(),
+            dmabuf_import.span_max >> 20,
+            crate::runtime::guest_ram::dmabuf::source()
+                .map(|s| s.describe())
+                .unwrap_or_else(|| "none".into()),
+        ));
         // Every import this process holds names a `VkDeviceMemory` that dies
         // with the device below. Dropping them here, before the new one exists,
         // is what makes a recreate rebuild against fresh identities instead of
@@ -1205,6 +1242,7 @@ impl DeviceContext {
         // Only the `Supported` rung names `VK_EXT_external_memory_host`, so a
         // host without it gets a device rather than a failed `vkCreateDevice`.
         enabled_device_extensions.extend(host_pointer.rung.required_extensions());
+        enabled_device_extensions.extend(dmabuf_import.rung.required_extensions());
         enabled_device_extensions.extend(push_descriptor.required_extensions());
         // Built in `caps` too. Bound to a local here only because `push_next`
         // borrows it for the lifetime of `dci`.
@@ -1333,6 +1371,7 @@ impl DeviceContext {
             max_allocation_size,
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             host_pointer,
+            dmabuf_import,
             push_descriptor,
             portability_subset,
             device_api_version: props.api_version,
@@ -1344,6 +1383,10 @@ impl DeviceContext {
             .host_pointer
             .is_available()
             .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+        let external_memory_fd = caps
+            .dmabuf_import
+            .is_available()
+            .then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let push_descriptor = caps
             .push_descriptor
             .is_available()
@@ -1464,6 +1507,7 @@ impl DeviceContext {
             caps,
             memory_properties,
             external_memory_host,
+            external_memory_fd,
             push_descriptor,
             extended_dynamic_state,
             extended_dynamic_state3,
