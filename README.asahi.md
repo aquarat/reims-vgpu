@@ -145,8 +145,16 @@ in the host repository.
   saturated by the per-draw path (one queue submission per draw), not by the
   GPU or shader compilation.
 - `memcpy` is still about two thirds of the drain's CPU time. Honeykrisp
-  cannot import guest RAM (no `VK_EXT_external_memory_host`), so guest data
-  is copied into and out of Vulkan memory once each way.
+  cannot import guest RAM as host pointers (no
+  `VK_EXT_external_memory_host`), so guest data is copied into and out of
+  Vulkan memory once each way. The out-of-process backend can import it as
+  dma-bufs instead: QEMU passes it `/dev/udmabuf` (`apv-gpu-proxy`
+  `udmabuf=on`, off by default), and it makes 64 MiB udmabufs of the
+  guest-RAM memfds as GPU work first touches them, which fits udmabuf's stock
+  limits. The simulator unit tests ran in 136.8 and 137.6 s with it against
+  165.2 and 178.5 s without (4 vCPU / 8 GB, interleaved), but a 12 GB guest's
+  SwiftUI UI test hangs on a GPU fence with it on, so it stays opt-in.
+  `REIMS_VGPU_UDMABUF=off` keeps the backend from asking for it.
 - Honeykrisp needs the 16-bit flat fragment input patch as well
   (`patches/mesa/0002-*` in the host repository); without it a Compose
   app's shaders abort the driver.

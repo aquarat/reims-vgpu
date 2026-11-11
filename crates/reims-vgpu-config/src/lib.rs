@@ -213,6 +213,14 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// A udmabuf pins the pages it covers for as long as the device holds the
 /// import, so the host memory a guest holds grows with what its GPU work has
 /// touched, up to its RAM size.
+///
+/// The VMM decides whether the rail runs: QEMU's `apv-gpu-proxy` offers
+/// `/dev/udmabuf` only with `udmabuf=on`, which is off by default. On
+/// Honeykrisp (M1 Max, 2026-11-11) a 12 GB guest's SwiftUI UI test stopped
+/// with the drain waiting on a GPU fence in every run with two or more of the
+/// rail's read arms on (5 of 5), and passed with any one of them alone (3 of
+/// 3); the simulator unit tests and the seam-crossing probes pass with all of
+/// it on.
 pub const UDMABUF: &str = "REIMS_VGPU_UDMABUF";
 
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
