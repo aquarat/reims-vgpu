@@ -151,9 +151,11 @@ in the host repository.
   dma-bufs instead: QEMU passes it `/dev/udmabuf` (`apv-gpu-proxy`
   `udmabuf=on`, off by default), and it makes 64 MiB udmabufs of the
   guest-RAM memfds as GPU work first touches them, which fits udmabuf's stock
-  limits. The simulator unit tests ran in 136.8 and 137.6 s with it against
-  165.2 and 178.5 s without (4 vCPU / 8 GB, interleaved), but a 12 GB guest's
-  SwiftUI UI test hangs on a GPU fence with it on, so it stays opt-in.
+  limits. The GPU then reads guest data in place and writes compute outputs
+  and render targets straight into guest pages. Simulator unit tests (4 vCPU
+  / 8 GB, interleaved): 161.6 and 155.8 s with it against 170.8 and 173.4 s
+  without, with 19 % less drain time. The 12 GB SwiftUI UI test: 211, 178
+  and 193 s against 213 s. It pins all guest RAM for the life of the guest.
   `REIMS_VGPU_UDMABUF=off` keeps the backend from asking for it.
 - Honeykrisp needs the 16-bit flat fragment input patch as well
   (`patches/mesa/0002-*` in the host repository); without it a Compose

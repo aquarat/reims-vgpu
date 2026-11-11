@@ -215,12 +215,13 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// touched, up to its RAM size.
 ///
 /// The VMM decides whether the rail runs: QEMU's `apv-gpu-proxy` offers
-/// `/dev/udmabuf` only with `udmabuf=on`, which is off by default. On
-/// Honeykrisp (M1 Max, 2026-11-11) a 12 GB guest's SwiftUI UI test stopped
-/// with the drain waiting on a GPU fence in every run with two or more of the
-/// rail's read arms on (5 of 5), and passed with any one of them alone (3 of
-/// 3); the simulator unit tests and the seam-crossing probes pass with all of
-/// it on.
+/// `/dev/udmabuf` only with `udmabuf=on`, which is off by default.
+///
+/// With the rail on, every compute output and render target that lands in
+/// guest pages is written by the GPU. Until the padded-window scatter, a
+/// padded guest pitch went as ~3 000 image-copy rectangles a frame, each one a
+/// Honeykrisp dispatch: the 12 GB SwiftUI UI test's GPU queue backed up by
+/// seconds and the guest timed out. See `plan_padded_guest_scatter`.
 pub const UDMABUF: &str = "REIMS_VGPU_UDMABUF";
 
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
