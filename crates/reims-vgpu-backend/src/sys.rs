@@ -132,6 +132,15 @@ pub fn map_shared_aligned(fd: RawFd, size: u64, offset: u64, align: u64) -> io::
     Ok(p as *mut u8)
 }
 
+/// Leave guest RAM out of this process's core dumps. A backend that crashes
+/// with the whole guest mapped otherwise takes about a minute to dump (QEMU
+/// gives up on it after 30 s, and SIGTERM does not stop a dump), and the dump
+/// holds the guest's memory. Advice only: on failure the range stays dumpable.
+pub fn dont_dump(p: *mut u8, len: usize) {
+    // SAFETY: advice on a mapping this process made; it changes no contents.
+    unsafe { libc::madvise(p.cast(), len, libc::MADV_DONTDUMP) };
+}
+
 /// One received message.
 pub struct Msg {
     pub hdr: Hdr,

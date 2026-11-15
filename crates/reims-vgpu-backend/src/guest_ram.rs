@@ -59,6 +59,7 @@ impl GuestRam {
         let mut out = Vec::with_capacity(regions.len());
         for (gpa, size, fd_offset, fd) in regions {
             let hva = sys::map_shared_aligned(fd.as_raw_fd(), size, fd_offset, MAP_ALIGN)?;
+            sys::dont_dump(hva, size as usize);
             out.push(Region {
                 gpa,
                 size,
@@ -212,6 +213,7 @@ impl GuestRam {
             });
             i += run;
         }
+        sys::dont_dump(view.cast(), len);
         self.views.lock().unwrap().push(View {
             addr: view as usize,
             len,
@@ -316,5 +318,57 @@ mod tests {
         );
         assert_eq!(slice_runs(&runs, 0xc000, 0x4000), vec![run(4, 0, 0x4000)]);
         assert_eq!(slice_runs(&runs, 0x14000, 0x1000), vec![]);
+    }
+
+    /// The VmFlags of the mapping that contains `addr`, from /proc/self/smaps.
+    fn vm_flags(addr: usize) -> String {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ') {
+                if let Some((lo, hi)) = range.split_once('-') {
+                    if let (Ok(lo), Ok(hi)) =
+                        (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+                    {
+                        inside = lo <= addr && addr < hi;
+                        continue;
+                    }
+                }
+            }
+            if inside {
+                if let Some(flags) = line.strip_prefix("VmFlags:") {
+                    return flags.to_string();
+                }
+            }
+        }
+        panic!("no mapping contains {addr:#x}");
+    }
+
+    /// Guest RAM, mapped whole or through a packed view, is left out of core
+    /// dumps ("dd" in VmFlags).
+    #[test]
+    fn guest_ram_is_left_out_of_core_dumps() {
+        use std::os::fd::FromRawFd;
+        let page = 16384u64;
+        let size = 8 * page;
+        // SAFETY: a fresh memfd, owned below.
+        let raw = unsafe { libc::memfd_create(c"guest-ram-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        // SAFETY: just created, not owned elsewhere.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: our fd.
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) }, 0);
+        let mut ram = GuestRam::default();
+        ram.set_table(vec![(0x1_0000_0000, size, 0, fd)]).unwrap();
+        let hva = ram.regions()[0].hva as usize;
+        assert!(vm_flags(hva).split_whitespace().any(|f| f == "dd"), "{}", vm_flags(hva));
+
+        // Pages out of order make a packed view rather than a direct pointer.
+        let view = ram
+            .map_pages(&[0x1_0000_0000 + 3 * page, 0x1_0000_0000], page)
+            .unwrap() as usize;
+        assert_ne!(view, hva);
+        assert!(vm_flags(view).split_whitespace().any(|f| f == "dd"), "{}", vm_flags(view));
+        ram.unmap_pages(view as *mut u8);
     }
 }
