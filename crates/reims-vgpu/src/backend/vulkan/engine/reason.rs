@@ -127,6 +127,20 @@ pub enum DrawReason {
         color_inputs: u8,
         attachments: u32,
     },
+    /// A draw binds a fragment storage image and the device did not enable
+    /// `fragmentStoresAndAtomics`, without which a fragment shader may not write
+    /// storage memory at all.
+    FragmentStoresUnsupported {
+        binding: u32,
+    },
+    /// A fragment storage image's view format is not one this device can bind
+    /// as an optimal-tiling storage image (`VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT`
+    /// absent), or its resident was created without `STORAGE` usage because the
+    /// allocation format lacks that feature.
+    StorageImageFormatUnsupported {
+        binding: u32,
+        format: ash::vk::Format,
+    },
     /// More MRT secondary attachments than the render pass can carry.
     SecondaryAttachmentCap {
         requested: usize,
@@ -343,6 +357,8 @@ impl crate::observe::Decline for DrawReason {
             Self::ResidentSampledNot2d { .. } => "resident_sampled_not_2d",
             Self::GuestRunSampledNot2d { .. } => "guest_run_sampled_not_2d",
             Self::SecondaryAttachmentCap { .. } => "secondary_attachment_cap",
+            Self::FragmentStoresUnsupported { .. } => "fragment_stores_unsupported",
+            Self::StorageImageFormatUnsupported { .. } => "storage_image_format_unsupported",
             Self::ColorInputAttachmentMissing { .. } => "color_input_attachment_missing",
             Self::ViewportSlotsUnsupported { .. } => "viewport_slots_unsupported",
             Self::VisibilityCountingUnsupported { .. } => "visibility_counting_unsupported",
@@ -416,8 +432,13 @@ impl std::fmt::Display for DrawReason {
                 let stage = if *fragment { "fragment" } else { "vertex" };
                 write!(f, " binding={binding} stage={stage}")
             }
-            Self::ResidentSampledNot2d { binding } | Self::GuestRunSampledNot2d { binding } => {
+            Self::ResidentSampledNot2d { binding }
+            | Self::GuestRunSampledNot2d { binding }
+            | Self::FragmentStoresUnsupported { binding } => {
                 write!(f, " binding={binding}")
+            }
+            Self::StorageImageFormatUnsupported { binding, format } => {
+                write!(f, " binding={binding} format={format:?}")
             }
             Self::ColorInputAttachmentMissing {
                 color_inputs,
@@ -658,6 +679,11 @@ mod tests {
 
     const ALL: &[DrawReason] = &[
         DrawReason::ResidentSampledNot2d { binding: 0 },
+        DrawReason::FragmentStoresUnsupported { binding: 0 },
+        DrawReason::StorageImageFormatUnsupported {
+            binding: 0,
+            format: ash::vk::Format::R8G8B8A8_SRGB,
+        },
         DrawReason::GuestRunSampledNot2d { binding: 0 },
         DrawReason::SecondaryAttachmentCap {
             requested: 0,

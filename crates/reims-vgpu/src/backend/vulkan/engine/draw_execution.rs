@@ -50,6 +50,27 @@ pub enum DrawExecutionDecline {
     LoadSecondaryContentNotReady {
         identity: TargetIdentity,
     },
+    /// A fragment storage image of guest-backed content (`Load`) whose resident
+    /// does not hold that content yet.
+    ///
+    /// A storage write keeps every texel the shader leaves alone, so the image
+    /// must hold the texture's pixels before the shader runs. Only a pass this
+    /// device ran can have put them in the resident; a fresh or recycled one
+    /// holds nothing of this texture's. Refused for the reason
+    /// [`Self::LoadSecondaryContentNotReady`] is.
+    StorageImageContentNotReady {
+        binding: u32,
+        identity: TargetIdentity,
+    },
+    /// A fragment storage image whose resident is a guest-memory import.
+    ///
+    /// An import is created for a linear layout without `STORAGE` usage, so it
+    /// cannot be bound as one; the storage rail binds device-allocated
+    /// residents only.
+    StorageImageGuestImported {
+        binding: u32,
+        identity: TargetIdentity,
+    },
     SeedResidentMissing {
         identity: TargetIdentity,
     },
@@ -174,6 +195,10 @@ impl Decline for DrawExecutionDecline {
             Self::LoadSecondaryContentNotReady { .. } => {
                 "vk_draw_exec_load_secondary_content_not_ready"
             }
+            Self::StorageImageContentNotReady { .. } => {
+                "vk_draw_exec_storage_image_content_not_ready"
+            }
+            Self::StorageImageGuestImported { .. } => "vk_draw_exec_storage_image_guest_imported",
             Self::SeedResidentMissing { .. } => "vk_draw_exec_seed_resident_missing",
             Self::SeedResidentNotReady { .. } => "vk_draw_exec_seed_resident_not_ready",
             Self::SeedGeometryMismatch { .. } => "vk_draw_exec_seed_geometry_mismatch",
@@ -255,6 +280,12 @@ impl Decline for DrawExecutionDecline {
                     "prior",
                     prior.map_or("no_record", ResidentReclaim::slug).to_string(),
                 ));
+                fields
+            }
+            Self::StorageImageContentNotReady { binding, identity }
+            | Self::StorageImageGuestImported { binding, identity } => {
+                let mut fields = vec![("binding", binding.to_string())];
+                fields.extend(identity_fields(identity));
                 fields
             }
             Self::SampledResidentNotReady { binding, identity } => {
@@ -403,6 +434,14 @@ mod tests {
             DrawExecutionDecline::LoadSecondaryContentNotReady {
                 identity: identity(),
             },
+            DrawExecutionDecline::StorageImageContentNotReady {
+                binding: 600,
+                identity: identity(),
+            },
+            DrawExecutionDecline::StorageImageGuestImported {
+                binding: 600,
+                identity: identity(),
+            },
             DrawExecutionDecline::SeedResidentMissing {
                 identity: identity(),
             },
@@ -470,7 +509,11 @@ mod tests {
         // Back up to 12: `*_load_secondary_content_not_ready` is the primary's
         // readiness guard given to the MRT secondary slot, which had gone
         // without one for as long as MRT has existed.
-        assert_eq!(before, 12, "the draw executor's reason census moved");
+        //
+        // 14: the fragment storage-image rail's two resident checks — a `Load`
+        // image whose resident holds nothing of the texture yet, and a resident
+        // that is a guest import without `STORAGE` usage.
+        assert_eq!(before, 14, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 

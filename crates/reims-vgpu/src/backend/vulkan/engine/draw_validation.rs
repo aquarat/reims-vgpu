@@ -131,6 +131,34 @@ pub enum DrawValidationDecline {
     DuplicateSamplerDescriptorBinding {
         binding: u32,
     },
+    /// A storage image claims a descriptor binding another descriptor of this
+    /// draw — buffer, sampled image, sampler or storage image — already holds.
+    DuplicateStorageImageDescriptorBinding {
+        binding: u32,
+    },
+    /// A storage image names a resident with no extent.
+    StorageImageZeroGeometry {
+        binding: u32,
+    },
+    /// A storage image names an image this same draw renders into as a colour
+    /// or depth attachment.
+    ///
+    /// The fragment shader would store into the image the pass is writing
+    /// through its attachment, in an order neither API defines, and Vulkan
+    /// allows a storage descriptor in neither the attachment layout nor the
+    /// feedback-loop one. Refused rather than reordered: no single answer is
+    /// Metal's.
+    StorageImageAliasesAttachment {
+        binding: u32,
+    },
+    /// A storage image names a resident this same draw also samples.
+    ///
+    /// One image would sit in two descriptors with two tracked accesses, and the
+    /// shader's samples would race its own stores. Metal leaves that undefined
+    /// and this device has no barrier inside one draw to define it with.
+    StorageImageAliasesSampled {
+        binding: u32,
+    },
     SampledZeroGeometry {
         binding: u32,
         width: u32,
@@ -272,6 +300,16 @@ impl Decline for DrawValidationDecline {
             Self::DuplicateSamplerDescriptorBinding { .. } => {
                 "vk_draw_validate_duplicate_sampler_descriptor_binding"
             }
+            Self::DuplicateStorageImageDescriptorBinding { .. } => {
+                "vk_draw_validate_duplicate_storage_image_descriptor_binding"
+            }
+            Self::StorageImageZeroGeometry { .. } => "vk_draw_validate_storage_image_zero_geometry",
+            Self::StorageImageAliasesAttachment { .. } => {
+                "vk_draw_validate_storage_image_aliases_attachment"
+            }
+            Self::StorageImageAliasesSampled { .. } => {
+                "vk_draw_validate_storage_image_aliases_sampled"
+            }
             Self::SampledZeroGeometry { .. } => "vk_draw_validate_sampled_zero_geometry",
             Self::SampledShapeConflict { .. } => "vk_draw_validate_sampled_shape_conflict",
             Self::SampledCubeGeometry { .. } => "vk_draw_validate_sampled_cube_geometry",
@@ -376,7 +414,11 @@ impl Decline for DrawValidationDecline {
             Self::DuplicateVertexBinding { binding }
             | Self::DuplicateStorageDescriptorBinding { binding }
             | Self::DuplicateSampledDescriptorBinding { binding }
-            | Self::DuplicateSamplerDescriptorBinding { binding } => {
+            | Self::DuplicateSamplerDescriptorBinding { binding }
+            | Self::DuplicateStorageImageDescriptorBinding { binding }
+            | Self::StorageImageZeroGeometry { binding }
+            | Self::StorageImageAliasesAttachment { binding }
+            | Self::StorageImageAliasesSampled { binding } => {
                 vec![("binding", binding.to_string())]
             }
             Self::SampledArrayElementOutOfRange {
@@ -627,6 +669,10 @@ mod tests {
                 count: 2,
             },
             DrawValidationDecline::DuplicateSamplerDescriptorBinding { binding: 0 },
+            DrawValidationDecline::DuplicateStorageImageDescriptorBinding { binding: 0 },
+            DrawValidationDecline::StorageImageZeroGeometry { binding: 0 },
+            DrawValidationDecline::StorageImageAliasesAttachment { binding: 0 },
+            DrawValidationDecline::StorageImageAliasesSampled { binding: 0 },
             DrawValidationDecline::SampledZeroGeometry {
                 binding: 32,
                 width: 0,
@@ -710,7 +756,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 51, "the validator's reason census moved");
+        assert_eq!(before, 55, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 
