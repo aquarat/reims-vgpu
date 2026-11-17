@@ -826,6 +826,73 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
     }
 }
 
+/// A guest `BGRA8Unorm_sRGB` storage surface is written through a format-less
+/// storage image in `B8G8R8A8_SRGB`, so the device encodes each store: linear
+/// `(0.5, 0.002, 1.0, 0.5)` lands as sRGB codes in BGRA memory order, not as
+/// the unencoded `128, 1` a UNORM view would store. Needs the GPU, and a device
+/// that writes the format without a declared one
+/// (`engine::storage_view_caps().srgb.bgra8`), which the product path refuses by
+/// name elsewhere.
+#[test]
+fn compute_storage_image_bgra8_srgb_store_is_encoded() {
+    let _g = engine_test_session();
+    if !engine::storage_view_caps().srgb.bgra8.writes() {
+        eprintln!("skip: B8G8R8A8_SRGB is not a format-less storage image on this device");
+        return;
+    }
+    let spvasm = storage_image_write_red_kernel("Unknown")
+        .replace(
+            "    %float_0 = OpConstant %float 0\n",
+            "    %float_0 = OpConstant %float 0\n %float_half = OpConstant %float 0.5\n%float_small = OpConstant %float 0.002\n",
+        )
+        .replace(
+            "%red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1",
+            "%red = OpConstantComposite %v4float %float_half %float_small %float_1 %float_half",
+        );
+    let Some(words) = assemble_spvasm(&spvasm, "simg_bgra8_srgb") else {
+        return;
+    };
+    let (w, h) = (4u32, 4u32);
+    let req = ComputeRequest {
+        spirv: words,
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([w, h, 1]),
+        storage_buffers: vec![],
+        sampled_images: vec![],
+        samplers: vec![],
+        storage_images: vec![ComputeStorageImageResource {
+            destination: Default::default(),
+            binding: 0,
+            array_element: 0,
+            descriptor_count: 1,
+            format: StorageImageFormat::Bgra8UnormSrgb,
+            width: w,
+            height: h,
+            bytes: vec![0u8; (w * h * 4) as usize],
+            residency: None,
+            seed_skipped: false,
+        }],
+    };
+    let Some(out) = engine_or_skip("simg_bgra8_srgb", &req) else {
+        return;
+    };
+    assert_eq!(out.images.len(), 1);
+    // sRGB codes by the transfer function: 0.5 -> 187.5 (Metal's table stores
+    // 187), 0.002 -> 6.6, 1.0 -> 255; alpha is linear, 127.5. One code of
+    // slack for the encoder's rounding, none for 1.0.
+    let near = |got: u8, want: i32| (i32::from(got) - want).abs() <= 1;
+    for p in out.images[0]
+        .bytes()
+        .expect("a Host destination reads bytes back")
+        .chunks_exact(4)
+    {
+        assert!(
+            p[0] == 255 && near(p[1], 7) && (p[2] == 187 || p[2] == 188) && near(p[3], 128),
+            "sRGB store not encoded in BGRA order: texel {p:?}"
+        );
+    }
+}
+
 /// `seed_skipped` contract: a generation-matching resident dispatch renders
 /// from the GPU-resident content while `bytes` is empty (no seed upload, the
 /// image sized by its geometry); once the resident is gone the same request
