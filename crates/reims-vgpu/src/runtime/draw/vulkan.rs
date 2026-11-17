@@ -6882,6 +6882,18 @@ pub(super) fn resolve_fragment_storage_texture<M: HostMemory + HostOps>(
     };
     let selector =
         pixel_format::storage_selector(rt.format).ok_or(format_refusal("no_storage_selector"))?;
+    // The eight-bit sRGB formats have storage selectors for the compute rail,
+    // whose staging images are created in the sRGB format itself. A fragment
+    // storage texture binds the colour resident instead, which holds sRGB
+    // targets as a UNORM allocation with an sRGB attachment view; storing
+    // through that pairing is not built, so it is refused by name.
+    if matches!(
+        selector,
+        pixel_format::StorageImageSelector::Rgba8UnormSrgb
+            | pixel_format::StorageImageSelector::Bgra8UnormSrgb
+    ) {
+        return Err(format_refusal("srgb_fragment_storage_unsupported"));
+    }
     let (attachment, _) = translate::pixel::color_attachment(rt.format)
         .map_err(|_| format_refusal("not_color_renderable"))?;
     let guest = translate::pixel::storage_image_from_selector(selector);

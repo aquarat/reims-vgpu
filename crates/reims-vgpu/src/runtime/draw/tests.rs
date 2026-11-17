@@ -8471,7 +8471,8 @@ fn a_fragment_storage_texture_resolves_to_its_colour_resident() {
         })
     ));
 
-    // An sRGB texture has no storage form at all.
+    // An sRGB texture is refused on the fragment rail by name, whatever the
+    // device can store.
     let srgb_ref = 120u32;
     put_linear_texture(
         &mut state,
@@ -8499,7 +8500,7 @@ fn a_fragment_storage_texture_resolves_to_its_colour_resident() {
             index: 2,
             texture_ref: srgb_ref,
             format: MTL_FORMAT_BGRA8_UNORM_SRGB,
-            detail: "no_storage_selector",
+            detail: "srgb_fragment_storage_unsupported",
         })
     );
 

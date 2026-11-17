@@ -248,8 +248,8 @@ pub(crate) fn registry_resident_usage(
 ///
 /// A view inherits its image's usage unless told otherwise, and a usage the
 /// view's format does not support makes the view invalid. An sRGB view over a
-/// `STORAGE` UNORM allocation is the case: sRGB formats are not storage
-/// formats on any host this device supports.
+/// `STORAGE` UNORM allocation is the case, on a device that cannot store the
+/// sRGB format (Honeykrisp can; many drivers cannot).
 pub(crate) fn resident_view_usage(
     ctx: &context::DeviceContext,
     image_usage: ash::vk::ImageUsageFlags,
