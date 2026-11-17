@@ -58,6 +58,8 @@
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
 //!   that the half a per-draw binder owes nothing on cannot hide the half it
 //!   does.
+//! - [`ycbcr`] — the two-plane Y′CbCr formats, what their planes hold, and
+//!   the texels Metal reads out of them.
 //! - [`pixel_format`] — the format ordinals, what each one is made of, and the
 //!   conversions between a texel and the eight-bit colour the device carries.
 //! - [`blend`] — a colour attachment's blend equations and write mask, and
@@ -146,3 +148,4 @@ pub mod topology;
 pub mod vertex_format;
 pub mod vertex_step;
 pub mod visibility;
+pub mod ycbcr;
