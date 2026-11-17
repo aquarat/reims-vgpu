@@ -109,6 +109,7 @@ vertexBufferCase()
 
 fragmentBufferCase()
 renderBarrierCase()
+fragmentStorageWriteCases()
 computeBarrierCase(resourceBarrier: true)
 computeBarrierCase(resourceBarrier: false)
 indirectComputeDispatchCase()

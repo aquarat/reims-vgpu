@@ -503,6 +503,14 @@ pub struct DrawRequest {
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
     pub samplers: Vec<SamplerResource>,
+    /// Fragment-stage storage images: guest textures the fragment shader
+    /// reads and writes directly (`texture2d<T, access::write | read_write>`).
+    ///
+    /// Each is a registry resident, named by the same identity a colour
+    /// attachment of that texture would have, so the pixels the draw stores are
+    /// the ones a later pass loads, samples or writes back. See
+    /// [`StorageImageResource`].
+    pub storage_images: Vec<StorageImageResource>,
     /// CPU Load seed for the color target, in the order
     /// [`DrawRequest::target_seed_order`] names.
     ///
@@ -1199,6 +1207,53 @@ impl SamplerCompareFunction {
     pub(crate) fn mtl_ordinal(self) -> u32 {
         self as u32
     }
+}
+
+/// One fragment-stage storage image: a registry resident bound as a
+/// `STORAGE_IMAGE` descriptor in `GENERAL` for the whole draw.
+///
+/// The resident is the texture's, not the draw's: the identity is resolved the
+/// way a colour attachment of the same texture would be, so a draw that stores
+/// into it and a later pass that loads or samples it name one image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageImageResource {
+    /// The descriptor binding, in the translator's numbering. Storage images
+    /// are not moved by the fragment sampled-band relocation
+    /// (`spirv_bind::offset_fragment_sampled_resource_bindings` leaves them in
+    /// place), so this is the reflected binding as it stands.
+    pub binding: u32,
+    pub identity: TargetIdentity,
+    /// The resident's declared format — what `registry_ensure_attachment`
+    /// creates or reuses it with, exactly as a colour attachment of this
+    /// texture would.
+    pub format: vk::Format,
+    /// The storage view's format: the format the shader's `OpTypeImage` was
+    /// specialized to (or, for an `Unknown`-format image, the resident's own).
+    /// Different from [`Self::format`] only for a raw view of another class
+    /// over the same bytes.
+    pub view_format: vk::Format,
+    /// What the image holds before the shader runs.
+    pub content: StorageImageContent,
+}
+
+/// What a storage image must hold before the draw's fragment shader runs.
+///
+/// A storage write leaves every texel the shader does not write as it was, so
+/// this is a load in every case: the only question is what a resident that
+/// holds nothing yet stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageImageContent {
+    /// The texture has guest storage, and its pixels are only in the resident
+    /// when a pass already put them there. A resident that is not ready refuses
+    /// the draw (`vk_draw_exec_storage_image_content_not_ready`) rather than
+    /// letting the shader read — and the guest later see — a recycled image's
+    /// stale texels as this texture's.
+    Load,
+    /// A host-only texture (heap-placed or memoryless): nothing outside the
+    /// resident defines its contents, so a resident that holds nothing yet is
+    /// cleared to zero first. Undefined contents are what Metal gives; zero is
+    /// the definition that cannot leak another identity's pixels.
+    LoadOrClear,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]

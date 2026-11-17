@@ -6649,6 +6649,444 @@ pub(crate) fn host_target_identity(
     }
 }
 
+/// The residency identity of a colour texture `c` describes, whose resident is
+/// created in `format` — or `None` when the texture is in none of the three
+/// namespaces (no host-only kind, no GVA, no mapping).
+///
+/// Identity mirrors the primary namespaces: a host-only texture by its ref, a
+/// normal-texture linear GVA by its own backing pages, else a mapper-ref-texture
+/// surface. Shared by the MRT secondary attachments and the fragment storage
+/// textures, because both must name the resident a colour pass into the same
+/// texture renders into — a second spelling would be a second image.
+///
+/// A GVA is named by its own backing pages, exactly like color0 — the
+/// primary's generation describes a different address, so it takes its own
+/// walk. Without one the texture is keyed on `(gva, width, height)` alone and
+/// two guest allocations reusing that address at that geometry share one GPU
+/// image — the wrong-content class `74748d2` closed for color0.
+pub(super) fn color_target_identity<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c: &ColorRtRequest,
+    format: ash::vk::Format,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    use crate::backend::vulkan::engine::TargetIdentity;
+    Some(if let Some(kind) = c.host_only {
+        host_target_identity(kind, task_id, c.texture_ref, c.width, c.height)
+    } else if c.target_gva != 0 {
+        TargetIdentity::Gva {
+            gva: c.target_gva,
+            width: c.width,
+            height: c.height,
+            generation: if c.texture_ref != 0 {
+                crate::runtime::writeback_debt::gva_resource_generation(
+                    state,
+                    host,
+                    crate::runtime::writeback_debt::GvaResourceKey {
+                        task_id,
+                        texture_ref: c.texture_ref,
+                    },
+                    c.target_gva,
+                    u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
+                )
+            } else {
+                gva_span_alloc_generation(
+                    state,
+                    host,
+                    task_id,
+                    c.target_gva,
+                    c.row_stride,
+                    c.height,
+                )
+            },
+            // The format this texture's image is actually created with, not a
+            // re-derivation of it. `registry_ensure_attachment` takes `format`,
+            // so answering the key from anything else lets the identity claim
+            // one format while the image holds another. It did: a
+            // `R16G16_SFLOAT` secondary is admitted by `color_attachment` and
+            // got an identity saying eight-bit RGBA.
+            format,
+        }
+    } else if c.mapping_id != 0 {
+        crate::backend::vulkan::present_identity::surface_identity(
+            state,
+            c.mapping_id,
+            c.width,
+            c.height,
+        )
+    } else {
+        return None;
+    })
+}
+
+/// Refuse, before anything is resolved or uploaded, a fragment shader whose
+/// storage textures the storage rail cannot bind.
+///
+/// Asked of the whole module rather than per bind, because two of the answers
+/// are about the module: an unclassified texture, and a raster-order group the
+/// translated module does not honour. The other two — a shape no colour
+/// resident can stand for, and a statically used storage texture the draw left
+/// unbound — are per texture, and asked here so that no neutral sampled image
+/// can be put where a storage one belongs (the unbound-texture repair below
+/// would otherwise do exactly that).
+pub(super) fn admit_fragment_storage_textures(
+    shader: &crate::runtime::m2v_cache::CachedShader,
+    textures: &[TextureBind],
+) -> Result<(), DrawPreparationDecline> {
+    let reflection = &shader.reflection;
+    if let Some((index, descriptor)) =
+        crate::runtime::spirv_bind::first_unclassified_texture_descriptor(reflection)
+    {
+        return Err(DrawPreparationDecline::TextureAccessUnsupported {
+            stage: "fragment",
+            index,
+            texture_ref: textures
+                .iter()
+                .find(|texture| texture.index == index)
+                .map(|texture| texture.texture_ref)
+                .unwrap_or(0),
+            binding: descriptor.binding,
+            access: "unknown",
+        });
+    }
+    let mut storage = crate::runtime::spirv_bind::reflected_storage_textures(reflection).peekable();
+    if storage.peek().is_none() {
+        return Ok(());
+    }
+    // Any ordered texture refuses, not only a storage one: Metal admits the
+    // qualifier on a writable texture alone, so one on another texture is a
+    // reading this device did not expect and must not run past.
+    match &shader.raster_order {
+        crate::runtime::m2v_cache::TextureRasterOrder::None => {}
+        crate::runtime::m2v_cache::TextureRasterOrder::Ordered(indices) => {
+            return Err(DrawPreparationDecline::RasterOrderedTextureUnsupported {
+                index: indices.first().copied().unwrap_or(u32::MAX),
+            });
+        }
+        crate::runtime::m2v_cache::TextureRasterOrder::Unreadable => {
+            return Err(DrawPreparationDecline::RasterOrderedTextureUnsupported {
+                index: u32::MAX,
+            });
+        }
+    }
+    for (index, descriptor) in storage {
+        let texture_ref = textures
+            .iter()
+            .find(|texture| texture.index == index)
+            .map(|texture| texture.texture_ref)
+            .unwrap_or(0);
+        if let Some(kind) =
+            crate::runtime::spirv_bind::storage_texture_unsupported_shape(reflection, descriptor)
+        {
+            return Err(DrawPreparationDecline::TextureDimensionUnsupported {
+                stage: "fragment",
+                index,
+                texture_ref,
+                binding: descriptor.binding,
+                kind: kind.to_string(),
+            });
+        }
+        if texture_ref == 0 {
+            return Err(DrawPreparationDecline::StorageTextureUnbound {
+                index,
+                binding: descriptor.binding,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// One fragment storage texture, resolved: what the engine binds, the format
+/// its shader image type is specialized to, and where its stores go once the
+/// draw has run.
+pub(super) struct FragmentStorageBind {
+    pub(super) resource: crate::backend::vulkan::engine::StorageImageResource,
+    /// The SPIR-V format the module's image type at `resource.binding` must
+    /// declare for `resource.view_format` to be bindable.
+    pub(super) shader_format: crate::runtime::spirv_bind::ImageFormat,
+    /// The texture described as the colour attachment its resident is keyed
+    /// like, which is the shape every Store rail takes.
+    pub(super) color: ColorRtRequest,
+    pub(super) store: FragmentStorageStore,
+}
+
+/// Where a fragment storage texture's stores land after the draw — one arm per
+/// namespace its resident can be in.
+pub(super) enum FragmentStorageStore {
+    /// A heap-placed or memoryless texture: the resident *is* its storage, so
+    /// there is nothing to write back.
+    HostOnly,
+    /// A mapper-ref-texture surface: the composite Store rail
+    /// (`store_surface_resident`), deferred where the ledger allows it.
+    Surface,
+    /// A normal-texture linear GVA: a resource debt where the ledger can take
+    /// one, else the eager copy into these pages, which were walked before the
+    /// draw was submitted — see `sync_store_allowed_pages` for why the walk
+    /// must predate the submit.
+    Gva {
+        pages: Option<super::StoreTargetPages>,
+    },
+}
+
+/// Resolve a fragment storage texture to the resident its stores go into.
+///
+/// The texture is resolved by the render-target ladder, exactly as a colour
+/// attachment naming it would be, and keyed by [`color_target_identity`], so
+/// the draw stores into the same image a pass rendering into this texture
+/// writes and a later sample of it reads. A storage write keeps every texel the
+/// shader leaves alone, so the image is a load: a guest-backed resident must
+/// already hold the texture (the engine refuses one that does not), and a
+/// host-only one that holds nothing starts at zero.
+///
+/// The format is specialized as the compute rail specializes it — the
+/// translator names a stand-in (`R32f` for `texture2d<float, write>`), and the
+/// bound texture's own format is what the image type must declare.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bind's coordinates, the shader it binds into, and the device's one capability"
+)]
+pub(super) fn resolve_fragment_storage_texture<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    index: u32,
+    texture_ref: u32,
+    binding: u32,
+    reflection: &metal2vulkan::reflect::ShaderReflection,
+    view_caps: crate::backend::vulkan::caps::device_features::StorageViewCaps,
+) -> Result<FragmentStorageBind, DrawPreparationDecline> {
+    let unresolved = |detail| DrawPreparationDecline::StorageTextureUnresolved {
+        index,
+        texture_ref,
+        detail,
+    };
+    let rt = super::render_target::lookup_render_target(
+        state,
+        host,
+        task_id,
+        crate::runtime::render_pass::ColorAttachment {
+            texture_ref,
+            ..Default::default()
+        },
+    )
+    .ok_or(unresolved("render_target_unresolved"))?;
+    if rt.sample_count > 1 {
+        return Err(unresolved("multisampled"));
+    }
+    let format_refusal = |detail| DrawPreparationDecline::StorageTextureFormat {
+        index,
+        texture_ref,
+        format: rt.format,
+        detail,
+    };
+    let selector =
+        pixel_format::storage_selector(rt.format).ok_or(format_refusal("no_storage_selector"))?;
+    let (attachment, _) = translate::pixel::color_attachment(rt.format)
+        .map_err(|_| format_refusal("not_color_renderable"))?;
+    let guest = translate::pixel::storage_image_from_selector(selector);
+    let declared = crate::runtime::spirv_bind::reflected_storage_image_format(reflection, binding)
+        .ok_or(format_refusal("shader_format_unreflected"))?;
+    // The fragment rail does not classify a storage binding's access, so it is
+    // held to the read half too: that only narrows the eight-bit sRGB formats,
+    // whose format-less view a device may allow for writes alone.
+    let shader_format = crate::runtime::compute_exec::vulkan::specialized_storage_image_format(
+        guest,
+        declared,
+        view_caps,
+        crate::runtime::spirv_bind::StorageImageAccess::Unknown,
+    )
+    .map_err(|refusal| {
+        use crate::runtime::compute_exec::vulkan::StorageSpecializeRefusal as R;
+        match refusal {
+            R::Mismatch(detail) | R::SrgbStorage(detail) => format_refusal(detail),
+        }
+    })?;
+    // An `Unknown`-format image takes its view from the texture itself; every
+    // other format names the view it specialized to.
+    let view_format = match shader_format {
+        crate::runtime::spirv_bind::ImageFormat::Unknown => guest.vk_format(),
+        other => crate::runtime::compute_exec::vulkan::spirv_image_format_to_engine_storage(other)
+            .ok_or(format_refusal("spirv_storage_format_unsupported"))?
+            .vk_format(),
+    };
+    let color = ColorRtRequest {
+        slot: 0,
+        texture_ref,
+        mapping_id: rt.mapping_id,
+        target_gva: rt.target_gva,
+        row_stride: rt.row_stride,
+        width: rt.width,
+        height: rt.height,
+        format: rt.format,
+        sample_count: 1,
+        load_action: reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_LOAD,
+        store_action: MTL_STORE_ACTION_STORE,
+        clear_color: [0.0; 4],
+        target_seed_rgba: None,
+        multisample_source_ref: 0,
+        host_only: rt.host_only,
+    };
+    // The resident is the one a colour pass into this texture renders into, so
+    // it is created in the format that pass's rail gives it: a GVA target's
+    // follows `gva_resident_format` (the guest's declaration where the host
+    // renders it, else the neutral format), a surface's is the mapping's own,
+    // and a host-only one is the attachment's. A resident narrowed away from the
+    // texture's own format holds texels a storage view of the texture cannot
+    // name, so that is refused rather than bound through a mismatched view.
+    let gva_format = gva_resident_format(rt.format);
+    let identity = color_target_identity(state, host, task_id, &color, gva_format)
+        .ok_or(unresolved("no_identity"))?;
+    let resident_format = match &identity {
+        crate::backend::vulkan::engine::TargetIdentity::Texture { .. } => attachment.vk,
+        _ => identity.resident_format(),
+    };
+    let allocation = |format| translate::pixel::ResidentFormat::of(format).allocation();
+    if allocation(resident_format) != allocation(attachment.vk) {
+        return Err(format_refusal("resident_format_narrowed"));
+    }
+    let (content, store) = if rt.host_only.is_some() {
+        (
+            crate::backend::vulkan::engine::StorageImageContent::LoadOrClear,
+            FragmentStorageStore::HostOnly,
+        )
+    } else if rt.mapping_id != 0 {
+        (
+            crate::backend::vulkan::engine::StorageImageContent::Load,
+            FragmentStorageStore::Surface,
+        )
+    } else {
+        (
+            crate::backend::vulkan::engine::StorageImageContent::Load,
+            FragmentStorageStore::Gva {
+                pages: super::sync_store_target_pages(state, host, task_id, &color),
+            },
+        )
+    };
+    Ok(FragmentStorageBind {
+        resource: crate::backend::vulkan::engine::StorageImageResource {
+            binding,
+            identity,
+            format: resident_format,
+            view_format,
+            content,
+        },
+        shader_format,
+        color,
+        store,
+    })
+}
+
+/// Land what a draw stored into its fragment storage textures where the guest
+/// can see it, once the engine has run the draw.
+///
+/// The same Store rails a colour attachment of each texture would take, chosen
+/// by the namespace its resident is in: none for a host-only texture, the
+/// composite Store for a surface, a resource debt or else the eager copy for a
+/// GVA. Each also makes stale every host-side copy of the texture's bytes, as
+/// those rails do, so a later sample cannot serve the frame before this draw.
+///
+/// A loss here comes after the draw ran and cannot refuse it, so it is named on
+/// the failure channel instead: `fragment_storage_store_lost`.
+pub(super) fn store_fragment_storage_textures<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    pipeline_ref: u32,
+    binds: &[FragmentStorageBind],
+) {
+    for bind in binds {
+        let identity = &bind.resource.identity;
+        let c = &bind.color;
+        let lost = |route: &'static str, detail: String| {
+            crate::runtime::drain::note_store_route(route);
+            crate::observe::fail(format!(
+                "fragment_storage_store_lost reason={route} pipe={pipeline_ref} \
+                 ref={} {}x{} fmt={:#x} identity={identity:?} {detail}",
+                c.texture_ref, c.width, c.height, c.format
+            ));
+        };
+        match &bind.store {
+            FragmentStorageStore::HostOnly => {
+                crate::runtime::drain::note_store_route("fragment_storage_host_only");
+            }
+            FragmentStorageStore::Surface => {
+                let stored = store_surface_resident(
+                    state,
+                    host,
+                    identity,
+                    c.mapping_id,
+                    c.width,
+                    c.height,
+                    // The storage rail binds device-allocated residents only
+                    // (the engine refuses a guest import), so the Store is a
+                    // copy, never a synchronization of shared backing.
+                    GuestStoreStatus {
+                        guest_backed: false,
+                        recorded: false,
+                        footprint: None,
+                    },
+                );
+                if stored {
+                    crate::runtime::drain::note_store_route("fragment_storage_surface");
+                    publish_surface_store(state, host, c.mapping_id, c.width, c.height, c.format);
+                } else {
+                    lost(
+                        "fragment_storage_surface_refused",
+                        format!("mid={}", c.mapping_id),
+                    );
+                }
+            }
+            FragmentStorageStore::Gva { pages } => {
+                let deferred = crate::backend::vulkan::engine::deferred_gpu_only_content_allowed()
+                    && crate::backend::vulkan::gva_window(identity).is_some_and(|window| {
+                        crate::runtime::writeback_debt::arm_gva(
+                            crate::backend::vulkan::VulkanBackend,
+                            state,
+                            host,
+                            task_id,
+                            c,
+                            window,
+                        )
+                    });
+                if deferred {
+                    crate::runtime::drain::note_store_route("fragment_storage_gva_deferred");
+                    continue;
+                }
+                match crate::runtime::render_writeback::vulkan::store_gva_frame(
+                    state,
+                    host,
+                    task_id,
+                    identity,
+                    c,
+                    c.texture_ref,
+                    pages.as_ref(),
+                    &[],
+                ) {
+                    Ok(_) => {
+                        // The guest's pages hold the frame now; every older
+                        // host-side spelling of the texture is stale.
+                        state.invalidate_object_host_copies(task_id, c.texture_ref);
+                        crate::runtime::surface_cache::evict_gva(state, c.target_gva);
+                        crate::runtime::drain::note_store_route("fragment_storage_gva_eager");
+                    }
+                    Err(decline) => {
+                        crate::observe::Emit::decline("fragment_storage_gva_store", &decline)
+                            .field("pipe", pipeline_ref)
+                            .field("ref", c.texture_ref)
+                            .field("gva", format!("{:#x}", c.target_gva))
+                            .fail_once(c.target_gva);
+                        lost(
+                            "fragment_storage_gva_refused",
+                            format!("gva={:#x}", c.target_gva),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a distinct wire-derived input to the attachment set"
@@ -6666,7 +7104,7 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
     Vec<crate::backend::vulkan::engine::SecondaryColorTarget>,
     crate::runtime::census::present_proxy::SecondaryMrtRefusal,
 > {
-    use crate::backend::vulkan::engine::{SecondaryColorTarget, TargetIdentity};
+    use crate::backend::vulkan::engine::SecondaryColorTarget;
     use crate::runtime::census::present_proxy::SecondaryMrtRefusal;
     if colors.len() <= 1 {
         return Ok(Vec::new());
@@ -6724,60 +7162,10 @@ pub(super) fn build_secondary_targets<M: HostMemory + HostOps>(
             }
         };
         let format = attachment.vk;
-        // Identity mirrors the primary namespaces: normal-texture linear GVA, else
-        // mapper-ref-texture surface.
-        //
-        // A secondary GVA is named by its own backing pages, exactly like color0
-        // — the primary's generation describes a different address (a secondary
-        // equal to the primary is rejected above), so it takes its own walk.
-        // Without one this attachment is keyed on `(gva, width, height)` alone
-        // and two guest allocations reusing that address at that geometry share
-        // one GPU image — the wrong-content class `74748d2` closed for color0.
-        let identity = if let Some(kind) = c.host_only {
-            host_target_identity(kind, task_id, c.texture_ref, c.width, c.height)
-        } else if c.target_gva != 0 {
-            TargetIdentity::Gva {
-                gva: c.target_gva,
-                width: c.width,
-                height: c.height,
-                generation: if c.texture_ref != 0 {
-                    crate::runtime::writeback_debt::gva_resource_generation(
-                        state,
-                        host,
-                        crate::runtime::writeback_debt::GvaResourceKey {
-                            task_id,
-                            texture_ref: c.texture_ref,
-                        },
-                        c.target_gva,
-                        u64::from(c.row_stride).saturating_mul(u64::from(c.height)),
-                    )
-                } else {
-                    gva_span_alloc_generation(
-                        state,
-                        host,
-                        task_id,
-                        c.target_gva,
-                        c.row_stride,
-                        c.height,
-                    )
-                },
-                // The format this attachment's image is actually created with,
-                // not a re-derivation of it. `registry_ensure_attachment` takes
-                // `format` — resolved just above by `color_attachment` — so
-                // answering the key from anything else lets the identity claim
-                // one format while the image holds another. It did: a
-                // `R16G16_SFLOAT` secondary is admitted by `color_attachment`
-                // and got an identity saying eight-bit RGBA.
-                format,
-            }
-        } else if c.mapping_id != 0 {
-            crate::backend::vulkan::present_identity::surface_identity(
-                state,
-                c.mapping_id,
-                c.width,
-                c.height,
-            )
-        } else {
+        // A secondary GVA takes its own walk: the primary's generation describes
+        // a different address (a secondary equal to the primary is rejected
+        // below). See `color_target_identity`.
+        let Some(identity) = color_target_identity(state, host, task_id, c, format) else {
             crate::runtime::census::present_proxy::note_secondary_mrt_drop(
                 crate::runtime::census::present_proxy::MrtDrop::NoIdentity,
                 c.width,
@@ -7126,33 +7514,33 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         ));
     }
 
-    for (stage, shader, textures) in [
-        ("vertex", &v_shader, &req.vertex_textures),
-        ("fragment", &f_shader, &req.fragment_textures),
-    ] {
-        if let Some((index, descriptor)) =
-            crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&shader.reflection)
-        {
-            let access = match descriptor.access {
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Unknown => "unknown",
-                crate::runtime::spirv_bind::ReflectedTextureAccess::Sampled => continue,
-            };
-            return Err(DrawError::DrawPreparation(
-                DrawPreparationDecline::TextureAccessUnsupported {
-                    stage,
-                    index,
-                    texture_ref: textures
-                        .iter()
-                        .find(|texture| texture.index == index)
-                        .map(|texture| texture.texture_ref)
-                        .unwrap_or(0),
-                    binding: descriptor.binding,
-                    access,
-                },
-            ));
-        }
+    // The vertex stage binds sampled textures only. The fragment stage also has
+    // the storage rail, and what that rail cannot bind is refused here, before
+    // any texture is resolved.
+    if let Some((index, descriptor)) =
+        crate::runtime::spirv_bind::first_non_sampled_texture_descriptor(&v_shader.reflection)
+    {
+        let access = match descriptor.access {
+            crate::runtime::spirv_bind::ReflectedTextureAccess::Storage => "storage",
+            _ => "unknown",
+        };
+        return Err(DrawError::DrawPreparation(
+            DrawPreparationDecline::TextureAccessUnsupported {
+                stage: "vertex",
+                index,
+                texture_ref: req
+                    .vertex_textures
+                    .iter()
+                    .find(|texture| texture.index == index)
+                    .map(|texture| texture.texture_ref)
+                    .unwrap_or(0),
+                binding: descriptor.binding,
+                access,
+            },
+        ));
     }
+    admit_fragment_storage_textures(&f_shader, &req.fragment_textures)
+        .map_err(DrawError::DrawPreparation)?;
     for (stage, expected_stage, shader) in [
         (
             "vertex",
@@ -7672,6 +8060,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // is something the guest asked for. See
         // [`crate::runtime::gpu_hang_trail::SamplerNote`].
         let mut sampler_origin: std::collections::BTreeMap<u32, u8> = Default::default();
+        // Fragment storage textures, resolved by `push_tex` beside the sampled
+        // ones; see `resolve_fragment_storage_texture`.
+        let mut fragment_storage: Vec<FragmentStorageBind> = Vec::new();
+        let storage_view_caps = crate::backend::vulkan::engine::storage_view_caps();
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
@@ -7701,6 +8093,26 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     use crate::runtime::spirv_bind::ReflectedTextureAccess;
                     let unsupported = match descriptor.access {
                         ReflectedTextureAccess::Sampled => None,
+                        // The storage rail: the texture's resident, bound as a
+                        // storage image at its reflected binding. Storage images
+                        // are not moved by the sampled-band relocation, so
+                        // `img_bind`'s offset does not apply to them.
+                        ReflectedTextureAccess::Storage if frag_stage => {
+                            fragment_storage.push(
+                                resolve_fragment_storage_texture(
+                                    state,
+                                    host,
+                                    req.task_id,
+                                    index,
+                                    texture_ref,
+                                    descriptor.binding,
+                                    reflection,
+                                    storage_view_caps,
+                                )
+                                .map_err(DrawError::DrawPreparation)?,
+                            );
+                            return Ok(());
+                        }
                         ReflectedTextureAccess::Storage => Some("storage"),
                         ReflectedTextureAccess::Unknown => Some("unknown"),
                     };
@@ -8947,6 +9359,33 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.vertex_attributes = attrs;
         resources.storage_buffers = storage;
         resources.sampled_images = images;
+        resources.storage_images = fragment_storage
+            .iter()
+            .map(|bind| bind.resource.clone())
+            .collect();
+        // The module this draw binds them through: the fragment variant with
+        // each storage image type specialized to its texture's format.
+        let f_words = if fragment_storage.is_empty() {
+            f_words
+        } else {
+            let requested: Vec<_> = fragment_storage
+                .iter()
+                .map(|bind| (bind.resource.binding, bind.shader_format))
+                .collect();
+            f_shader
+                .storage_specialized(separate_sampled, buf_collide, &requested)
+                .map_err(|error| {
+                    crate::observe::Emit::decline("fragment_storage_format", &error)
+                        .field("pipe", req.pipeline_ref)
+                        .fail();
+                    DrawError::DrawPreparation(DrawPreparationDecline::StorageTextureFormat {
+                        index: u32::MAX,
+                        texture_ref: 0,
+                        format: 0,
+                        detail: "spirv_specialize_failed",
+                    })
+                })?
+        };
         resources.color_inputs = frag_color_inputs;
         resources.continues_render_pass = req.continues_render_pass;
         resources.render_pass_continues = req.render_pass_continues;
@@ -9465,6 +9904,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .map(|s| s.binding)
             .chain(resources.sampled_images.iter().map(|i| i.binding))
             .chain(resources.samplers.iter().map(|s| s.binding))
+            .chain(resources.storage_images.iter().map(|i| i.binding))
             .collect();
         let frag_gap =
             crate::runtime::gpu_hang_trail::gap(&frag_declared_bindings, &frag_layout_bindings);
@@ -9687,6 +10127,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        store_fragment_storage_textures(
+            state,
+            host,
+            req.task_id,
+            req.pipeline_ref,
+            &fragment_storage,
+        );
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan

@@ -384,6 +384,27 @@ fragment float4 render_barrier_read_fs(VOut in [[stage_in]],
                    : float4(1.0, 0.0, 0.0, 1.0);
 }
 
+// Fragment storage writes. Each fragment stores into a texture that is not the
+// pass's attachment, at its own pixel, so the stored image is fully determined
+// by the colour and the coverage; the attachment output is incidental.
+fragment float4 storage_write_fs(VOut in [[stage_in]],
+                                 texture2d<float, access::write> dst [[texture(0)]],
+                                 constant float4 &colour [[buffer(0)]]) {
+    dst.write(colour, uint2(in.pos.xy));
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
+
+// The read_write form: the texel the shader stores depends on the one it
+// loads, so a device that binds the image without its prior contents, or
+// orders the store before an earlier pass's write, stores a different value.
+fragment float4 storage_accumulate_fs(VOut in [[stage_in]],
+                                      texture2d<float, access::read_write> dst [[texture(0)]],
+                                      constant float4 &colour [[buffer(0)]]) {
+    uint2 p = uint2(in.pos.xy);
+    dst.write(dst.read(p) + colour, p);
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
+
 fragment float4 tex_fs(VOut in [[stage_in]],
                        texture2d<float, access::sample> tex [[texture(0)]]) {
     constexpr sampler s(filter::nearest, address::clamp_to_edge);

@@ -310,6 +310,10 @@ enum PassObstacle {
     MrtLayout,
     /// `vkCmdResetQueryPool` for an occlusion query.
     QueryReset,
+    /// A fragment storage image made ready for the shader's reads and writes:
+    /// the barrier after whatever last touched its resident, and the clear of a
+    /// host-only one that holds nothing yet.
+    StorageImage,
 }
 
 impl PassObstacle {
@@ -342,6 +346,7 @@ impl PassObstacle {
             Self::Gather => "passmerge_outside_gather",
             Self::MrtLayout => "passmerge_outside_mrt_layout",
             Self::QueryReset => "passmerge_outside_query_reset",
+            Self::StorageImage => "passmerge_outside_storage_image",
         }
     }
 
@@ -359,6 +364,7 @@ impl PassObstacle {
             Self::SampledUpload => "passheld_outside_sampled_upload",
             Self::Gather => "passheld_outside_gather",
             Self::QueryReset => "passheld_outside_query_reset",
+            Self::StorageImage => "passheld_outside_storage_image",
         }
     }
 }
@@ -2042,6 +2048,66 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
+    validate_storage_images(req)
+}
+
+/// The request-shape rules for [`DrawRequest::storage_images`].
+///
+/// Each storage image is a resident the draw both reads and writes, so beyond
+/// owning its binding it must not be any other view of an image this draw
+/// touches: not an attachment of the pass, and not a resident it samples.
+/// `aliases` and not `==` for both, for the reason `build_secondary_targets`
+/// gives — the destination is the conflict, and two spellings of one guest
+/// object at two formats are still one object.
+fn validate_storage_images(req: &DrawRequest) -> Result<(), DrawError> {
+    for (seen, image) in req.storage_images.iter().enumerate() {
+        let binding = image.binding;
+        if image.identity.width() == 0 || image.identity.height() == 0 {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::StorageImageZeroGeometry { binding },
+            ));
+        }
+        if descriptor_binding_claimed(
+            req,
+            (binding, 0),
+            req.storage_buffers.len(),
+            req.sampled_images.len(),
+            req.samplers.len(),
+        ) || req.sampled_images.iter().any(|s| s.binding == binding)
+            || req.storage_images[..seen]
+                .iter()
+                .any(|other| other.binding == binding)
+        {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::DuplicateStorageImageDescriptorBinding { binding },
+            ));
+        }
+        let attachments = req
+            .target_identity
+            .iter()
+            .chain(req.secondary_targets.iter().map(|s| &s.identity))
+            .chain(req.depth.as_ref().and_then(|d| d.identity.as_ref()));
+        if attachments
+            .into_iter()
+            .any(|attached| attached.aliases(&image.identity))
+        {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::StorageImageAliasesAttachment { binding },
+            ));
+        }
+        let sampled_targets = req.sampled_images.iter().filter_map(|s| match &s.source {
+            SampledSource::Target(identity) => Some(identity),
+            _ => None,
+        });
+        if sampled_targets
+            .into_iter()
+            .any(|sampled| sampled.aliases(&image.identity))
+        {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::StorageImageAliasesSampled { binding },
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2968,6 +3034,17 @@ pub(crate) unsafe fn execute_draw_inner(
             binding: b.binding,
             ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
             stages: (vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT).as_raw(),
+            count: 1,
+        });
+    }
+    // Fragment stage only: the storage rail binds what a fragment shader
+    // writes, and the runtime refuses a vertex-stage storage texture before a
+    // request is built.
+    for b in &req.storage_images {
+        layout_bindings.push(BindingSig {
+            binding: b.binding,
+            ty: vk::DescriptorType::STORAGE_IMAGE.as_raw() as u32,
+            stages: vk::ShaderStageFlags::FRAGMENT.as_raw(),
             count: 1,
         });
     }
@@ -4240,6 +4317,11 @@ pub(crate) unsafe fn execute_draw_inner(
         }
     }
 
+    // Fragment storage images: each is the texture's registry resident, ensured
+    // the way a colour attachment of that texture would be, and bound through a
+    // view in the format the shader's image type was specialized to.
+    let storage = prepare_storage_images(ctx, pools, counters, req)?;
+
     phase.enter(super::draw_phase::Phase::AcquireReadback);
     // Sized by the attachment's own texel, not by a constant four. The copy at
     // the end of this command buffer names an image extent and no buffer row
@@ -4337,6 +4419,7 @@ pub(crate) unsafe fn execute_draw_inner(
         &sampled,
         &sampler_handles,
         &color_inputs,
+        &storage,
     );
     if let Some(dset) = dset {
         // An allocated set is fresh out of the pool and carries nothing, so
@@ -4701,6 +4784,86 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &[],
         );
+    }
+
+    // Fragment storage images: wait for whatever last touched each resident and
+    // make it readable and writable by the fragment stage, in `GENERAL`.
+    //
+    // Recorded every draw, including after a storage write by the draw before:
+    // successive storage draws over one image are then ordered, where Metal
+    // orders them only across a barrier this device decodes as a no-op. That is
+    // stronger than the contract and costs a closed pass per storage draw — the
+    // price of not reading a render encoder's barriers yet.
+    let mut barriered_storage = std::collections::HashSet::new();
+    for image in &storage {
+        if !barriered_storage.insert(image.identity.clone()) {
+            continue;
+        }
+        unsafe { outside_pass.before_record(PassObstacle::StorageImage, pools, &ctx.device, cb) };
+        let (src_stage, src_access) = image.access.source_scope();
+        let shader_stage = vk::PipelineStageFlags::FRAGMENT_SHADER;
+        let shader_access = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
+        if image.clear {
+            // Nothing in the resident is this identity's, so the transition
+            // discards (`UNDEFINED`); the source scope still orders the clear
+            // after whatever last used the image.
+            let to_clear = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(STORAGE_IMAGE_LAYOUT)
+                .image(image.image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_clear,
+            );
+            ctx.device.cmd_clear_color_image(
+                cb,
+                image.image,
+                STORAGE_IMAGE_LAYOUT,
+                &vk::ClearColorValue::default(),
+                &[super::color_subresource_range()],
+            );
+            let to_shader = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(shader_access)
+                .old_layout(STORAGE_IMAGE_LAYOUT)
+                .new_layout(STORAGE_IMAGE_LAYOUT)
+                .image(image.image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                shader_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_shader,
+            );
+        } else {
+            let to_shader = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(shader_access)
+                .old_layout(image.access.layout())
+                .new_layout(STORAGE_IMAGE_LAYOUT)
+                .image(image.image)
+                .subresource_range(super::color_subresource_range())];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                shader_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_shader,
+            );
+        }
     }
 
     // Resident samples: transition the persistent target in place. Duplicate
@@ -5816,6 +5979,15 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_access(seed_identity, next_access);
         }
     }
+    // A storage image now holds what the shader stored, and only the resident
+    // holds it: ready, last touched by a fragment-shader write, and sole copy
+    // until the runtime's Store lands it in guest pages.
+    for image in &storage {
+        pools.registry_mark_ready_with_access(
+            &image.identity,
+            super::pools::ResidentAccess::StorageWrite(STORAGE_IMAGE_LAYOUT),
+        );
+    }
     // Deferred-submit draw: park the per-draw descriptor set on the open batch
     // (opening it if this is the first), hand the batch this draw's sampled
     // images for the content cache, and return. The CPU-side bookkeeping above
@@ -6197,6 +6369,7 @@ fn fill_descriptor_bindings(
     sampled: &[PreparedSampled],
     sampler_handles: &[(u32, vk::Sampler)],
     color_inputs: &[(u32, vk::ImageView, vk::ImageLayout)],
+    storage_images: &[PreparedStorage],
 ) {
     out.extend(storage_slots.iter().map(|(binding, bound, len)| {
         super::pools::PushDescriptorBinding::Buffer {
@@ -6240,6 +6413,131 @@ fn fill_descriptor_bindings(
             layout,
         }
     }));
+    out.extend(
+        storage_images
+            .iter()
+            .map(|image| super::pools::PushDescriptorBinding::Image {
+                binding: image.binding,
+                array_element: 0,
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                sampler: vk::Sampler::null(),
+                view: image.view,
+                layout: STORAGE_IMAGE_LAYOUT,
+            }),
+    );
+}
+
+/// The layout a fragment storage image is bound and left in. `GENERAL` is the
+/// only layout a storage descriptor may name.
+const STORAGE_IMAGE_LAYOUT: vk::ImageLayout = vk::ImageLayout::GENERAL;
+
+/// One fragment storage image, resolved to the resident it binds.
+struct PreparedStorage {
+    binding: u32,
+    identity: super::types::TargetIdentity,
+    image: vk::Image,
+    view: vk::ImageView,
+    /// What last touched the resident, read after it was ensured — the source
+    /// scope of the barrier into the shader's access.
+    access: super::pools::ResidentAccess,
+    /// A host-only resident that holds nothing yet: cleared to zero before the
+    /// shader runs. See [`super::types::StorageImageContent::LoadOrClear`].
+    clear: bool,
+}
+
+/// Resolve every storage image of `req` to its resident, refusing — before
+/// anything is recorded — what the device or the resident cannot honour.
+///
+/// The order of the checks is the order of the questions: can the device store
+/// from a fragment shader at all, can it store this format, is the resident one
+/// it can bind as storage, and does it hold what the shader must load.
+unsafe fn prepare_storage_images(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    req: &DrawRequest,
+) -> Result<Vec<PreparedStorage>, DrawError> {
+    let mut storage = Vec::with_capacity(req.storage_images.len());
+    for resource in &req.storage_images {
+        let binding = resource.binding;
+        if !ctx.features.fragment_stores_and_atomics {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::FragmentStoresUnsupported { binding },
+            ));
+        }
+        // The allocation must carry `STORAGE` usage, which the registry gives
+        // exactly the formats this answers yes for, and the view must be one
+        // a storage descriptor may name.
+        let allocation =
+            crate::backend::vulkan::translate::pixel::ResidentFormat::of(resource.format)
+                .allocation();
+        for format in [allocation, resource.view_format] {
+            if !ctx.supports_optimal_storage_image(format) {
+                return Err(DrawError::Unsupported(
+                    super::reason::DrawReason::StorageImageFormatUnsupported { binding, format },
+                ));
+            }
+        }
+        let identity = &resource.identity;
+        pools.registry_ensure_attachment(
+            ctx,
+            identity.clone(),
+            identity.width(),
+            identity.height(),
+            1,
+            identity.generation(),
+            resource.format,
+            counters,
+        )?;
+        // Using it is reading it, for the registry's age: a resident a draw
+        // stores into is one the guest is actively drawing with.
+        pools.registry_note_sampled_use(identity);
+        let (image, access, ready, imported) = {
+            let slot = pools
+                .registry_get(identity)
+                .expect("the resident ensured on the line above is registered");
+            (
+                slot.image,
+                slot.access,
+                slot.content_ready,
+                slot.memory.is_guest_imported(),
+            )
+        };
+        // Asked after the ensure, not before: ensuring may have recreated the
+        // resident, and only the slot that will be bound can say what it holds.
+        if imported {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::StorageImageGuestImported {
+                    binding,
+                    identity: identity.clone(),
+                },
+            ));
+        }
+        let clear = match (ready, resource.content) {
+            (true, _) => false,
+            (false, super::types::StorageImageContent::LoadOrClear) => true,
+            (false, super::types::StorageImageContent::Load) => {
+                return Err(DrawError::DrawExecution(
+                    DrawExecutionDecline::StorageImageContentNotReady {
+                        binding,
+                        identity: identity.clone(),
+                    },
+                ))
+            }
+        };
+        let view = pools
+            .registry_sample_view(ctx, identity, resource.view_format, counters)?
+            .expect("the resident ensured above is registered");
+        storage.push(PreparedStorage {
+            binding,
+            identity: identity.clone(),
+            image,
+            view,
+            access,
+            clear,
+        });
+    }
+    Ok(storage)
 }
 
 /// Derive Vulkan's write structures from `bindings` and hand them to `f`.
@@ -7841,6 +8139,150 @@ mod tests {
             "distinct array elements of one binding are not a duplicate: {:?}",
             validate_v1(&array).err()
         );
+    }
+
+    fn storage_texture(ref_: u32) -> super::super::types::TargetIdentity {
+        super::super::types::TargetIdentity::Texture {
+            ref_,
+            width: 16,
+            height: 16,
+            generation: 1 << 63,
+            stencil: false,
+        }
+    }
+
+    fn storage_image_at(
+        binding: u32,
+        identity: super::super::types::TargetIdentity,
+    ) -> super::super::types::StorageImageResource {
+        super::super::types::StorageImageResource {
+            binding,
+            identity,
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            view_format: vk::Format::R16G16B16A16_SFLOAT,
+            content: super::super::types::StorageImageContent::LoadOrClear,
+        }
+    }
+
+    fn storage_refusal(req: &DrawRequest) -> Option<DrawValidationDecline> {
+        match validate_v1(req) {
+            Err(DrawError::DrawValidation(decline)) => Some(decline),
+            Ok(()) => None,
+            Err(other) => panic!("a storage-image check refuses as validation: {other:?}"),
+        }
+    }
+
+    /// A fragment storage image owns its binding against every other descriptor
+    /// list, and names no image the same draw renders into or samples.
+    ///
+    /// Each of these is a different hazard (two descriptors on one binding; a
+    /// pass and a shader writing one image; a shader sampling what it stores),
+    /// and each must refuse before anything is ensured or recorded.
+    #[test]
+    fn a_storage_image_owns_its_binding_and_aliases_nothing_the_draw_touches() {
+        let mut alone = validatable_request();
+        alone.storage_images = vec![storage_image_at(600, storage_texture(7))];
+        assert_eq!(storage_refusal(&alone), None, "one storage image is valid");
+
+        for (name, mut req) in [
+            ("a storage buffer", {
+                let mut req = validatable_request();
+                req.storage_buffers = vec![storage_at(600)];
+                req
+            }),
+            ("a sampled image", {
+                let mut req = validatable_request();
+                req.sampled_images = vec![sampled_at(600, 0)];
+                req
+            }),
+            ("another storage image", {
+                let mut req = validatable_request();
+                req.storage_images = vec![storage_image_at(600, storage_texture(8))];
+                req
+            }),
+        ] {
+            req.storage_images
+                .push(storage_image_at(600, storage_texture(7)));
+            assert_eq!(
+                storage_refusal(&req),
+                Some(
+                    DrawValidationDecline::DuplicateStorageImageDescriptorBinding { binding: 600 }
+                ),
+                "a storage image on {name}'s binding"
+            );
+        }
+
+        let mut attached = validatable_request();
+        attached.target_identity = Some(storage_texture(7));
+        attached.storage_images = vec![storage_image_at(600, storage_texture(7))];
+        assert_eq!(
+            storage_refusal(&attached),
+            Some(DrawValidationDecline::StorageImageAliasesAttachment { binding: 600 }),
+            "the draw's own colour target"
+        );
+
+        // `aliases`, not `==`: the same texture ref at another generation is
+        // the same guest object.
+        let mut attached_other_key = validatable_request();
+        attached_other_key.target_identity = Some(storage_texture(7));
+        let mut other_generation = storage_texture(7);
+        if let super::super::types::TargetIdentity::Texture { generation, .. } =
+            &mut other_generation
+        {
+            *generation = 5;
+        }
+        attached_other_key.storage_images = vec![storage_image_at(600, other_generation)];
+        assert_eq!(
+            storage_refusal(&attached_other_key),
+            Some(DrawValidationDecline::StorageImageAliasesAttachment { binding: 600 }),
+        );
+
+        let mut sampled = validatable_request();
+        let mut sample = sampled_at(40, 0);
+        sample.source = SampledSource::Target(storage_texture(7));
+        sample.width = 16;
+        sample.height = 16;
+        sampled.sampled_images = vec![sample];
+        sampled.storage_images = vec![storage_image_at(600, storage_texture(7))];
+        assert_eq!(
+            storage_refusal(&sampled),
+            Some(DrawValidationDecline::StorageImageAliasesSampled { binding: 600 }),
+        );
+
+        let mut empty = validatable_request();
+        empty.storage_images = vec![storage_image_at(
+            600,
+            super::super::types::TargetIdentity::Texture {
+                ref_: 7,
+                width: 0,
+                height: 16,
+                generation: 0,
+                stencil: false,
+            },
+        )];
+        assert_eq!(
+            storage_refusal(&empty),
+            Some(DrawValidationDecline::StorageImageZeroGeometry { binding: 600 }),
+        );
+    }
+
+    /// A storage write is visible to no render pass's external dependency, so
+    /// nothing may treat it as already covered — a later sample of the image
+    /// must record a barrier (and close an open pass to do it), and the barrier
+    /// must name the fragment stage's read and write.
+    #[test]
+    fn a_storage_write_is_never_covered_by_a_pass_entry() {
+        let written = super::super::pools::ResidentAccess::StorageWrite(STORAGE_IMAGE_LAYOUT);
+        assert!(!written.covered_by_pass_entry());
+        assert_eq!(written.layout(), vk::ImageLayout::GENERAL);
+        assert_eq!(
+            written.source_scope(),
+            (
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            )
+        );
+        assert!(!pass_exit_needs_no_barrier(written));
     }
 
     /// A descriptor that is both malformed and duplicated reports the malformed
