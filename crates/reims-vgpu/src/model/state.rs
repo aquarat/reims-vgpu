@@ -3251,6 +3251,16 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
     pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u32, u16), GuestLinearMemo>,
+    /// Converted two-plane Y'CbCr textures, memoized on their planes' bytes the
+    /// way [`Self::guest_linear_memo`] is on a linear texture's: every bind
+    /// re-reads both planes and byte-compares, so a guest write is always seen,
+    /// and only an unchanged pair skips the conversion. Same byte cap
+    /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]) and the same eviction. A derived copy,
+    /// never guest state: an evicted entry is re-converted on the next bind.
+    pub two_plane_memo: LruBytesMemo<
+        crate::runtime::two_plane::TwoPlaneMemoKey,
+        crate::runtime::two_plane::TwoPlaneMemo,
+    >,
     /// Whether the hypervisor's guest-write generation would be a sound "these
     /// texels did not change" key for the zero-copy sampled gathers, measured
     /// against the bytes themselves. See
@@ -3624,6 +3634,7 @@ impl DeviceState {
             stamp_ledger: Default::default(),
             gva_resident_backing: std::collections::BTreeMap::new(),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
+            two_plane_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             gather_witness: crate::runtime::gather_witness::GatherWitness::default(),
             bound_buffers: crate::runtime::bound_buffers::BoundBuffers::default(),
             buffer_write_gen: crate::runtime::buffer_write_gen::BufferWriteGens::default(),

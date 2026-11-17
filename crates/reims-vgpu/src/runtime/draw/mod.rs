@@ -65,6 +65,11 @@ use reims_vgpu_protocol::pass_action::{
 // sibling of `metal`, and gated once here rather than per item.
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
+// The Vulkan sampled rail's bind of a two-plane Y'CbCr texture. It hands the
+// converted texels over as the rail's own `SampledSourceRequest`, so it is
+// gated with that rail.
+#[cfg(feature = "backend-vulkan")]
+mod two_plane;
 // Only for `exec`'s pass-extent census, which declares its own copy of these
 // bands because it runs on every backend. See
 // `the_two_coverage_censuses_use_the_same_bands`.
@@ -1906,6 +1911,28 @@ fn sample_miss_detail<M: HostMemory + HostOps>(
                         l0.map(|l| l.row_stride).unwrap_or(0),
                     )
                 }
+            }
+        }
+        crate::runtime::two_plane::OBJECT_TYPE_DUAL_PLANE_TEXTURE => {
+            // The bind's own refusal (`draw_sample_two_plane`, a
+            // `two_plane_*` slug) has already said why; this names the object.
+            match objects::resolve_resource(state, host, task_id, texture_ref)
+                .ok()
+                .as_deref()
+                .map(crate::model::TaskResource::decoded)
+            {
+                Some(Ok(crate::runtime::decode::resource::Descriptor::DualPlaneTexture(dual))) => {
+                    format!(
+                        "type=12 desc_len={desc_len} pf={} plane0={}x{} plane1={}x{} \
+                         reason=two_plane_refused",
+                        dual.pixel_format(),
+                        dual.planes[0].width,
+                        dual.planes[0].height,
+                        dual.planes[1].width,
+                        dual.planes[1].height,
+                    )
+                }
+                _ => format!("type=12 desc_len={desc_len} reason=two_plane_undecoded"),
             }
         }
         other => format!("type={other} desc_len={desc_len} reason=unsupported_object_type"),

@@ -143,6 +143,8 @@ pub mod surface_currency;
 pub mod task_slot;
 /// Texture / mapper-ref-texture geometry registration.
 pub mod texture;
+/// Two-plane Y'CbCr textures: placing their planes and converting them.
+pub mod two_plane;
 /// Track host-authoritative surface and GVA frames, and transfer them on demand.
 pub mod writeback_debt;
 
