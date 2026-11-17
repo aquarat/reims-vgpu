@@ -129,15 +129,51 @@ pub enum DrawPreparationDecline {
         index: u32,
         binding: u32,
     },
-    /// The render engine currently exposes guest textures as sampled images.
-    /// Binding a reflected storage image through that descriptor type would be
-    /// invalid Vulkan, so refuse before constructing the request.
+    /// A texture the shader reads or writes directly that this backend has no
+    /// rail for: a storage texture in the **vertex** stage (the storage rail
+    /// binds what a fragment shader writes), or a texture whose access
+    /// reflection could not classify at all.
     TextureAccessUnsupported {
         stage: &'static str,
         index: u32,
         texture_ref: u32,
         binding: u32,
         access: &'static str,
+    },
+    /// A fragment storage texture the module statically uses and the draw did
+    /// not bind. Unlike a sampled texture there is no neutral stand-in: a store
+    /// into a placeholder would be guest work that lands nowhere.
+    StorageTextureUnbound {
+        index: u32,
+        binding: u32,
+    },
+    /// A fragment storage texture whose resident this device cannot name: the
+    /// render-target ladder refused it (its own `rt_resolve` line says which
+    /// rung), or it resolved to a multisampled texture.
+    StorageTextureUnresolved {
+        index: u32,
+        texture_ref: u32,
+        detail: &'static str,
+    },
+    /// A fragment storage texture whose format the storage rail cannot bind:
+    /// no storage selector for the guest format, no reflected storage format in
+    /// the shader, or a shader format the guest's cannot be specialized to
+    /// (`detail` is the specializer's own reason).
+    StorageTextureFormat {
+        index: u32,
+        texture_ref: u32,
+        format: u16,
+        detail: &'static str,
+    },
+    /// A fragment shader stores through a texture argument that declares
+    /// `[[raster_order_group(n)]]`, or whose raster order could not be read.
+    ///
+    /// The group orders overlapping fragments' accesses, which Vulkan spells as
+    /// a fragment-shader interlock; the translated module carries none, so it
+    /// would run the stores unordered. `index` is the Metal texture index, or
+    /// `u32::MAX` when the metadata was unreadable.
+    RasterOrderedTextureUnsupported {
+        index: u32,
     },
     /// A valid reflected resource needs a runtime provisioning path this
     /// backend does not implement. Treating its index as an ordinary stream
@@ -304,6 +340,12 @@ impl Decline for DrawPreparationDecline {
             }
             Self::UnboundStorageBuffer { .. } => "draw_prepare_unbound_storage_buffer",
             Self::TextureAccessUnsupported { .. } => "draw_prepare_texture_access_unsupported",
+            Self::StorageTextureUnbound { .. } => "draw_prepare_storage_texture_unbound",
+            Self::StorageTextureUnresolved { .. } => "draw_prepare_storage_texture_unresolved",
+            Self::StorageTextureFormat { .. } => "draw_prepare_storage_texture_format",
+            Self::RasterOrderedTextureUnsupported { .. } => {
+                "draw_prepare_raster_ordered_texture_unsupported"
+            }
             Self::ReflectedResourceUnsupported { .. } => {
                 "draw_prepare_reflected_resource_unsupported"
             }
@@ -538,6 +580,33 @@ impl Decline for DrawPreparationDecline {
                 ("binding", binding.to_string()),
                 ("access", (*access).to_string()),
             ],
+            Self::StorageTextureUnbound { index, binding } => vec![
+                ("index", index.to_string()),
+                ("binding", binding.to_string()),
+            ],
+            Self::StorageTextureUnresolved {
+                index,
+                texture_ref,
+                detail,
+            } => vec![
+                ("index", index.to_string()),
+                ("texture_ref", texture_ref.to_string()),
+                ("detail", (*detail).to_string()),
+            ],
+            Self::StorageTextureFormat {
+                index,
+                texture_ref,
+                format,
+                detail,
+            } => vec![
+                ("index", index.to_string()),
+                ("texture_ref", texture_ref.to_string()),
+                ("format", format!("{format:#x}")),
+                ("detail", (*detail).to_string()),
+            ],
+            Self::RasterOrderedTextureUnsupported { index } => {
+                vec![("index", index.to_string())]
+            }
             Self::ReflectedResourceUnsupported {
                 stage,
                 index,
@@ -803,6 +872,22 @@ mod tests {
                 binding: 34,
                 access: "storage",
             },
+            DrawPreparationDecline::StorageTextureUnbound {
+                index: 2,
+                binding: 600,
+            },
+            DrawPreparationDecline::StorageTextureUnresolved {
+                index: 2,
+                texture_ref: 7,
+                detail: "render_target_unresolved",
+            },
+            DrawPreparationDecline::StorageTextureFormat {
+                index: 2,
+                texture_ref: 7,
+                format: 0x73,
+                detail: "no_storage_selector",
+            },
+            DrawPreparationDecline::RasterOrderedTextureUnsupported { index: 2 },
             DrawPreparationDecline::ReflectedResourceUnsupported {
                 stage: "fragment",
                 index: 2,
@@ -897,7 +982,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 36, "the draw-preparation reason census moved");
+        assert_eq!(before, 40, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

@@ -2517,8 +2517,28 @@ pub fn raster_ordered_texture_indices(ll: &str) -> Vec<u32> {
     indices
 }
 
+/// First texture descriptor whose access reflection could not classify as
+/// either sampled or storage — the one texture neither render rail can bind.
+pub fn first_unclassified_texture_descriptor(
+    reflection: &ShaderReflection,
+) -> Option<(u32, ReflectedTextureDescriptor)> {
+    reflection.bindings.iter().find_map(|binding| {
+        if !is_texture_kind(binding.kind)
+            || matches!(
+                binding.access,
+                Some(ResourceAccess::Sampled | ResourceAccess::Storage)
+            )
+        {
+            return None;
+        }
+        reflected_texture_descriptor(reflection, binding.metal_index)
+            .map(|descriptor| (binding.metal_index, descriptor))
+    })
+}
+
 /// First texture descriptor that cannot be exposed through a sampled-image
-/// render binding. Compute has a storage-image request path; render does not.
+/// binding: a storage texture, or an unclassified one. The vertex stage binds
+/// sampled textures only; the fragment stage has the storage rail besides.
 pub fn first_non_sampled_texture_descriptor(
     reflection: &ShaderReflection,
 ) -> Option<(u32, ReflectedTextureDescriptor)> {

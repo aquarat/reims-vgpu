@@ -8157,3 +8157,353 @@ fn both_spellings_of_the_channel_exchange_agree_and_are_their_own_inverse() {
         );
     }
 }
+
+/// A fragment-stage reflection with one texture argument at Metal index
+/// `index`, descriptor `binding`, declared with `shape`, classified `access`.
+#[cfg(feature = "backend-vulkan")]
+fn fragment_texture_reflection(
+    index: u32,
+    binding: u32,
+    shape: metal2vulkan::meta::TextureShape,
+    access: Option<metal2vulkan::reflect::ResourceAccess>,
+) -> metal2vulkan::reflect::ShaderReflection {
+    use metal2vulkan::reflect::{DescriptorLocation, ResourceBinding, ResourceKind, ShaderStage};
+    let mut reflection = shader_pull_reflection(&[]);
+    reflection.stage = ShaderStage::Fragment;
+    reflection.vertex_builtins = None;
+    reflection.bindings.push(ResourceBinding {
+        kind: ResourceKind::Texture,
+        metal_index: index,
+        descriptor: Some(DescriptorLocation {
+            set: 0,
+            binding,
+            count: 1,
+        }),
+        param_index: None,
+        stage_input_location: None,
+        address_space: None,
+        declared_size: None,
+        extent: None,
+        footprint: None,
+        type_layout: None,
+        type_name: None,
+        texture_shape: Some(shape),
+        embedded_source: None,
+        access,
+        static_sampler: None,
+    });
+    reflection
+}
+
+/// `texture2d<float, write>` as the translator reflects it: a full-width float
+/// stand-in format (`R32f`) the bound texture's own must replace.
+#[cfg(feature = "backend-vulkan")]
+fn float_write_shape() -> metal2vulkan::meta::TextureShape {
+    metal2vulkan::meta::TextureShape {
+        dimension: metal2vulkan::meta::TextureDimension::D2,
+        arrayed: false,
+        multisampled: false,
+        component: metal2vulkan::meta::TextureComponent::Float,
+        writable: true,
+        array_ref: false,
+        array_length: None,
+        storage_format: Some(metal2vulkan::meta::TextureFormat::R32f),
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn storage_shader(
+    reflection: metal2vulkan::reflect::ShaderReflection,
+    raster_order: crate::runtime::m2v_cache::TextureRasterOrder,
+) -> crate::runtime::m2v_cache::CachedShader {
+    let mut shader =
+        crate::runtime::m2v_cache::CachedShader::new(Vec::new(), std::sync::Arc::new(reflection));
+    shader.raster_order = raster_order;
+    shader
+}
+
+/// What the fragment storage rail cannot bind is refused by name, before any
+/// texture is resolved — and in particular an unbound storage texture is
+/// refused rather than left to the unbound-texture repair, which would put a
+/// neutral *sampled* image where the module declares a storage one.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn fragment_storage_admission_names_each_refusal() {
+    use crate::backend::vulkan::engine::DrawPreparationDecline as D;
+    use crate::runtime::m2v_cache::TextureRasterOrder;
+    use metal2vulkan::reflect::ResourceAccess;
+
+    const BINDING: u32 = 600;
+    let bound = [TextureBind {
+        index: 1,
+        texture_ref: 77,
+        resource: None,
+    }];
+    let storage = || {
+        fragment_texture_reflection(
+            1,
+            BINDING,
+            float_write_shape(),
+            Some(ResourceAccess::Storage),
+        )
+    };
+
+    let admitted = storage_shader(storage(), TextureRasterOrder::None);
+    assert_eq!(admit_fragment_storage_textures(&admitted, &bound), Ok(()));
+
+    assert_eq!(
+        admit_fragment_storage_textures(&admitted, &[]),
+        Err(D::StorageTextureUnbound {
+            index: 1,
+            binding: BINDING
+        }),
+        "a statically used storage texture with nothing bound"
+    );
+
+    let ordered = storage_shader(storage(), TextureRasterOrder::Ordered(vec![1].into()));
+    assert_eq!(
+        admit_fragment_storage_textures(&ordered, &bound),
+        Err(D::RasterOrderedTextureUnsupported { index: 1 })
+    );
+    let unreadable = storage_shader(storage(), TextureRasterOrder::Unreadable);
+    assert_eq!(
+        admit_fragment_storage_textures(&unreadable, &bound),
+        Err(D::RasterOrderedTextureUnsupported { index: u32::MAX })
+    );
+
+    let mut cube = float_write_shape();
+    cube.dimension = metal2vulkan::meta::TextureDimension::Cube;
+    let cube = storage_shader(
+        fragment_texture_reflection(1, BINDING, cube, Some(ResourceAccess::Storage)),
+        TextureRasterOrder::None,
+    );
+    assert_eq!(
+        admit_fragment_storage_textures(&cube, &bound),
+        Err(D::TextureDimensionUnsupported {
+            stage: "fragment",
+            index: 1,
+            texture_ref: 77,
+            binding: BINDING,
+            kind: "cube".into(),
+        })
+    );
+
+    let unclassified = storage_shader(
+        fragment_texture_reflection(1, BINDING, float_write_shape(), None),
+        TextureRasterOrder::None,
+    );
+    assert_eq!(
+        admit_fragment_storage_textures(&unclassified, &bound),
+        Err(D::TextureAccessUnsupported {
+            stage: "fragment",
+            index: 1,
+            texture_ref: 77,
+            binding: BINDING,
+            access: "unknown",
+        })
+    );
+
+    // A shader with no storage texture is not asked about raster order at all:
+    // the reading is only taken for shaders that store.
+    let mut sampled_shape = float_write_shape();
+    sampled_shape.writable = false;
+    sampled_shape.storage_format = None;
+    let sampled = storage_shader(
+        fragment_texture_reflection(1, 33, sampled_shape, Some(ResourceAccess::Sampled)),
+        TextureRasterOrder::Unreadable,
+    );
+    assert_eq!(admit_fragment_storage_textures(&sampled, &[]), Ok(()));
+}
+
+/// Write a single-level linear texture of `format` into task 1's object list at
+/// `tex_ref`, and return its guest address.
+#[cfg(feature = "backend-vulkan")]
+fn put_linear_texture(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    tex_ref: u32,
+    (width, height, row_stride): (u32, u32, u32),
+    format: u16,
+) -> u64 {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_LIST_ENTRY_LEN,
+        OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
+        TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
+    };
+    let handle = 8u32;
+    let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    st64(
+        &mut desc[LINEAR_DESC_SIZE..],
+        u64::from(row_stride) * u64::from(height),
+    );
+    st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], height);
+    st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], format);
+    let desc_gva = 0x280u64;
+    write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+    let off = list_object_entry_offset(tex_ref, 256).unwrap();
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let packed = (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8);
+    st32(&mut list_entry[0..], packed);
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+    u64::from(handle) << RESOURCE_PAGE_SHIFT
+}
+
+/// A fragment storage texture resolves to the resident a colour pass into the
+/// same texture renders into — the GVA identity of its own pages, in the format
+/// the primary attachment rail gives that texture (`gva_resident_format`) — and
+/// the shader's stand-in image format is specialized to the texture's own.
+///
+/// `RGBA8Unorm` rather than the login window's `RGBA16Float`, because whether
+/// a GVA resident keeps a half-float declaration is the host's answer
+/// (`render_target_layout_supported`) and a test with no device has none; the
+/// eight-bit layouts are rendered by every host. The half-float case is the
+/// GPU parity test's.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_fragment_storage_texture_resolves_to_its_colour_resident() {
+    use crate::backend::vulkan::engine::{
+        DrawPreparationDecline as D, StorageImageContent, TargetIdentity,
+    };
+    use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM};
+    use crate::runtime::spirv_bind::ImageFormat;
+    use metal2vulkan::reflect::ResourceAccess;
+
+    const BINDING: u32 = 600;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 256));
+    let (tex_ref, w, h, bpr) = (199u32, 480u32, 64u32, 1920u32);
+    let gva = put_linear_texture(
+        &mut state,
+        &mut host,
+        tex_ref,
+        (w, h, bpr),
+        MTL_FORMAT_RGBA8_UNORM,
+    );
+    let reflection = fragment_texture_reflection(
+        2,
+        BINDING,
+        float_write_shape(),
+        Some(ResourceAccess::Storage),
+    );
+
+    let bind = resolve_fragment_storage_texture(
+        &mut state,
+        &mut host,
+        1,
+        2,
+        tex_ref,
+        BINDING,
+        &reflection,
+        true,
+    )
+    .expect("an RGBA8Unorm linear texture is a storage texture this rail binds");
+    let generation = crate::runtime::writeback_debt::gva_resource_generation(
+        &mut state,
+        &host,
+        crate::runtime::writeback_debt::GvaResourceKey {
+            task_id: 1,
+            texture_ref: tex_ref,
+        },
+        gva,
+        u64::from(bpr) * u64::from(h),
+    );
+    assert_eq!(
+        bind.resource.identity,
+        TargetIdentity::Gva {
+            gva,
+            width: w,
+            height: h,
+            generation,
+            format: gva_resident_format(MTL_FORMAT_RGBA8_UNORM),
+        },
+        "the identity a colour attachment of this texture is keyed by"
+    );
+    assert_eq!(
+        bind.resource.binding, BINDING,
+        "the reflected binding, unmoved"
+    );
+    assert_eq!(bind.resource.format, ash::vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(bind.resource.view_format, ash::vk::Format::R8G8B8A8_UNORM);
+    assert_eq!(
+        bind.shader_format,
+        ImageFormat::Rgba8Unorm,
+        "the translator's R32f stand-in becomes the texture's own format"
+    );
+    assert_eq!(bind.resource.content, StorageImageContent::Load);
+    assert!(matches!(bind.store, FragmentStorageStore::Gva { .. }));
+    assert_eq!(bind.color.target_gva, gva);
+
+    // A shader of another numeric class and width cannot be specialized onto
+    // it: `texture2d<ushort, write>` (`Rgba16ui`) over eight-bit unorm.
+    let mut uint_shape = float_write_shape();
+    uint_shape.component = metal2vulkan::meta::TextureComponent::Uint;
+    uint_shape.storage_format = Some(metal2vulkan::meta::TextureFormat::Rgba16ui);
+    let uint = fragment_texture_reflection(2, BINDING, uint_shape, Some(ResourceAccess::Storage));
+    assert!(matches!(
+        resolve_fragment_storage_texture(
+            &mut state, &mut host, 1, 2, tex_ref, BINDING, &uint, true,
+        ),
+        Err(D::StorageTextureFormat {
+            index: 2,
+            texture_ref: 199,
+            format: MTL_FORMAT_RGBA8_UNORM,
+            ..
+        })
+    ));
+
+    // An sRGB texture has no storage form at all.
+    let srgb_ref = 120u32;
+    put_linear_texture(
+        &mut state,
+        &mut host,
+        srgb_ref,
+        (64, 64, 256),
+        MTL_FORMAT_BGRA8_UNORM_SRGB,
+    );
+    assert_eq!(
+        resolve_fragment_storage_texture(
+            &mut state,
+            &mut host,
+            1,
+            2,
+            srgb_ref,
+            BINDING,
+            &reflection,
+            true,
+        )
+        .err(),
+        Some(D::StorageTextureFormat {
+            index: 2,
+            texture_ref: srgb_ref,
+            format: MTL_FORMAT_BGRA8_UNORM_SRGB,
+            detail: "no_storage_selector",
+        })
+    );
+
+    // And a ref with nothing behind it names the resolve that failed.
+    assert_eq!(
+        resolve_fragment_storage_texture(
+            &mut state,
+            &mut host,
+            1,
+            2,
+            0x5c1,
+            BINDING,
+            &reflection,
+            true,
+        )
+        .err(),
+        Some(D::StorageTextureUnresolved {
+            index: 2,
+            texture_ref: 0x5c1,
+            detail: "render_target_unresolved",
+        })
+    );
+}

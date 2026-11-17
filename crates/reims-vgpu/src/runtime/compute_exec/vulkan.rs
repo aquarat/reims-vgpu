@@ -1886,7 +1886,7 @@ pub(super) fn mtl_to_engine_sampled(
     crate::backend::vulkan::translate::pixel::sampled_image(format).ok()
 }
 
-pub(super) fn spirv_image_format_to_engine_storage(
+pub(crate) fn spirv_image_format_to_engine_storage(
     format: crate::runtime::spirv_bind::ImageFormat,
 ) -> Option<crate::backend::vulkan::engine::StorageImageFormat> {
     use crate::backend::vulkan::engine::StorageImageFormat as V;
@@ -1942,7 +1942,7 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
     }
 }
 
-pub(super) fn specialized_storage_image_format(
+pub(crate) fn specialized_storage_image_format(
     guest: crate::backend::vulkan::engine::StorageImageFormat,
     shader: crate::runtime::spirv_bind::ImageFormat,
     write_without_format: bool,
