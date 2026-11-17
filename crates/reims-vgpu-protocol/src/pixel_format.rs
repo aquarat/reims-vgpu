@@ -368,6 +368,16 @@ pub enum StorageImageSelector {
     Rg8Unorm = 10,
     Rgba32Uint = 11,
     R32Uint = 12,
+    /// `RGBA8Unorm_sRGB`. A storage image that keeps its transfer function: a
+    /// kernel writes linear values and the texture holds them encoded, exactly
+    /// as Metal stores them. Its own member rather than [`Self::Rgba8Unorm`]'s
+    /// spelling, because folding it there is the silent drop of the transfer
+    /// function this enum exists to keep visible — and because, unlike the
+    /// linear member, no host is obliged to offer it: a backend answers it from
+    /// what its device reports about the format.
+    Rgba8UnormSrgb = 13,
+    /// `BGRA8Unorm_sRGB`, on [`Self::Rgba8UnormSrgb`]'s terms.
+    Bgra8UnormSrgb = 14,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1816,6 +1826,12 @@ pub fn sampled_class(format: u16) -> Option<SampledClass> {
 /// Which storage-image selector a Metal format maps to, or `None` for a format
 /// this host will not expose as a storage image.
 ///
+/// The two eight-bit sRGB formats are members in their own right
+/// ([`StorageImageSelector::Rgba8UnormSrgb`], [`StorageImageSelector::Bgra8UnormSrgb`]),
+/// never folded onto their linear siblings. Membership here is the contract's
+/// "this format can be a storage image" and not a host promise; whether the
+/// running device can write one is the backend's question, asked of the device.
+///
 /// The texel width is **not** returned. It used to be, as a second column
 /// beside each selector, and the only thing that column was ever used for was a
 /// `debug_assert_eq!` against [`bytes_per_pixel`] at three of the four call
@@ -1832,6 +1848,8 @@ pub fn storage_selector(format: u16) -> Option<StorageImageSelector> {
         MTL_FORMAT_RG16_FLOAT => StorageImageSelector::Rg16Float,
         MTL_FORMAT_RGBA8_UNORM => StorageImageSelector::Rgba8Unorm,
         MTL_FORMAT_BGRA8_UNORM => StorageImageSelector::Bgra8Unorm,
+        MTL_FORMAT_RGBA8_UNORM_SRGB => StorageImageSelector::Rgba8UnormSrgb,
+        MTL_FORMAT_BGRA8_UNORM_SRGB => StorageImageSelector::Bgra8UnormSrgb,
         MTL_FORMAT_RGBA8_UINT => StorageImageSelector::Rgba8Uint,
         MTL_FORMAT_RGBA8_SINT => StorageImageSelector::Rgba8Sint,
         MTL_FORMAT_RGBA16_UINT => StorageImageSelector::Rgba16Uint,
@@ -4334,6 +4352,34 @@ mod tests {
     /// The widths are spelled out rather than derived, because that is the point:
     /// a change to `bytes_per_pixel` that silently redefined a storage format's
     /// stride is exactly what the deleted column existed to catch.
+    /// The two eight-bit sRGB formats select members of their own and never
+    /// their linear siblings', and every format whose selector is one of those
+    /// members carries the transfer function — so a storage image built from a
+    /// selector cannot drop it, and cannot gain one the guest did not declare.
+    #[test]
+    fn an_srgb_storage_format_keeps_its_own_selector() {
+        assert_eq!(
+            storage_selector(MTL_FORMAT_RGBA8_UNORM_SRGB),
+            Some(StorageImageSelector::Rgba8UnormSrgb)
+        );
+        assert_eq!(
+            storage_selector(MTL_FORMAT_BGRA8_UNORM_SRGB),
+            Some(StorageImageSelector::Bgra8UnormSrgb)
+        );
+        let mut srgb = 0;
+        for fmt in 0u16..=u16::MAX {
+            if let Some(selector) = storage_selector(fmt) {
+                let srgb_member = matches!(
+                    selector,
+                    StorageImageSelector::Rgba8UnormSrgb | StorageImageSelector::Bgra8UnormSrgb
+                );
+                assert_eq!(is_srgb(fmt), srgb_member, "{fmt:#x} selects {selector:?}");
+                srgb += usize::from(srgb_member);
+            }
+        }
+        assert_eq!(srgb, 2);
+    }
+
     #[test]
     fn storage_texel_width_matches_the_pixel_table() {
         let expected: &[(u16, u32)] = &[
@@ -4344,6 +4390,8 @@ mod tests {
             (MTL_FORMAT_RG16_FLOAT, RG16F_BPP),
             (MTL_FORMAT_RGBA8_UNORM, RGBA8_BPP),
             (MTL_FORMAT_BGRA8_UNORM, BGRA8_BPP),
+            (MTL_FORMAT_RGBA8_UNORM_SRGB, RGBA8_BPP),
+            (MTL_FORMAT_BGRA8_UNORM_SRGB, BGRA8_BPP),
             (MTL_FORMAT_RGBA8_UINT, RGBA8_BPP),
             (MTL_FORMAT_RGBA8_SINT, RGBA8_BPP),
             (MTL_FORMAT_RGBA16_UINT, RGBA16_BPP),

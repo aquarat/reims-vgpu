@@ -2750,6 +2750,8 @@ mod tests {
             (StorageImageFormat::Rgba8Sint, 4),
             (StorageImageFormat::Rgba8Unorm, 4),
             (StorageImageFormat::Bgra8Unorm, 4),
+            (StorageImageFormat::Rgba8UnormSrgb, 4),
+            (StorageImageFormat::Bgra8UnormSrgb, 4),
             (StorageImageFormat::Rg16Float, 4),
             (StorageImageFormat::R8Unorm, 1),
             (StorageImageFormat::Rg8Unorm, 2),

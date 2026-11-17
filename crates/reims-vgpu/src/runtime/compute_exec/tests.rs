@@ -1857,6 +1857,24 @@ fn storage_access_proxy_names_writeonly_seed_cost() {
     }));
 }
 
+/// The device answers the specialization tests below run against: the BGRA
+/// composite flag as given, and no sRGB storage format admitted.
+#[cfg(feature = "backend-vulkan")]
+fn view_caps(
+    bgra8_without_format: bool,
+) -> crate::backend::vulkan::caps::device_features::StorageViewCaps {
+    crate::backend::vulkan::caps::device_features::StorageViewCaps {
+        bgra8_without_format,
+        srgb: Default::default(),
+    }
+}
+
+/// The access a write-only kernel's storage binding reflects as. Only an sRGB
+/// surface's answer depends on it.
+#[cfg(feature = "backend-vulkan")]
+const WRITE_ONLY: crate::runtime::spirv_bind::StorageImageAccess =
+    crate::runtime::spirv_bind::StorageImageAccess::WriteOnly;
+
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
@@ -1875,15 +1893,20 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     // A uint shader over a BGRA8Unorm surface is a deliberate raw byte view
     // (byte order preserved) — unaffected by the without-format flag.
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Uint, true),
+        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Uint, view_caps(true), WRITE_ONLY),
         Ok(S::Rgba8Uint)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Uint, false),
+        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Uint, view_caps(false), WRITE_ONLY),
         Ok(S::Rgba8Uint)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Rgba16Float, S::Rgba32Float, true),
+        specialized_storage_image_format(
+            V::Rgba16Float,
+            S::Rgba32Float,
+            view_caps(true),
+            WRITE_ONLY
+        ),
         Ok(S::Rgba16Float)
     );
     // BGRA8Unorm normalized color store (the desktop composite): with the
@@ -1891,24 +1914,43 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     // (viewed B8G8R8A8_UNORM — no R/B swap); without it, degrades to the
     // swapped Rgba8Unorm view.
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba32Float, true),
+        specialized_storage_image_format(
+            V::Bgra8Unorm,
+            S::Rgba32Float,
+            view_caps(true),
+            WRITE_ONLY
+        ),
         Ok(S::Unknown)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba32Float, false),
+        specialized_storage_image_format(
+            V::Bgra8Unorm,
+            S::Rgba32Float,
+            view_caps(false),
+            WRITE_ONLY
+        ),
         Ok(S::Rgba8Unorm)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Unorm, true),
+        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba8Unorm, view_caps(true), WRITE_ONLY),
         Ok(S::Unknown)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba16Uint, true),
-        Err("spirv_guest_numeric_class_mismatch")
+        specialized_storage_image_format(V::Bgra8Unorm, S::Rgba16Uint, view_caps(true), WRITE_ONLY),
+        Err(StorageSpecializeRefusal::Mismatch(
+            "spirv_guest_numeric_class_mismatch"
+        ))
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::Unsupported(0), true),
-        Err("spirv_storage_format_unsupported")
+        specialized_storage_image_format(
+            V::Bgra8Unorm,
+            S::Unsupported(0),
+            view_caps(true),
+            WRITE_ONLY
+        ),
+        Err(StorageSpecializeRefusal::Mismatch(
+            "spirv_storage_format_unsupported"
+        ))
     );
 
     // R32Uint storage (the captured VTMTS 4K coverage-buffer case): the
@@ -1919,18 +1961,20 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     // specializes the SPIR-V storage image to single-channel `R32ui` so the
     // view is VK_FORMAT_R32_UINT and a written `uint4`.x is the full u32.
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::Rgba8Uint, true),
+        specialized_storage_image_format(V::R32Uint, S::Rgba8Uint, view_caps(true), WRITE_ONLY),
         Ok(S::R32ui)
     );
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::Rgba16Uint, true),
+        specialized_storage_image_format(V::R32Uint, S::Rgba16Uint, view_caps(true), WRITE_ONLY),
         Ok(S::R32ui)
     );
     // A float/unorm-class write shader over an R32Uint surface is a genuine
     // numeric-class mismatch, not a raw view — still rejected.
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::Rgba8Unorm, true),
-        Err("spirv_guest_numeric_class_mismatch")
+        specialized_storage_image_format(V::R32Uint, S::Rgba8Unorm, view_caps(true), WRITE_ONLY),
+        Err(StorageSpecializeRefusal::Mismatch(
+            "spirv_guest_numeric_class_mismatch"
+        ))
     );
     // The R32-single-channel sint/float and packed Rgb9e5 storage paths
     // stay guarded off (no live capture yet justifies enabling them). The
@@ -1982,38 +2026,40 @@ fn r32f_write_images_specialize_to_the_bound_guest_surface() {
     // Wider float surfaces: the placeholder widens to the guest's own format
     // so all four written lanes are stored, not just `.x`.
     assert_eq!(
-        specialized_storage_image_format(V::Rgba32Float, S::R32Float, true),
+        specialized_storage_image_format(V::Rgba32Float, S::R32Float, view_caps(true), WRITE_ONLY),
         Ok(S::Rgba32Float)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Rgba16Float, S::R32Float, true),
+        specialized_storage_image_format(V::Rgba16Float, S::R32Float, view_caps(true), WRITE_ONLY),
         Ok(S::Rgba16Float)
     );
     // Narrower single-channel float: still class-matched to the guest surface.
     assert_eq!(
-        specialized_storage_image_format(V::R16Float, S::R32Float, true),
+        specialized_storage_image_format(V::R16Float, S::R32Float, view_caps(true), WRITE_ONLY),
         Ok(S::R16Float)
     );
     // An R32Float guest surface is an exact match — the raw view is correct.
     assert_eq!(
-        specialized_storage_image_format(V::R32Float, S::R32Float, true),
+        specialized_storage_image_format(V::R32Float, S::R32Float, view_caps(true), WRITE_ONLY),
         Ok(S::R32Float)
     );
     // BGRA8Unorm is the desktop composite target. Bytes/texel are equal (4 == 4)
     // so the raw-view early return would view a BGRA surface as a single
     // 32-bit float; a normalized color store must retarget instead.
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, true),
+        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, view_caps(true), WRITE_ONLY),
         Ok(S::Unknown)
     );
     assert_eq!(
-        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, false),
+        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, view_caps(false), WRITE_ONLY),
         Ok(S::Rgba8Unorm)
     );
     // A float-class shader over a uint surface stays a class mismatch.
     assert_eq!(
-        specialized_storage_image_format(V::R32Uint, S::R32Float, true),
-        Err("spirv_guest_numeric_class_mismatch")
+        specialized_storage_image_format(V::R32Uint, S::R32Float, view_caps(true), WRITE_ONLY),
+        Err(StorageSpecializeRefusal::Mismatch(
+            "spirv_guest_numeric_class_mismatch"
+        ))
     );
 }
 
@@ -2041,25 +2087,152 @@ fn same_class_equal_width_storage_formats_take_the_guest_surface_not_the_placeho
 
     // 4 bytes both sides, float class both sides — the measured case.
     assert_eq!(
-        specialized_storage_image_format(V::Rg16Float, S::R32Float, true),
+        specialized_storage_image_format(V::Rg16Float, S::R32Float, view_caps(true), WRITE_ONLY),
         Ok(S::Rg16Float)
     );
     // Same width and class again, and a colour store: `.x` as one f32 would be
     // three channels short.
     assert_eq!(
-        specialized_storage_image_format(V::Rgba8Unorm, S::R32Float, true),
+        specialized_storage_image_format(V::Rgba8Unorm, S::R32Float, view_caps(true), WRITE_ONLY),
         Ok(S::Rgba8Unorm)
     );
     // 2 bytes both sides.
     assert_eq!(
-        specialized_storage_image_format(V::Rg8Unorm, S::R16Float, true),
+        specialized_storage_image_format(V::Rg8Unorm, S::R16Float, view_caps(true), WRITE_ONLY),
         Ok(S::Rg8Unorm)
     );
     // The genuine raw view — integer shader over a normalized surface — is not
     // disturbed by narrowing the width test.
     assert_eq!(
-        specialized_storage_image_format(V::Rgba8Unorm, S::Rgba8Uint, true),
+        specialized_storage_image_format(V::Rgba8Unorm, S::Rgba8Uint, view_caps(true), WRITE_ONLY),
         Ok(S::Rgba8Uint)
+    );
+}
+
+/// A kernel's colour store into an eight-bit sRGB surface is specialized to the
+/// sRGB image itself, declared format-less so the device encodes each store —
+/// or it is refused by the name of the capability the device lacks. It is never
+/// retargeted to the UNORM sibling, which is how the kernel's linear values used
+/// to reach the guest unencoded.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_srgb_colour_store_keeps_its_format_or_refuses_by_name() {
+    use crate::backend::vulkan::caps::device_features::{
+        SrgbStorage as R, SrgbStorageCaps, StorageViewCaps,
+    };
+    use crate::backend::vulkan::engine::StorageImageFormat as V;
+    use crate::runtime::spirv_bind::{ImageFormat as S, StorageImageAccess as A};
+    use StorageSpecializeRefusal::{Mismatch, SrgbStorage};
+
+    let caps = |rgba8, bgra8| StorageViewCaps {
+        bgra8_without_format: true,
+        srgb: SrgbStorageCaps { rgba8, bgra8 },
+    };
+    let spec = specialized_storage_image_format;
+    let both = caps(R::ReadWrite, R::ReadWrite);
+
+    // Whatever float format the translator declared — `R32f` is what a generic
+    // `texture2d<float, access::write>` lowers to — and whatever the access.
+    for guest in [V::Rgba8UnormSrgb, V::Bgra8UnormSrgb] {
+        for shader in [S::Rgba8Unorm, S::Rgba32Float, S::Rgba16Float, S::R32Float] {
+            for access in [A::WriteOnly, A::ReadOnly, A::ReadWrite, A::Unknown] {
+                assert_eq!(
+                    spec(guest, shader, both, access),
+                    Ok(S::Unknown),
+                    "{guest:?} {shader:?} {access:?}"
+                );
+            }
+        }
+    }
+
+    // Each missing fact is its own refusal, in its own class.
+    for (support, slug) in [
+        (R::Unanswerable, "srgb_storage_capability_unanswerable"),
+        (R::NoStorageImage, "srgb_storage_no_storage_image"),
+        (
+            R::NoWriteWithoutFormat,
+            "srgb_storage_no_write_without_format",
+        ),
+    ] {
+        assert_eq!(
+            spec(
+                V::Bgra8UnormSrgb,
+                S::Rgba32Float,
+                caps(R::ReadWrite, support),
+                A::WriteOnly
+            ),
+            Err(SrgbStorage(slug)),
+            "{support:?}"
+        );
+        // The answer is per format: the other order is unaffected.
+        assert_eq!(
+            spec(
+                V::Rgba8UnormSrgb,
+                S::Rgba32Float,
+                caps(R::ReadWrite, support),
+                A::WriteOnly
+            ),
+            Ok(S::Unknown)
+        );
+    }
+
+    // A device that writes the format without a declared one but does not read
+    // it so serves a write-only kernel and refuses any kernel that may read.
+    let write_only = caps(R::WriteOnly, R::WriteOnly);
+    assert_eq!(
+        spec(V::Bgra8UnormSrgb, S::Rgba32Float, write_only, A::WriteOnly),
+        Ok(S::Unknown)
+    );
+    for access in [A::ReadOnly, A::ReadWrite, A::Unknown] {
+        assert_eq!(
+            spec(V::Bgra8UnormSrgb, S::Rgba32Float, write_only, access),
+            Err(SrgbStorage("srgb_storage_no_read_without_format")),
+            "{access:?}"
+        );
+    }
+
+    // An integer shader over an sRGB surface is a raw byte view, as over
+    // `BGRA8Unorm`: no transfer function is involved, so no sRGB capability is.
+    let none = caps(R::Unanswerable, R::Unanswerable);
+    assert_eq!(
+        spec(V::Bgra8UnormSrgb, S::Rgba8Uint, none, A::ReadWrite),
+        Ok(S::Rgba8Uint)
+    );
+    assert_eq!(
+        spec(V::Rgba8UnormSrgb, S::Rgba16Uint, both, A::WriteOnly),
+        Err(Mismatch("spirv_guest_numeric_class_mismatch"))
+    );
+
+    // The BGRA composite answer is unaffected by the sRGB rungs.
+    assert_eq!(
+        spec(V::Bgra8Unorm, S::Rgba32Float, none, A::WriteOnly),
+        Ok(S::Unknown)
+    );
+
+    // Two classes, two dispatch refusals.
+    assert_eq!(
+        SrgbStorage("srgb_storage_no_storage_image").status(),
+        ComputeStatus::Unsupported("storage_srgb_unsupported")
+    );
+    assert_eq!(
+        Mismatch("spirv_guest_numeric_class_mismatch").status(),
+        ComputeStatus::Unsupported("storage_format_specialize_mismatch")
+    );
+
+    // The bridges carry the sRGB formats as themselves, for both roles: the
+    // storage image a format-less store lands in, and the sampled image a read
+    // decodes through.
+    assert_eq!(
+        selector_to_engine_storage(pixel_format::StorageImageSelector::Bgra8UnormSrgb),
+        V::Bgra8UnormSrgb
+    );
+    assert_eq!(
+        mtl_to_engine_sampled(pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB),
+        Some(V::Bgra8UnormSrgb)
+    );
+    assert_eq!(
+        mtl_to_engine_sampled(pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB),
+        Some(V::Rgba8UnormSrgb)
     );
 }
 
@@ -3561,8 +3734,17 @@ fn a_nil_entry_clears_the_slot_on_the_wire_path_too() {
 /// and column. The same layout `a_declared_mip_chain_stages_every_level_and_not_only_its_base`
 /// builds, with texels that differ from one another so a misplaced byte shows.
 fn padded_linear_texture(levels: u32, base: u32) -> (FakeHost, DeviceState) {
+    padded_linear_texture_in(
+        crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        levels,
+        base,
+    )
+}
+
+/// [`padded_linear_texture`] declared in `format`, which must be four bytes a
+/// texel.
+fn padded_linear_texture_in(format: u16, levels: u32, base: u32) -> (FakeHost, DeviceState) {
     use crate::protocol::endian::{st16, st32, st64};
-    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_HEIGHT, TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
@@ -3627,7 +3809,8 @@ fn padded_linear_texture(levels: u32, base: u32) -> (FakeHost, DeviceState) {
     }
     let pf_off =
         TEXTURE_DESC_PIXEL_FORMAT + (levels as usize - 1) * TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
-    st16(&mut desc[pf_off..], MTL_FORMAT_BGRA8_UNORM);
+    assert_eq!(pixel_format::bytes_per_pixel(format), Some(BPP));
+    st16(&mut desc[pf_off..], format);
     let desc_gva = 0x2000u64;
     write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(11, 32).unwrap();
@@ -3693,4 +3876,38 @@ fn a_sampled_linear_level_is_staged_as_a_guest_read_of_the_same_bytes() {
         storage.bytes, reference.bytes,
         "a storage seed is still read as bytes"
     );
+}
+
+/// A linear `BGRA8Unorm_sRGB` texture stages in its own format for both roles.
+///
+/// The storage binding is the one the simulator's home screen lost 243 times a
+/// run as `linear_tex_fmt_storage`: the format had no storage selector, so the
+/// rail refused the bind outright. It now carries the sRGB selector, and the
+/// writeback names the guest's own format.
+#[test]
+fn a_linear_srgb_texture_stages_in_its_own_format_for_both_roles() {
+    use crate::protocol::pixel_format::{StorageImageSelector, MTL_FORMAT_BGRA8_UNORM_SRGB};
+    const BASE: u32 = 8;
+
+    let (mut host, mut state) = padded_linear_texture_in(MTL_FORMAT_BGRA8_UNORM_SRGB, 1, BASE);
+    let storage = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, true)
+        .expect("a linear sRGB texture stages as a storage destination");
+    assert_eq!(storage.pixel_format, MTL_FORMAT_BGRA8_UNORM_SRGB);
+    assert_eq!(
+        storage.storage_selector,
+        Some(StorageImageSelector::Bgra8UnormSrgb)
+    );
+    assert_eq!(storage.bytes.len(), (BASE * BASE * 4) as usize);
+    match storage.writeback {
+        TextureWriteback::Linear { pixel_format, .. } => {
+            assert_eq!(pixel_format, MTL_FORMAT_BGRA8_UNORM_SRGB)
+        }
+        _ => panic!("expected a linear writeback"),
+    }
+
+    let (mut host, mut state) = padded_linear_texture_in(MTL_FORMAT_BGRA8_UNORM_SRGB, 1, BASE);
+    let sampled = stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, 11, 0, false)
+        .expect("a linear sRGB texture stages as a sampled source");
+    assert_eq!(sampled.pixel_format, MTL_FORMAT_BGRA8_UNORM_SRGB);
+    assert_eq!(sampled.bytes, storage.bytes, "the same bytes either way");
 }

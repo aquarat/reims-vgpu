@@ -52,6 +52,11 @@ pub fn storage_image_format(selector: StorageImageSelector) -> (MTLPixelFormat, 
         S::Rgba32Float => (MTLPixelFormat::RGBA32Float, 16),
         S::Rgba8Unorm => (MTLPixelFormat::RGBA8Unorm, 4),
         S::Bgra8Unorm => (MTLPixelFormat::BGRA8Unorm, 4),
+        // The guest's own sRGB format, so a kernel's write is encoded and its
+        // read decoded by Metal exactly as on the guest's GPU. This rail runs
+        // on Apple-silicon hosts only, whose GPU families write sRGB textures.
+        S::Rgba8UnormSrgb => (MTLPixelFormat::RGBA8Unorm_sRGB, 4),
+        S::Bgra8UnormSrgb => (MTLPixelFormat::BGRA8Unorm_sRGB, 4),
         S::R16Float => (MTLPixelFormat::R16Float, 2),
         S::Rg16Float => (MTLPixelFormat::RG16Float, 4),
         S::R8Unorm => (MTLPixelFormat::R8Unorm, 1),
@@ -138,6 +143,18 @@ mod tests {
                 MTLPixelFormat::BGRA8Unorm,
                 4,
                 pf::MTL_FORMAT_BGRA8_UNORM,
+            ),
+            (
+                S::Rgba8UnormSrgb,
+                MTLPixelFormat::RGBA8Unorm_sRGB,
+                4,
+                pf::MTL_FORMAT_RGBA8_UNORM_SRGB,
+            ),
+            (
+                S::Bgra8UnormSrgb,
+                MTLPixelFormat::BGRA8Unorm_sRGB,
+                4,
+                pf::MTL_FORMAT_BGRA8_UNORM_SRGB,
             ),
             (
                 S::R16Float,

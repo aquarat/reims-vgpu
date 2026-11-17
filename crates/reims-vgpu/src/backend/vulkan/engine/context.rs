@@ -720,6 +720,10 @@ pub(crate) struct DeviceContext {
     pub spirv_storage_write_without_format: bool,
     pub spirv_storage_read_without_format: bool,
     pub spirv_storage_extended_formats: bool,
+    /// The eight-bit sRGB formats as format-less storage images — per format,
+    /// because Vulkan answers the question per format. See
+    /// [`crate::backend::vulkan::caps::device_features::SrgbStorage`].
+    pub srgb_storage: crate::backend::vulkan::caps::device_features::SrgbStorageCaps,
     /// For each [`crate::protocol::pixel_format::TexelLayout`], whether this
     /// host can sample its Vulkan format with linear filtering; gates the
     /// native sampled rails (see [`DeviceFeatures::sampled_linear_filter`]).
@@ -1517,6 +1521,7 @@ impl DeviceContext {
             spirv_storage_write_without_format: features.storage_image_write_without_format,
             spirv_storage_read_without_format: features.storage_image_read_without_format,
             spirv_storage_extended_formats: features.storage_image_extended_formats,
+            srgb_storage: features.srgb_storage,
             sampled_linear_filter,
             pipeline_cache,
             vertex_divisor,

@@ -2671,6 +2671,7 @@ pub fn unpin_resident_target(identity: &TargetIdentity) {
 enum EngineProbe {
     StorageWriteWithoutFormat,
     SampledLayoutLinearFilter,
+    StorageViewCaps,
 }
 
 impl EngineProbe {
@@ -2678,6 +2679,7 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::SampledLayoutLinearFilter => "sampled_layout_linear_filter",
+            Self::StorageViewCaps => "storage_view_caps",
         }
     }
 
@@ -2687,6 +2689,7 @@ impl EngineProbe {
         match self {
             Self::StorageWriteWithoutFormat => 7,
             Self::SampledLayoutLinearFilter => 9,
+            Self::StorageViewCaps => 10,
         }
     }
 }
@@ -2809,6 +2812,33 @@ pub fn supports_storage_image_write_without_format() -> bool {
             engine_probe_decline(EngineProbe::StorageWriteWithoutFormat, &error)
                 .fail_once(EngineProbe::StorageWriteWithoutFormat.discriminant());
             false
+        }
+    }
+}
+
+/// Every storage-view answer the compute rail specializes a module against:
+/// the BGRA composite answer [`supports_storage_image_write_without_format`]
+/// gives, and the per-format sRGB storage rungs, in one engine lock.
+///
+/// An engine that cannot initialize answers the default — nothing admitted —
+/// after its decline, so a refusal downstream names the missing capability
+/// rather than binding a view this host was never asked about.
+pub fn storage_view_caps() -> crate::backend::vulkan::caps::device_features::StorageViewCaps {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => crate::backend::vulkan::caps::device_features::StorageViewCaps {
+            bgra8_without_format: ctx.storage_image_write_without_format,
+            srgb: ctx.srgb_storage,
+        },
+        Err(error) => {
+            engine_probe_decline(EngineProbe::StorageViewCaps, &error)
+                .fail_once(EngineProbe::StorageViewCaps.discriminant());
+            Default::default()
         }
     }
 }
@@ -6749,6 +6779,7 @@ mod probe_visibility_tests {
         for probe in [
             EngineProbe::StorageWriteWithoutFormat,
             EngineProbe::SampledLayoutLinearFilter,
+            EngineProbe::StorageViewCaps,
         ] {
             let line = engine_probe_decline(probe, &error).render();
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));

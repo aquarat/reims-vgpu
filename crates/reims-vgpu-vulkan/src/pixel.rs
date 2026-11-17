@@ -52,8 +52,9 @@ pub enum Refusal {
     /// Defined, and the contract does not make it a colour attachment.
     NoColorAttachmentFormat(u16),
     /// Defined, and the contract's storage-image narrowing has no entry for it.
-    /// Every sRGB format lands here, which is why no downgrade is possible on
-    /// this rail — see [`storage_image`].
+    /// Every sRGB format but the two eight-bit orders lands here, and those two
+    /// reach the rail as sRGB, which is why no downgrade is possible on this
+    /// rail — see [`storage_image`].
     NoStorageImageFormat(u16),
 }
 
@@ -888,6 +889,17 @@ pub enum StorageImageFormat {
     Rgba8Sint,
     Rgba8Unorm,
     Bgra8Unorm,
+    /// `R8G8B8A8_SRGB`: [`Self::Rgba8Unorm`]'s bytes with the transfer
+    /// function kept, so a sampled bind decodes and a storage write encodes in
+    /// the image view rather than in nobody.
+    ///
+    /// Sampling it needs nothing: Vulkan mandates `SAMPLED_IMAGE` with linear
+    /// filtering for both eight-bit sRGB orders. A **storage** image of it is
+    /// optional and format-less — SPIR-V names no sRGB image format — so the
+    /// compute rail asks the device's per-format answer before building one.
+    Rgba8UnormSrgb,
+    /// `B8G8R8A8_SRGB`, on [`Self::Rgba8UnormSrgb`]'s terms.
+    Bgra8UnormSrgb,
     Rg16Float,
     R8Unorm,
     /// Metal `A8Unorm`: one byte, presenting `(0, 0, 0, a)`.
@@ -1006,6 +1018,8 @@ impl StorageImageFormat {
             | Self::Rgba8Sint
             | Self::Rgba8Unorm
             | Self::Bgra8Unorm
+            | Self::Rgba8UnormSrgb
+            | Self::Bgra8UnormSrgb
             | Self::R32Uint
             | Self::R32Sint
             | Self::R32Float
@@ -1050,8 +1064,11 @@ impl StorageImageFormat {
 ///
 /// Neither half is written here. A render target's answer is
 /// `store_texel_order` composed with [`vk_texel_layout`]; a storage image's is
-/// `storage_selector` composed with [`storage_image_from_selector`] and
-/// `StorageImageFormat::vk_format`. Both already existed, both are already the
+/// `storage_selector` composed with [`storage_image_from_selector`],
+/// `StorageImageFormat::vk_format` and [`storage_format`] — the last because a
+/// copy lands bytes and no transfer function, so an sRGB storage image's
+/// verbatim texel is its linear allocation, as it is on the render side. Both
+/// already existed, both are already the
 /// authority for their own rail, and a format either admits is a format that
 /// rail creates images at — so nothing new is claimed about any format, and a
 /// new arm in either table reaches this without being added twice.
@@ -1064,7 +1081,13 @@ pub fn verbatim_texel(mtl: u16) -> Option<(vk::Format, u32)> {
         return Some((vk_texel_layout(layout), layout.bytes_per_texel()));
     }
     let storage = storage_image_from_selector(pixel_format::storage_selector(mtl)?);
-    Some((storage.vk_format(), storage.bytes_per_texel() as u32))
+    // The stored texel, without a transfer function: a copy moves bytes and
+    // does not apply one, so the sRGB storage members answer their linear
+    // allocation, as the render Store's half does for the same formats.
+    Some((
+        storage_format(storage.vk_format()),
+        storage.bytes_per_texel() as u32,
+    ))
 }
 
 /// The engine's storage-image format for a contract
@@ -1095,6 +1118,8 @@ pub fn storage_image_from_selector(
         S::Rgba32Float => StorageImageFormat::Rgba32Float,
         S::Rgba8Unorm => StorageImageFormat::Rgba8Unorm,
         S::Bgra8Unorm => StorageImageFormat::Bgra8Unorm,
+        S::Rgba8UnormSrgb => StorageImageFormat::Rgba8UnormSrgb,
+        S::Bgra8UnormSrgb => StorageImageFormat::Bgra8UnormSrgb,
         S::R16Float => StorageImageFormat::R16Float,
         S::Rg16Float => StorageImageFormat::Rg16Float,
         S::R8Unorm => StorageImageFormat::R8Unorm,
@@ -1115,27 +1140,29 @@ pub fn storage_image_from_selector(
 /// # Why this rail keeps an enum where the others took a `VkFormat`
 ///
 /// The colour-attachment and sampled rails resolve to a real `VkFormat` so an
-/// sRGB format is expressible on them. This one does not, and the reason is not
-/// inertia:
+/// sRGB format is expressible on them. This one is an enum, and the reason is
+/// not inertia:
 ///
-/// * **No sRGB format reaches it.** `pixel_format::storage_selector` has no
-///   sRGB arm, so an sRGB format declines here with
-///   [`Refusal::NoStorageImageFormat`] rather than downgrading — which
-///   is why `srgb_census` names six rails and none of them is this one. Widening
-///   the vocabulary would therefore make no colour space newly reachable.
-/// * **The shader side cannot name one either.** A storage image's view format
-///   must be class-compatible with the format the SPIR-V module declares, and
-///   the SPIR-V image-format operand has no sRGB member at all
-///   (`runtime::spirv_bind::ImageFormat`). Vulkan likewise does not apply the
-///   transfer function on an image store.
+/// * **sRGB reaches it as sRGB, never as its linear sibling.** The two
+///   eight-bit sRGB formats have storage selectors of their own and land on
+///   [`StorageImageFormat::Rgba8UnormSrgb`] and
+///   [`StorageImageFormat::Bgra8UnormSrgb`], whose Vulkan formats keep the
+///   transfer function — which is why `srgb_census` still names no downgrade
+///   site on this rail. Every other sRGB format declines with
+///   [`Refusal::NoStorageImageFormat`].
+/// * **The shader side cannot name one.** The SPIR-V image-format operand has
+///   no sRGB member at all (`runtime::spirv_bind::ImageFormat`), so a storage
+///   view in an sRGB format is reachable only format-less, and whether the
+///   device allows that is a per-format capability the compute rail asks before
+///   it specializes a module. Membership here is the format, not that promise.
 /// * **Its consumer reasons about the enum by name.** The compute path picks a
 ///   view format by comparing the guest surface's format class against the
 ///   shader's declared one; expressed over `VkFormat` that reasoning would have
 ///   to be spelled in `runtime/`, which is exactly the boundary
 ///   `translate::gate` exists to keep closed.
 ///
-/// A test below pins the first point, so if a future selector does admit an
-/// sRGB format this comment stops being true loudly rather than quietly.
+/// A test below pins the first point both ways: an sRGB format that reaches
+/// this rail reaches it in an sRGB `VkFormat`, and nothing linear gains one.
 pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, Refusal> {
     use reims_vgpu_core::pixel_format as pf;
     // Validate the format against the one pixel table first, so an entirely
@@ -1224,6 +1251,8 @@ pub fn vk_storage_image(format: StorageImageFormat) -> vk::Format {
         StorageImageFormat::Rgba8Sint => vk::Format::R8G8B8A8_SINT,
         StorageImageFormat::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
         StorageImageFormat::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        StorageImageFormat::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
+        StorageImageFormat::Bgra8UnormSrgb => vk::Format::B8G8R8A8_SRGB,
         StorageImageFormat::Rg16Float => vk::Format::R16G16_SFLOAT,
         StorageImageFormat::Rg16Uint => vk::Format::R16G16_UINT,
         StorageImageFormat::R8Unorm => vk::Format::R8_UNORM,
@@ -2116,9 +2145,12 @@ mod tests {
             };
             overlap += 1;
             let storage = storage_image_from_selector(selector);
+            // Stored bytes, not views: an sRGB storage image keeps its
+            // transfer function in its `VkFormat`, and a copy of it lands the
+            // same bytes as the linear texel the render side names.
             assert_eq!(
                 vk_texel_layout(layout),
-                storage.vk_format(),
+                storage_format(storage.vk_format()),
                 "format {mtl:#x} is two different host texels"
             );
             assert_eq!(
@@ -2129,7 +2161,10 @@ mod tests {
             // And whichever half answered, the union answers the same thing.
             assert_eq!(
                 verbatim_texel(mtl),
-                Some((storage.vk_format(), storage.bytes_per_texel() as u32)),
+                Some((
+                    storage_format(storage.vk_format()),
+                    storage.bytes_per_texel() as u32
+                )),
                 "format {mtl:#x}"
             );
         }
@@ -2165,40 +2200,65 @@ mod tests {
         assert!(p::store_texel_order(p::MTL_FORMAT_RGBA32_FLOAT).is_none());
     }
 
-    /// The storage rail *declines* sRGB rather than downgrading it, which is
-    /// why it keeps a layout enum where the colour and sampled rails now
-    /// resolve to a `VkFormat`.
+    /// The storage rail never downgrades sRGB: an sRGB format either reaches it
+    /// in an sRGB `VkFormat` or declines by name, and a linear format never
+    /// gains a transfer function on the way.
     ///
-    /// Pins the load-bearing half of that argument: widening this vocabulary
-    /// could not make a colour space newly reachable, because no sRGB format
-    /// gets through the contract's storage selector in the first place. If one
-    /// ever does, this fails and the decision is up for review — the rail would
-    /// then be silently dropping a transfer function with no census site
-    /// watching it.
+    /// The two eight-bit orders are the ones that reach it. They used to decline
+    /// like the rest, and a compute path that could not take them folded them
+    /// onto their linear siblings one layer up instead, so a kernel's linear
+    /// values were stored unencoded and its reads saw codes as values. The fold
+    /// is gone because the rail can now say the true format; this is what keeps
+    /// it from coming back here.
     #[test]
-    fn no_srgb_format_reaches_the_storage_rail() {
+    fn an_srgb_format_reaches_the_storage_rail_as_srgb_or_not_at_all() {
+        let mut admitted = Vec::new();
         let mut checked = 0;
         for mtl in translated() {
-            if !is_srgb(mtl) {
+            let f = translate(mtl).unwrap();
+            let Ok(image) = storage_image(mtl) else {
+                if f.is_srgb() {
+                    checked += 1;
+                    assert_eq!(
+                        storage_image(mtl).unwrap_err(),
+                        Refusal::NoStorageImageFormat(mtl),
+                        "MTL {mtl:#x} is sRGB and declined for another reason"
+                    );
+                }
                 continue;
-            }
-            checked += 1;
+            };
+            let v = vk_storage_image(image);
+            // `storage_format` folds exactly the transfer function off a
+            // format, so a format it moves is one that carries one.
             assert_eq!(
-                storage_image(mtl).unwrap_err(),
-                Refusal::NoStorageImageFormat(mtl),
-                "MTL {mtl:#x} is sRGB and reached the storage rail"
+                storage_format(v) != v,
+                f.is_srgb(),
+                "MTL {mtl:#x} reached the storage rail as {v:?}"
             );
-        }
-        assert!(checked >= 2, "the table lists no sRGB formats to check");
-
-        // …and nothing the rail *does* admit carries a transfer function, so
-        // `PixelFormat::vk` and `linear_vk` coincide for every one of them.
-        for mtl in translated() {
-            if storage_image(mtl).is_ok() {
-                let f = translate(mtl).unwrap();
-                assert_eq!(f.vk, f.linear_vk, "MTL {mtl:#x}");
+            if f.is_srgb() {
+                assert_eq!(v, f.vk, "MTL {mtl:#x} is not its own sRGB format");
+                admitted.push(mtl);
             }
         }
+        assert!(
+            checked >= 2,
+            "the table lists no declined sRGB formats to check"
+        );
+        assert_eq!(
+            admitted,
+            [
+                p::MTL_FORMAT_RGBA8_UNORM_SRGB,
+                p::MTL_FORMAT_BGRA8_UNORM_SRGB
+            ]
+        );
+        assert_eq!(
+            storage_image(p::MTL_FORMAT_BGRA8_UNORM_SRGB),
+            Ok(StorageImageFormat::Bgra8UnormSrgb)
+        );
+        assert_eq!(
+            sampled_image(p::MTL_FORMAT_RGBA8_UNORM_SRGB),
+            Ok(StorageImageFormat::Rgba8UnormSrgb)
+        );
     }
 
     /// A guest texture the graphics rail will sample is one the compute rail
@@ -2223,13 +2283,11 @@ mod tests {
     /// [`StorageImageFormat::R8Unorm`], and [`storage_image_components`] is the
     /// plan the sampled view binds.
     ///
-    /// - The two `*_SRGB` orders would have to bind their linear sibling, which
-    ///   is the [`TranslateReason::SrgbDowngraded`] loss
-    ///   [`sampled_pixels`] hands its caller. This rail's `Result` has nowhere
-    ///   to record it, and
-    ///   [`storage_image`] refuses sRGB for the same reason with its own test
-    ///   pinning that. Admitting it silently here would break the symmetry the
-    ///   crate relies on, so it waits for the rail to gain a warning channel.
+    /// The two eight-bit `*_SRGB` orders used to be listed here: binding
+    /// their linear sibling would have been an unrecorded downgrade. They left
+    /// the list when the rail gained members that keep the transfer function
+    /// ([`StorageImageFormat::Rgba8UnormSrgb`] and its BGRA twin), so a
+    /// dispatch samples them decoded, as a draw does.
     ///
     /// - The **BC block-compressed families** cannot cross this rail at all,
     ///   and that is structural rather than pending a channel. A
@@ -2253,8 +2311,6 @@ mod tests {
     #[test]
     fn a_texture_the_graphics_rail_samples_is_not_refused_by_the_compute_one() {
         const EXCEPTIONS: &[(u16, &str)] = &[
-            (p::MTL_FORMAT_RGBA8_UNORM_SRGB, "would downgrade unrecorded"),
-            (p::MTL_FORMAT_BGRA8_UNORM_SRGB, "would downgrade unrecorded"),
             (
                 p::MTL_FORMAT_BC1_RGBA,
                 "no block-compressed storage image exists",

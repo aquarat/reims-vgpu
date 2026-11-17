@@ -113,6 +113,121 @@ impl ImageRobustness {
     }
 }
 
+/// What this device can do with one eight-bit sRGB format as a **storage**
+/// image.
+///
+/// # Why it is a question about the format and not about the device
+///
+/// A Metal kernel that writes an `_sRGB` texture stores linear values and the
+/// texture holds them encoded; a read decodes. Vulkan can do the same thing in
+/// hardware only through a storage view *in the sRGB format* — and the SPIR-V
+/// image-format operand has no sRGB member, so the shader must declare the image
+/// format-less (`Unknown`). That takes three facts, and Vulkan reports all three
+/// per format:
+///
+/// - `STORAGE_IMAGE` under optimal tiling. Not mandatory for any sRGB format.
+/// - `STORAGE_WRITE_WITHOUT_FORMAT` and `STORAGE_READ_WITHOUT_FORMAT`, which
+///   exist only as `VkFormatFeatureFlags2` bits in `VkFormatProperties3`.
+///
+/// Those two bits are answerable on a Vulkan 1.3 device or one advertising
+/// `VK_KHR_format_feature_flags2`. Below that, the device-wide
+/// `shaderStorageImage{Write,Read}WithoutFormat` features are specified for the
+/// formats SPIR-V can name, and it names no sRGB format, so such a device is
+/// [`Self::Unanswerable`] and declines rather than being assumed capable.
+///
+/// The device-wide features are still required on top: the pipeline cache
+/// declares `StorageImage{Write,Read}WithoutFormat` in a module only where they
+/// were enabled at device creation, so a format bit without its feature is a
+/// module the device would refuse anyway.
+///
+/// Several rungs rather than a bool so a refusal names which fact was missing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SrgbStorage {
+    /// Neither Vulkan 1.3 nor `VK_KHR_format_feature_flags2`: the per-format
+    /// without-format bits cannot be asked. Default, so a `DeviceFeatures` built
+    /// without a query never claims a capability it has not checked.
+    #[default]
+    Unanswerable,
+    /// The format has no `STORAGE_IMAGE` under optimal tiling.
+    NoStorageImage,
+    /// A storage image, but not one a shader may write without a declared
+    /// format — and a declared format is not available for sRGB.
+    NoWriteWithoutFormat,
+    /// Written without a declared format; not read without one.
+    WriteOnly,
+    /// Written and read without a declared format.
+    ReadWrite,
+}
+
+impl SrgbStorage {
+    /// The rung for one format, from what the device reported.
+    ///
+    /// `optimal` is the format's `VkFormatProperties3::optimalTilingFeatures`,
+    /// or `None` where that structure cannot be asked. `write_feature` and
+    /// `read_feature` are the device-wide without-format features.
+    pub fn from_format_features(
+        optimal: Option<vk::FormatFeatureFlags2>,
+        write_feature: bool,
+        read_feature: bool,
+    ) -> Self {
+        let Some(optimal) = optimal else {
+            return Self::Unanswerable;
+        };
+        if !optimal.contains(vk::FormatFeatureFlags2::STORAGE_IMAGE) {
+            return Self::NoStorageImage;
+        }
+        if !(write_feature
+            && optimal.contains(vk::FormatFeatureFlags2::STORAGE_WRITE_WITHOUT_FORMAT))
+        {
+            return Self::NoWriteWithoutFormat;
+        }
+        if read_feature && optimal.contains(vk::FormatFeatureFlags2::STORAGE_READ_WITHOUT_FORMAT) {
+            Self::ReadWrite
+        } else {
+            Self::WriteOnly
+        }
+    }
+
+    /// Whether a kernel may write the format through a format-less view.
+    pub fn writes(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+
+    /// Whether a kernel may read the format through a format-less view.
+    pub fn reads(self) -> bool {
+        matches!(self, Self::ReadWrite)
+    }
+}
+
+/// [`SrgbStorage`] for each eight-bit sRGB format a storage image can be.
+///
+/// Exactly the two `pixel_format::storage_selector` admits — `RGBA8Unorm_sRGB`
+/// and `BGRA8Unorm_sRGB` — so the type has one field per selector member rather
+/// than a table keyed by `VkFormat` that could be asked about a format no guest
+/// storage binding names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SrgbStorageCaps {
+    /// `R8G8B8A8_SRGB`.
+    pub rgba8: SrgbStorage,
+    /// `B8G8R8A8_SRGB`.
+    pub bgra8: SrgbStorage,
+}
+
+/// What the compute rail may choose as a storage view, read once per dispatch.
+///
+/// The two format-dependent storage answers the compute path specializes a
+/// module against, carried together so the specializer is handed the device's
+/// whole answer rather than whichever half a call site remembered to ask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageViewCaps {
+    /// [`DeviceFeatures::storage_image_write_without_format_bgra`]: a guest
+    /// `BGRA8Unorm` surface can be written through a format-less
+    /// `B8G8R8A8_UNORM` view.
+    pub bgra8_without_format: bool,
+    /// The two eight-bit sRGB formats.
+    pub srgb: SrgbStorageCaps,
+}
+
 /// The `maxImageDimension2D` every Vulkan 1.2 implementation must report at
 /// least (spec table "Required Limits"). Used only as the floor a queried
 /// value is clamped to, and as the answer when no device has been resolved.
@@ -227,6 +342,8 @@ pub struct DeviceFeatures {
     /// spec-mandatory — only `R8G8B8A8_UNORM` is — so the BGRA composite path
     /// needs this *and* `storage_image_write_without_format`.
     pub bgra8_storage: bool,
+    /// The eight-bit sRGB formats as storage images; see [`SrgbStorage`].
+    pub srgb_storage: SrgbStorageCaps,
     /// For each [`TexelLayout`], indexed by [`TexelLayout::index`], whether its
     /// Vulkan format is usable as a sampled image with **linear** filtering
     /// under optimal tiling.
@@ -512,6 +629,14 @@ impl DeviceFeatures {
         self.storage_image_write_without_format && self.bgra8_storage
     }
 
+    /// Every storage-view answer the compute rail specializes against.
+    pub fn storage_view_caps(&self) -> StorageViewCaps {
+        StorageViewCaps {
+            bgra8_without_format: self.storage_image_write_without_format_bgra(),
+            srgb: self.srgb_storage,
+        }
+    }
+
     /// The `vk::PhysicalDeviceFeatures` to enable, derived from what is
     /// supported **and** what the backend actually binds.
     ///
@@ -687,6 +812,7 @@ impl DeviceFeatures {
             storage_image_write_without_format,
             storage_image_read_without_format,
             bgra8_storage,
+            srgb_storage,
             texture_compression_bc,
             sampled_linear_filter,
             color_attachment,
@@ -750,7 +876,9 @@ impl DeviceFeatures {
              storage_image_extended_formats={storage_image_extended_formats} \
              storage_image_write_without_format={storage_image_write_without_format} \
              storage_image_read_without_format={storage_image_read_without_format} \
-             bgra8_storage={bgra8_storage} no_linear_filter={} no_blendable_attachment={} \
+             bgra8_storage={bgra8_storage} \
+             srgb_storage_rgba8={:?} srgb_storage_bgra8={:?} \
+             no_linear_filter={} no_blendable_attachment={} \
              storage16={storage16} storage8={storage8} float16={float16} int8={int8} \
              shader_output_viewport_index={shader_output_viewport_index} \
              timeline_semaphore={timeline_semaphore} \
@@ -765,6 +893,8 @@ impl DeviceFeatures {
              dyn_topology_unrestricted={dynamic_primitive_topology_unrestricted} \
              depth_clamp={depth_clamp} multi_viewport={multi_viewport} max_viewports={max_viewports} \
              occlusion_query_precise={occlusion_query_precise}",
+            srgb_storage.rgba8,
+            srgb_storage.bgra8,
             missing(sampled_linear_filter),
             missing(color_attachment),
         )
@@ -848,6 +978,30 @@ pub unsafe fn query(
     }
     .optimal_tiling_features
     .contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
+
+    // The eight-bit sRGB formats as format-less storage images. The
+    // without-format bits exist only in `VkFormatProperties3`, which is chained
+    // only where the device can answer it — the same rule as the
+    // extension-only feature structures below. See [`SrgbStorage`].
+    let format_properties3 = props.api_version >= vk::API_VERSION_1_3
+        || has_extension(vk::KHR_FORMAT_FEATURE_FLAGS2_NAME);
+    let srgb_storage_of = |format: vk::Format| {
+        let optimal = format_properties3.then(|| {
+            let mut props3 = vk::FormatProperties3::default();
+            let mut props2 = vk::FormatProperties2::default().push_next(&mut props3);
+            unsafe { instance.get_physical_device_format_properties2(pd, format, &mut props2) };
+            props3.optimal_tiling_features
+        });
+        SrgbStorage::from_format_features(
+            optimal,
+            supported.shader_storage_image_write_without_format == vk::TRUE,
+            supported.shader_storage_image_read_without_format == vk::TRUE,
+        )
+    };
+    let srgb_storage = SrgbStorageCaps {
+        rgba8: srgb_storage_of(vk::Format::R8G8B8A8_SRGB),
+        bgra8: srgb_storage_of(vk::Format::B8G8R8A8_SRGB),
+    };
 
     // One probe per sampled texel layout, so the native rails decline a layout
     // this host cannot filter instead of sampling it wrong. Derived from
@@ -1041,6 +1195,7 @@ pub unsafe fn query(
         storage_image_read_without_format: supported.shader_storage_image_read_without_format
             == vk::TRUE,
         bgra8_storage,
+        srgb_storage,
         sampled_linear_filter,
         color_attachment,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
@@ -1091,6 +1246,10 @@ mod tests {
             storage_image_write_without_format: true,
             storage_image_read_without_format: true,
             bgra8_storage: true,
+            srgb_storage: SrgbStorageCaps {
+                rgba8: SrgbStorage::ReadWrite,
+                bgra8: SrgbStorage::ReadWrite,
+            },
             sampled_linear_filter: [true; TexelLayout::ALL.len()],
             color_attachment: [true; TexelLayout::ALL.len()],
             storage16: true,
@@ -1440,6 +1599,71 @@ mod tests {
             ..all_supported()
         };
         assert!(!no_feature.storage_image_write_without_format_bgra());
+    }
+
+    /// Each rung of an sRGB storage format names the one fact that was missing,
+    /// and only the top two admit anything.
+    #[test]
+    fn an_srgb_storage_rung_names_the_missing_fact() {
+        use vk::FormatFeatureFlags2 as F;
+        let all =
+            F::STORAGE_IMAGE | F::STORAGE_WRITE_WITHOUT_FORMAT | F::STORAGE_READ_WITHOUT_FORMAT;
+        let rung = SrgbStorage::from_format_features;
+
+        assert_eq!(rung(None, true, true), SrgbStorage::Unanswerable);
+        assert_eq!(
+            rung(Some(all ^ F::STORAGE_IMAGE), true, true),
+            SrgbStorage::NoStorageImage
+        );
+        assert_eq!(
+            rung(Some(all ^ F::STORAGE_WRITE_WITHOUT_FORMAT), true, true),
+            SrgbStorage::NoWriteWithoutFormat
+        );
+        // The format bit without the device feature is not enough: the module
+        // could not declare the capability.
+        assert_eq!(
+            rung(Some(all), false, true),
+            SrgbStorage::NoWriteWithoutFormat
+        );
+        assert_eq!(
+            rung(Some(all ^ F::STORAGE_READ_WITHOUT_FORMAT), true, true),
+            SrgbStorage::WriteOnly
+        );
+        assert_eq!(rung(Some(all), true, false), SrgbStorage::WriteOnly);
+        assert_eq!(rung(Some(all), true, true), SrgbStorage::ReadWrite);
+
+        for (s, writes, reads) in [
+            (SrgbStorage::Unanswerable, false, false),
+            (SrgbStorage::NoStorageImage, false, false),
+            (SrgbStorage::NoWriteWithoutFormat, false, false),
+            (SrgbStorage::WriteOnly, true, false),
+            (SrgbStorage::ReadWrite, true, true),
+        ] {
+            assert_eq!((s.writes(), s.reads()), (writes, reads), "{s:?}");
+        }
+    }
+
+    /// A `DeviceFeatures` nobody queried claims no sRGB storage, and the
+    /// compute rail's per-dispatch answer is the struct's own two fields.
+    #[test]
+    fn srgb_storage_is_unclaimed_until_queried_and_reaches_the_view_caps() {
+        let none = DeviceFeatures::default();
+        assert_eq!(none.srgb_storage, SrgbStorageCaps::default());
+        assert!(!none.srgb_storage.rgba8.writes());
+        assert!(!none.srgb_storage.bgra8.writes());
+        assert_eq!(none.storage_view_caps(), StorageViewCaps::default());
+
+        let all = all_supported();
+        assert_eq!(
+            all.storage_view_caps(),
+            StorageViewCaps {
+                bgra8_without_format: true,
+                srgb: all.srgb_storage,
+            }
+        );
+        let line = all.report_line();
+        assert!(line.contains("srgb_storage_rgba8=ReadWrite"), "{line}");
+        assert!(line.contains("srgb_storage_bgra8=ReadWrite"), "{line}");
     }
 
     /// The render-target bound is the device's limit, not the spec's floor.

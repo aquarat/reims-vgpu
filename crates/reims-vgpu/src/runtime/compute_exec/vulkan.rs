@@ -983,6 +983,10 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
 
     let mut staged_tex: Vec<StagedTexture<VulkanStage>> = Vec::new();
     let mut storage_writeonly_count = 0usize;
+    // Each storage binding's reflected content access, for the specialization
+    // below: an sRGB storage view's read half is a capability of its own.
+    let mut storage_accesses: Vec<(u32, crate::runtime::spirv_bind::StorageImageAccess)> =
+        Vec::new();
     for t in &acc.textures {
         use crate::runtime::spirv_bind::{
             ImageAccess, ReflectedComputeTexture, StorageImageAccess,
@@ -1057,7 +1061,11 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
             }
         };
         let storage_access = if is_storage {
-            match crate::runtime::spirv_bind::storage_image_access(&spirv, binding) {
+            let access = crate::runtime::spirv_bind::storage_image_access(&spirv, binding);
+            if let Some(access) = access {
+                storage_accesses.push((binding, access));
+            }
+            match access {
                 Some(StorageImageAccess::WriteOnly) => Some("write_only"),
                 Some(StorageImageAccess::ReadOnly) => Some("read_only"),
                 Some(StorageImageAccess::ReadWrite) => Some("read_write"),
@@ -1172,10 +1180,11 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
     let mut sampled_images = Vec::with_capacity(sampled_count);
     let mut storage_images = Vec::with_capacity(storage_count);
     let mut storage_formats = Vec::with_capacity(storage_count);
-    // Device support for format-less storage writes decides whether a guest
+    // Device support for format-less storage views: whether a guest
     // BGRA8Unorm storage surface can composite into a B8G8R8A8_UNORM view (no
-    // R/B swap) or must degrade to the swapped Rgba8Unorm view.
-    let write_without_format = vk_engine::supports_storage_image_write_without_format();
+    // R/B swap) or must degrade to the swapped Rgba8Unorm view, and whether a
+    // guest sRGB surface can be written and read in its own format.
+    let view_caps = vk_engine::storage_view_caps();
     // Mapping windows whose readback the engine scatters into the guest's
     // pages itself, so the writes' bookkeeping can follow the engine call.
     let mut scatter_windows: Vec<(u32, u64, u64)> = Vec::new();
@@ -1198,13 +1207,34 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
             ));
             return ComputeStatus::Unsupported("storage_reflection_format_missing");
         };
+        // Every storage binding was classified while staging, or refused there;
+        // a missing entry would mean the two loops disagree about which
+        // bindings are storage, and is held to both halves rather than guessed.
+        let access = storage_accesses
+            .iter()
+            .find(|(binding, _)| *binding == t.binding)
+            .map_or(
+                crate::runtime::spirv_bind::StorageImageAccess::Unknown,
+                |(_, access)| *access,
+            );
         let specialized = match specialized_storage_image_format(
             guest_fmt,
             shader_decl,
-            write_without_format,
+            view_caps,
+            access,
         ) {
             Ok(format) => format,
-            Err(reason) => {
+            Err(refusal @ StorageSpecializeRefusal::SrgbStorage(reason)) => {
+                crate::observe::fail(format!(
+                    "compute_linux storage_format fail reason={reason} pipe={} bind={} spirv={shader_decl:?} guest={guest_fmt:?} simg={} access={access:?} caps={:?}",
+                    acc.pipeline_ref,
+                    t.binding,
+                    selector as u32,
+                    view_caps.srgb,
+                ));
+                return refusal.status();
+            }
+            Err(refusal @ StorageSpecializeRefusal::Mismatch(reason)) => {
                 crate::observe::fail(format!(
                         "compute_linux storage_format fail reason={reason} pipe={} bind={} spirv={shader_decl:?} guest={guest_fmt:?} simg={} guest_bpp={} shader_bpp={}",
                         acc.pipeline_ref,
@@ -1215,7 +1245,7 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
                             .map(|format| format.bytes_per_texel())
                             .unwrap_or(0)
                     ));
-                return ComputeStatus::Unsupported("storage_format_specialize_mismatch");
+                return refusal.status();
             }
         };
         storage_formats.push((t.binding, guest_fmt, shader_decl, specialized));
@@ -1274,20 +1304,35 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
             };
             // An `Unknown`-format storage image carries no SPIR-V texel format;
             // its engine format (and thus VkImageView) is the guest surface's
-            // own format — here BGRA8Unorm → B8G8R8A8_UNORM — so the composite
-            // write lands in guest channel order (the R/B-swap fix). Every other
-            // format takes its engine format from the specialized SPIR-V format.
+            // own format — BGRA8Unorm → B8G8R8A8_UNORM, so the composite write
+            // lands in guest channel order (the R/B-swap fix), and an sRGB
+            // surface → its sRGB format, so the device encodes each store.
+            // Every other format takes its engine format from the specialized
+            // SPIR-V format.
             let shader_fmt = if matches!(
                 specialized,
                 crate::runtime::spirv_bind::ImageFormat::Unknown
             ) {
-                // Always-on proxy for the BGRA-storage-composite R/B class: this
+                // Always-on proxy for the format-less storage classes: this
                 // line fires only on the corrected (without_format) path. Its
                 // absence together with a `degraded_rb_swap` line below is the
                 // regression signal that a swap is being emitted.
                 crate::observe::off(format!(
-                    "compute_linux bgra_storage_composite pipe={} bind={} mode=without_format guest={guest_fmt:?} view=B8G8R8A8_UNORM {}x{}",
-                    acc.pipeline_ref, t.binding, t.width, t.height
+                    "compute_linux {} pipe={} bind={} mode=without_format guest={guest_fmt:?} view={:?} {}x{}",
+                    if matches!(
+                        guest_fmt,
+                        crate::backend::vulkan::engine::StorageImageFormat::Rgba8UnormSrgb
+                            | crate::backend::vulkan::engine::StorageImageFormat::Bgra8UnormSrgb
+                    ) {
+                        "srgb_storage"
+                    } else {
+                        "bgra_storage_composite"
+                    },
+                    acc.pipeline_ref,
+                    t.binding,
+                    guest_fmt.vk_format(),
+                    t.width,
+                    t.height
                 ));
                 guest_fmt
             } else {
@@ -1342,7 +1387,19 @@ fn execute_dispatch_linux_viewed<M: HostMemory + HostOps>(
                 // capability; the direct arm needs the guest-RAM import, and
                 // where that is absent the licence declines by name and this
                 // reads back exactly as it always did.
-                destination: direct_destination(state, host, t, shader_fmt.vk_format()),
+                //
+                // Handed the image's *stored* texel: every licence behind it
+                // compares against `verbatim_texel`, which names bytes and no
+                // transfer function, and a copy out of an sRGB storage image
+                // moves exactly its linear sibling's bytes.
+                destination: direct_destination(
+                    state,
+                    host,
+                    t,
+                    crate::backend::vulkan::translate::pixel::storage_format(
+                        shader_fmt.vk_format(),
+                    ),
+                ),
                 residency: t.rail.residency.map(|candidate| {
                     crate::backend::vulkan::engine::ComputeStorageResidency {
                         identity: candidate.key,
@@ -1925,6 +1982,8 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
         | V::R16Float
         | V::Rgba8Unorm
         | V::Bgra8Unorm
+        | V::Rgba8UnormSrgb
+        | V::Bgra8UnormSrgb
         | V::Rg16Float
         | V::R8Unorm
         | V::Rg8Unorm
@@ -1942,17 +2001,131 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
     }
 }
 
+/// Whether a shader-declared storage format is a normalized/float colour store
+/// — a `vec4` of values the image converts — rather than a raw integer view.
+fn is_color_store(shader: crate::runtime::spirv_bind::ImageFormat) -> bool {
+    use crate::runtime::spirv_bind::ImageFormat as S;
+    matches!(
+        shader,
+        S::Rgba8Unorm
+            | S::Rgba32Float
+            | S::Rgba16Float
+            | S::R16Float
+            | S::R32Float
+            | S::Rg16Float
+            | S::R8Unorm
+            | S::Rg8Unorm
+    )
+}
+
+/// The device's answer for an eight-bit sRGB guest storage format, or `None`
+/// for any other format.
+fn srgb_storage_of(
+    guest: crate::backend::vulkan::engine::StorageImageFormat,
+    caps: crate::backend::vulkan::caps::device_features::StorageViewCaps,
+) -> Option<crate::backend::vulkan::caps::device_features::SrgbStorage> {
+    use crate::backend::vulkan::engine::StorageImageFormat as V;
+    match guest {
+        V::Rgba8UnormSrgb => Some(caps.srgb.rgba8),
+        V::Bgra8UnormSrgb => Some(caps.srgb.bgra8),
+        _ => None,
+    }
+}
+
+/// The refusal slug for an sRGB storage colour store the device cannot hold,
+/// naming the one fact that was missing.
+///
+/// A kernel's colour write into an sRGB texture is an encode, and Vulkan does
+/// that only through a storage view in the sRGB format — which SPIR-V cannot
+/// declare, so the view is format-less. There is no lawful substitute on this
+/// rail: a UNORM view would store the kernel's linear values unencoded, which
+/// is the defect the silent sRGB-to-UNORM fold used to commit. So every rung
+/// below the needed one is a refusal by name.
+fn srgb_storage_refusal(
+    support: crate::backend::vulkan::caps::device_features::SrgbStorage,
+    access: crate::runtime::spirv_bind::StorageImageAccess,
+) -> Option<&'static str> {
+    use crate::backend::vulkan::caps::device_features::SrgbStorage as R;
+    use crate::runtime::spirv_bind::StorageImageAccess as A;
+    // An access the reflection could not classify may read, so it is held to
+    // the read half too.
+    let reads = !matches!(access, A::WriteOnly);
+    // The rungs stop at the first missing fact, so a device that will not
+    // write the format without a declared one is refused whatever the access:
+    // its read bit was never the question that decided anything.
+    match support {
+        R::Unanswerable => Some("srgb_storage_capability_unanswerable"),
+        R::NoStorageImage => Some("srgb_storage_no_storage_image"),
+        R::NoWriteWithoutFormat => Some("srgb_storage_no_write_without_format"),
+        R::WriteOnly if reads => Some("srgb_storage_no_read_without_format"),
+        R::WriteOnly | R::ReadWrite => None,
+    }
+}
+
+/// Why a storage binding could not be specialized.
+///
+/// Two classes with two different owners, so they are two variants rather than
+/// one slug space a caller would have to sort by prefix: a format pairing this
+/// rail has no rule for, and an eight-bit sRGB surface the running device
+/// cannot hold as a storage image in its own format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StorageSpecializeRefusal {
+    /// The guest surface and the translator's declaration do not pair; the
+    /// slug names the rule that refused.
+    Mismatch(&'static str),
+    /// A colour store into an sRGB surface the device lacks the per-format
+    /// capability for; the slug names the missing fact
+    /// ([`srgb_storage_refusal`]).
+    SrgbStorage(&'static str),
+}
+
+impl StorageSpecializeRefusal {
+    /// The dispatch's refusal: one per class, as before for the mismatch.
+    pub(super) fn status(self) -> ComputeStatus {
+        match self {
+            Self::Mismatch(_) => ComputeStatus::Unsupported("storage_format_specialize_mismatch"),
+            Self::SrgbStorage(_) => ComputeStatus::Unsupported("storage_srgb_unsupported"),
+        }
+    }
+}
+
+/// The SPIR-V storage format a binding is specialized to, from the guest
+/// surface's format, the format the translator declared, the device's
+/// storage-view answers, and the binding's reflected content access.
+///
+/// `access` matters for the eight-bit sRGB formats alone, whose format-less
+/// view the device may allow for writes and not for reads; every other format's
+/// answer is a property of the formats and the device.
 pub(super) fn specialized_storage_image_format(
     guest: crate::backend::vulkan::engine::StorageImageFormat,
     shader: crate::runtime::spirv_bind::ImageFormat,
-    write_without_format: bool,
-) -> Result<crate::runtime::spirv_bind::ImageFormat, &'static str> {
+    caps: crate::backend::vulkan::caps::device_features::StorageViewCaps,
+    access: crate::runtime::spirv_bind::StorageImageAccess,
+) -> Result<crate::runtime::spirv_bind::ImageFormat, StorageSpecializeRefusal> {
     use crate::backend::vulkan::engine::StorageImageFormat as V;
     use crate::runtime::spirv_bind::ImageFormat as S;
+    use StorageSpecializeRefusal::Mismatch;
 
     let Some(shader_engine) = spirv_image_format_to_engine_storage(shader) else {
-        return Err("spirv_storage_format_unsupported");
+        return Err(Mismatch("spirv_storage_format_unsupported"));
     };
+    // A guest sRGB surface written by a colour store keeps its transfer
+    // function: the storage image is the sRGB format itself, declared
+    // format-less, so the device encodes each store and decodes each load as
+    // Metal does. That is a per-format capability, and a device without it is
+    // refused by name — never retargeted to the UNORM sibling, which would store
+    // the kernel's linear values unencoded.
+    //
+    // An integer shader over the same surface is a raw byte view, exactly as
+    // over `BGRA8Unorm`, and falls through to the raw-view rule below.
+    if let Some(support) = srgb_storage_of(guest, caps) {
+        if is_color_store(shader) {
+            return match srgb_storage_refusal(support, access) {
+                Some(refusal) => Err(StorageSpecializeRefusal::SrgbStorage(refusal)),
+                None => Ok(S::Unknown),
+            };
+        }
+    }
     // A guest BGRA8Unorm surface written by a normalized (float/unorm-class)
     // shader is a color store. SPIR-V has no `Bgra8` storage format, so a
     // concrete `Rgba8Unorm` view would store the shader's red at the guest's
@@ -1967,25 +2140,12 @@ pub(super) fn specialized_storage_image_format(
     // A uint/sint shader over BGRA is instead a deliberate raw byte view (byte
     // order preserved, no conversion) and must keep its raw format — it falls
     // through to the raw-view / class-matched logic below, unchanged.
-    if matches!(guest, V::Bgra8Unorm) {
-        let normalized_color_store = matches!(
-            shader,
+    if matches!(guest, V::Bgra8Unorm) && is_color_store(shader) {
+        return Ok(if caps.bgra8_without_format {
+            S::Unknown
+        } else {
             S::Rgba8Unorm
-                | S::Rgba32Float
-                | S::Rgba16Float
-                | S::R16Float
-                | S::R32Float
-                | S::Rg16Float
-                | S::R8Unorm
-                | S::Rg8Unorm
-        );
-        if normalized_color_store {
-            return Ok(if write_without_format {
-                S::Unknown
-            } else {
-                S::Rgba8Unorm
-            });
-        }
+        });
     }
     // Nothing to specialize when the translator already named the guest's own
     // format. Stated before the class rules below so a guest surface whose
@@ -2009,7 +2169,7 @@ pub(super) fn specialized_storage_image_format(
         // A shader that itself declared `Unknown` (format-less) storage is not a
         // class we specialize by numeric class; the caller only mints `Unknown`
         // deliberately for the BGRA path, which returns above.
-        S::Unknown | S::Unsupported(_) => return Err("spirv_storage_format_unsupported"),
+        S::Unknown | S::Unsupported(_) => return Err(Mismatch("spirv_storage_format_unsupported")),
     };
     // An integer-class shader over a normalized/float-class guest surface of the
     // same texel width is a deliberate raw byte view — Metal `BGRA8Unorm` bound
@@ -2065,7 +2225,7 @@ pub(super) fn specialized_storage_image_format(
         // can name it and its view mapping would be illegal on one.
         | V::A8Unorm
         | V::Rg11b10Float => {
-            return Err("spirv_sampled_only_format_as_storage");
+            return Err(Mismatch("spirv_sampled_only_format_as_storage"));
         }
         V::Rgba32Float => (0, S::Rgba32Float),
         V::Rgba16Float => (0, S::Rgba16Float),
@@ -2074,6 +2234,12 @@ pub(super) fn specialized_storage_image_format(
         // degraded Rgba8Unorm) before reaching here; this arm is only the
         // class/bytes fallthrough for Rgba8Unorm and a defensive default.
         V::Rgba8Unorm | V::Bgra8Unorm => (0, S::Rgba8Unorm),
+        // A colour store over an sRGB surface returned above, and a raw
+        // integer view of the same width took the raw-view rule; what is left
+        // is an integer shader of another width, which no class pairs with.
+        V::Rgba8UnormSrgb | V::Bgra8UnormSrgb => {
+            return Err(Mismatch("spirv_guest_numeric_class_mismatch"));
+        }
         V::Rg16Float => (0, S::Rg16Float),
         V::R8Unorm => (0, S::R8Unorm),
         V::Rg8Unorm => (0, S::Rg8Unorm),
@@ -2083,7 +2249,7 @@ pub(super) fn specialized_storage_image_format(
         V::Rgba8Sint => (2, S::Rgba8Sint),
     };
     if shader_class != guest_class {
-        return Err("spirv_guest_numeric_class_mismatch");
+        return Err(Mismatch("spirv_guest_numeric_class_mismatch"));
     }
     Ok(specialized)
 }
