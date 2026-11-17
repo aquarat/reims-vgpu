@@ -229,14 +229,15 @@ pub fn decode_memoryless_texture_descriptor(
 /// builds every biplanar video texture this way, so refusing to decode the tag
 /// is not a way to avoid it.
 ///
-/// **Decoded here, executed nowhere.** No rail lists this tag in the `want`
-/// slice it passes to `objects::resolve_descriptor`, so a bind of one still
-/// refuses with `WrongType { got: 12 }`. That is deliberate: one biplanar Metal
-/// texture fed from two guest plane regions is a backend feature, not a decode
-/// arm, and presenting plane 0 as if it were a whole texture would sample luma
-/// as colour — a wrong frame rather than a missing one. What decoding buys is
-/// that the refusal is now *informed*: the geometry and pixel format of the
-/// thing being refused are recovered and reported.
+/// **Executed by conversion.** Presenting plane 0 as if it were a whole
+/// texture would sample luma as colour — a wrong frame rather than a missing
+/// one — so no rail binds a plane. `runtime::two_plane` reads both planes and
+/// converts them on the CPU into the texels Metal reads
+/// (`protocol::ycbcr`), and the sampled draw rail and the compute stager bind
+/// that. Formats whose texels depend on terms no decoded field carries refuse
+/// by name there; [`decode_dual_plane_texture_descriptor`] writes each distinct
+/// descriptor out whole (`dual_plane_texture_descriptor`) so the bytes it does
+/// not decode can be read for them.
 pub const OBJECT_TYPE_DUAL_PLANE_TEXTURE: u8 = 12;
 
 /// Serializer-object first dword subtypes.
@@ -2592,26 +2593,96 @@ pub fn decode_dual_plane_texture_descriptor(
             decode_texture_dimension_block(&plane1_bytes, Some(extent))?,
         ],
     };
-    // Unsupported guest work, and the only place that knows what was asked for.
-    // The bind refuses later as `WrongType { got: 12 }`, which can say the tag
-    // and nothing else; this says the texture. Keyed so a video stream's worth
-    // of identically shaped planes costs one line.
-    let key = (u64::from(out.pixel_format()) << 48)
-        | (u64::from(out.planes[0].width & 0xff_ffff) << 24)
-        | u64::from(out.planes[0].height & 0xff_ffff);
-    if crate::observe::first_sight("dual_plane_texture_unexecutable", key) {
-        crate::observe::fail(format!(
-            "dual_plane_texture_unexecutable pf={:#x} plane0={}x{} plane1={}x{} levels={levels} \
-             (decoded; no rail binds a two-plane texture yet, so a bind of this object \
-             refuses at the type gate)",
-            out.pixel_format(),
-            out.planes[0].width,
-            out.planes[0].height,
-            out.planes[1].width,
-            out.planes[1].height,
-        ));
-    }
+    note_dual_plane_descriptor(bytes, plane1, trailer, levels, &out);
     Ok(out)
+}
+
+/// How many distinct dual-plane descriptors [`note_dual_plane_descriptor`]
+/// writes out in one process. Each line carries ~250 bytes of hex; the census
+/// exists to recover a layout, and a few dozen shapes settle it.
+const DUAL_PLANE_CENSUS_CAP: u32 = 32;
+
+/// Write one dual-plane descriptor out whole, for recovering what its
+/// undecoded bytes carry.
+///
+/// A converted two-plane format (`YCBCR8_420_2P`, 500) reads differently by
+/// the surface's range and YCbCr matrix, and nothing this decoder reads names
+/// either. Whether the guest sends them at all is a question about the bytes
+/// it does not decode, so this states those bytes beside the ones it does:
+///
+/// - `hdrN` is plane `N`'s 24-byte `APVTextureDimension` header. Decoded:
+///   `+0` the 14-bit level count and two flag bits, `+4` the data offset,
+///   `+23` bytes per element. Undecoded: `+2`, `+12`, `+20..+23`.
+/// - `trailer` is the object's 44-byte format trailer. Decoded: `+14` the
+///   pixel format, `+16`/`+20` the repeated width and height, `+30` the
+///   sample count. Undecoded: `+0..+14`, `+24..+30`, `+32..+44`.
+///
+/// Latched per distinct `(format, extent, headers, trailer)` with the data
+/// offsets left out of the key, so a stream of identically shaped frames
+/// costs one line, and capped at [`DUAL_PLANE_CENSUS_CAP`] lines overall.
+/// It is an `OFF` analysis line: the texture decoded, and whether it binds is
+/// the bind's to say.
+fn note_dual_plane_descriptor(
+    bytes: &[u8],
+    plane1: usize,
+    trailer: usize,
+    levels: u32,
+    out: &DualPlaneTextureDescriptor,
+) {
+    use crate::protocol::fnv::{fold_bytes, fold_u64, FNV_OFFSET_BASIS};
+    use std::fmt::Write as _;
+
+    let header = |base: usize| &bytes[base..base + TEXTURE_DIM_HEADER_LEN];
+    let (hdr0, hdr1, tail) = (header(TEXTURE_DIM_BASE), header(plane1), &bytes[trailer..]);
+    // The data offset (`+4..+12`) differs per allocation and says nothing
+    // about the layout; everything else is part of the shape.
+    let shape = |h: &[u8]| -> u64 { fold_bytes(fold_bytes(FNV_OFFSET_BASIS, &h[..4]), &h[12..]) };
+    let key = fold_bytes(
+        fold_u64(
+            fold_u64(
+                fold_u64(FNV_OFFSET_BASIS, u64::from(out.pixel_format())),
+                (u64::from(out.planes[0].width) << 32) | u64::from(out.planes[0].height),
+            ),
+            shape(hdr0) ^ shape(hdr1).rotate_left(17),
+        ),
+        tail,
+    );
+    if !crate::observe::first_sight("dual_plane_texture_descriptor", key) {
+        return;
+    }
+    // The cap is a set of latched slots rather than a counter so it lives in
+    // the same latch set as every other first sighting, and is reset with it.
+    if !(0..DUAL_PLANE_CENSUS_CAP)
+        .any(|slot| crate::observe::first_sight("dual_plane_texture_descriptor_slot", slot.into()))
+    {
+        return;
+    }
+    let hex = |b: &[u8]| {
+        let mut s = String::with_capacity(2 * b.len());
+        for byte in b {
+            let _ = write!(s, "{byte:02x}");
+        }
+        s
+    };
+    let plane = |p: &TextureDescriptor| {
+        let l0 = p.level(0).copied().unwrap_or_default();
+        format!(
+            "{}x{}:bpr={}:off={:#x}:size={}:bpe={}",
+            l0.width, l0.height, l0.row_stride, l0.offset, l0.size, p.bytes_per_element
+        )
+    };
+    crate::observe::off(format!(
+        "dual_plane_texture_descriptor pf={} levels={levels} len={} alloc={:#x} \
+         plane0={} plane1={} hdr0={} hdr1={} trailer={}",
+        out.pixel_format(),
+        bytes.len(),
+        out.planes[0].allocation_size,
+        plane(&out.planes[0]),
+        plane(&out.planes[1]),
+        hex(hdr0),
+        hex(hdr1),
+        hex(tail),
+    ));
 }
 
 /// Read the trailer's sample count, but only once the trailer has proved it is
