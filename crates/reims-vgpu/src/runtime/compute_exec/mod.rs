@@ -1792,6 +1792,12 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
     // those pages). `ListObjectEntry` is `Copy`, so one guest-DMA read+decode
     // serves both instead of two.
     let ref_entry = objects::lookup_list_entry(state, host, task_id, texture_ref);
+    // A two-plane Y'CbCr texture in guest memory stages its planes converted.
+    if ref_entry.is_some_and(|entry| {
+        entry.object_type == crate::runtime::two_plane::OBJECT_TYPE_DUAL_PLANE_TEXTURE
+    }) {
+        return two_plane::stage_guest(state, host, task_id, texture_ref, binding, is_storage);
+    }
     if let Some(entry) = ref_entry {
         if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
             let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
@@ -2231,6 +2237,25 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         };
         if width == 0 || height == 0 {
             return Err(ComputeStatus::MissingTexture("compute_stage_tex_zero_geom"));
+        }
+        // A two-plane Y'CbCr format over the surface reads both its planes,
+        // converted; no single-plane format table answers for it.
+        if crate::protocol::ycbcr::two_plane_format(format).is_some() {
+            return two_plane::stage_surface(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                binding,
+                is_storage,
+                two_plane::SurfaceTexture {
+                    mapping_id,
+                    width,
+                    height,
+                    pixel_format: format,
+                    view_pixel_format,
+                },
+            );
         }
         let view_format = match crate::runtime::draw::effective_view_sample_format_reasoned(
             format,
@@ -3790,3 +3815,4 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests;
+mod two_plane;

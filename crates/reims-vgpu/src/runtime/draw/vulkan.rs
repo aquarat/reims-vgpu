@@ -1256,6 +1256,12 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     let mut surface: Option<u32> = None;
     let resolved_resource =
         resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
+    // A two-plane Y'CbCr texture binds its two planes converted, never a plane.
+    if let Some(resource) = resolved_resource.as_ref().filter(|resource| {
+        resource.entry.object_type == crate::runtime::two_plane::OBJECT_TYPE_DUAL_PLANE_TEXTURE
+    }) {
+        return super::two_plane::sampled_source(state, host, task_id, texture_ref, resource);
+    }
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry;
         if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {

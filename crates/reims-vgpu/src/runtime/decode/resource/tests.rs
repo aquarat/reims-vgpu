@@ -3636,14 +3636,22 @@ fn a_dual_plane_descriptor_decodes_both_planes_and_the_shared_trailer() {
             .any(|l| l.starts_with("texture_desc_trailer_disagrees")),
         "the layout is exactly right here; nothing may claim otherwise: {lines:?}"
     );
-    // Decoded, and still refused for execution -- once, with the geometry on it.
+    // Decoded, and written out whole once for the bytes nothing decodes.
     let note = lines
         .iter()
-        .find(|l| l.starts_with("dual_plane_texture_unexecutable"))
-        .expect("unsupported guest work must reach the failure channel");
+        .find(|l| l.contains("dual_plane_texture_descriptor"))
+        .expect("the descriptor census reaches the always-on channel");
     assert!(
-        note.contains("plane0=1920x1080") && note.contains("plane1=960x540"),
+        note.contains("plane0=1920x1080:bpr=1920")
+            && note.contains("plane1=960x540:bpr=1920")
+            && note.contains("trailer="),
         "{note}"
+    );
+    let trailer = &b[b.len() - 44..];
+    let trailer_hex: String = trailer.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert!(
+        note.ends_with(&format!("trailer={trailer_hex}")),
+        "the whole trailer, decoded and undecoded bytes alike: {note}"
     );
 }
 
