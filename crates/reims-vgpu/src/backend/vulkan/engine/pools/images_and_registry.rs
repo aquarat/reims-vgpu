@@ -890,17 +890,30 @@ impl ResourcePools {
         {
             return Ok(Some(*view));
         }
-        let view = unsafe {
-            ctx.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(slot.image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format)
-                    .subresource_range(super::super::registry_subresource_range(format)),
-                None,
-            )
+        // A guest import was created without `STORAGE`, so it has nothing to
+        // restrict; a device-allocated resident has exactly the usage its
+        // allocation format's rule gives it.
+        let restricted = match &slot.memory {
+            ResidentMemory::Recyclable(_) => super::super::resident_view_usage(
+                ctx,
+                super::super::registry_resident_usage(ctx, slot.format.allocation()),
+                format,
+            ),
+            ResidentMemory::GuestImported { .. } => None,
+        };
+        let mut view_usage = vk::ImageViewUsageCreateInfo::default();
+        let mut info = vk::ImageViewCreateInfo::default()
+            .image(slot.image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(super::super::registry_subresource_range(format));
+        if let Some(restricted) = restricted {
+            view_usage = view_usage.usage(restricted);
+            info = info.push_next(&mut view_usage);
         }
-        .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error)))?;
+        let view = unsafe { ctx.device.create_image_view(&info, None) }.map_err(|error| {
+            DrawError::VkCall(VkCall::new(VkOp::PoolsCreateRegistryView, error))
+        })?;
         counters.note_create(CreateSite::RegistryImageView);
         slot.alternate_views.push((format, view));
         Ok(Some(view))
@@ -1244,6 +1257,9 @@ impl ResourcePools {
         // reclaims and retries on out-of-memory rather than trimming ahead of
         // one. See `recoverable_residents`.
         self.note_registry_reach();
+        // The guest import's usage. A device-allocated image below takes
+        // `registry_resident_usage` instead, which adds `STORAGE` where the
+        // format allows it — a term the import's linear layout is not asked for.
         let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::INPUT_ATTACHMENT
             | vk::ImageUsageFlags::TRANSFER_SRC
@@ -1348,7 +1364,10 @@ impl ResourcePools {
                         .array_layers(1)
                         .samples(super::super::caches::vk_sample_count(sample_count))
                         .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(usage)
+                        .usage(super::super::registry_resident_usage(
+                            ctx,
+                            format.allocation(),
+                        ))
                         .initial_layout(vk::ImageLayout::UNDEFINED),
                     None,
                 )
@@ -1428,14 +1447,25 @@ impl ResourcePools {
         // that same format. They are one handle on every format that carries no
         // transfer function, which is every format but the two sRGB spellings.
         let attachment_view = if format.needs_own_view() {
-            match ctx.device.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(format.declared())
-                    .subresource_range(color_subresource_range()),
-                None,
-            ) {
+            let image_usage = match &memory {
+                ResidentMemory::Recyclable(_) => {
+                    super::super::registry_resident_usage(ctx, format.allocation())
+                }
+                ResidentMemory::GuestImported { .. } => usage,
+            };
+            let mut view_usage = vk::ImageViewUsageCreateInfo::default();
+            let mut info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format.declared())
+                .subresource_range(color_subresource_range());
+            if let Some(restricted) =
+                super::super::resident_view_usage(ctx, image_usage, format.declared())
+            {
+                view_usage = view_usage.usage(restricted);
+                info = info.push_next(&mut view_usage);
+            }
+            match ctx.device.create_image_view(&info, None) {
                 Ok(v) => {
                     counters.note_create(CreateSite::RegistryImageView);
                     Some(v)
@@ -1582,11 +1612,11 @@ impl ResourcePools {
         }
         // Census only, as in the primary `registry_ensure`.
         self.note_registry_reach();
-        let usage = super::super::registry_target_usage(format.allocation());
+        let usage = super::super::registry_resident_usage(ctx, format.allocation());
         // Reuse a recycled image+memory+view of identical (geometry, format)
         // before allocating — same recycle discipline as the primary
         // `registry_ensure`. Usage is a function of the format
-        // (`registry_target_usage`), so images cross-flow between these paths by
+        // (`registry_resident_usage`), so images cross-flow between these paths by
         // geometry+format without a bucket ever mixing usages. Skips the
         // create/alloc/bind/view + their note_create/note_alloc; recycled
         // contents are stale, so the slot below is inserted layout=UNDEFINED /

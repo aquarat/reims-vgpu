@@ -1973,6 +1973,17 @@ pub(crate) enum ResidentAccess {
     /// A transfer read it: a present blit, a guest-page readback, a GPU seed
     /// copy, or this draw's own copy-on-sample snapshot.
     TransferRead(vk::ImageLayout),
+    /// A fragment shader read and wrote it as a storage image
+    /// (`texture2d<T, access::write | read_write>` bound to a draw).
+    ///
+    /// Its own variant rather than a `ShaderRead` with a write folded in,
+    /// because the two differ in exactly what a later barrier must name: a
+    /// storage write is a `SHADER_WRITE` at `FRAGMENT_SHADER`, which no render
+    /// pass's external dependency covers (see [`Self::covered_by_pass_entry`]),
+    /// so every consumer — a sample, a snapshot, a readback, a later storage
+    /// draw, a colour load — owes a barrier, and a draw that would record one
+    /// inside an open pass closes the pass first.
+    StorageWrite(vk::ImageLayout),
 }
 
 impl ResidentAccess {
@@ -2030,12 +2041,19 @@ impl ResidentAccess {
     ///   implicit host-memory dependency does make it visible, but the layout is
     ///   not the resting one and the transition out of `PREINITIALIZED` is the
     ///   one thing that preserves those bytes. Never skippable.
+    /// - `StorageWrite` is a fragment-shader write. The external dependency's
+    ///   source scope names colour output and transfer only, so a storage write
+    ///   is outside it and a draw reading what an earlier draw stored must wait
+    ///   for it explicitly. That barrier cannot be recorded inside the open
+    ///   pass, which is what closes it — stronger than Metal, which orders
+    ///   render-stage writes only across a barrier, and this device decodes the
+    ///   render encoder's barriers as no-ops.
     ///
     /// A wrong `true` is a sampled read racing the write that produced its
     /// pixels: a stale frame, with nothing reported anywhere.
     pub(crate) fn covered_by_pass_entry(self) -> bool {
         match self {
-            Self::Untouched | Self::GuestBacking => false,
+            Self::Untouched | Self::GuestBacking | Self::StorageWrite(_) => false,
             Self::ColorWrite(_)
             | Self::ColorFeedback(_)
             | Self::ShaderRead(_)
@@ -2059,9 +2077,10 @@ impl ResidentAccess {
             Self::Untouched => vk::ImageLayout::UNDEFINED,
             Self::GuestBacking => vk::ImageLayout::PREINITIALIZED,
             Self::ColorWrite(layout) => layout,
-            Self::ColorFeedback(layout) | Self::ShaderRead(layout) | Self::TransferRead(layout) => {
-                layout
-            }
+            Self::ColorFeedback(layout)
+            | Self::ShaderRead(layout)
+            | Self::TransferRead(layout)
+            | Self::StorageWrite(layout) => layout,
         }
     }
 
@@ -2108,6 +2127,12 @@ impl ResidentAccess {
             Self::TransferRead(_) => (
                 vk::PipelineStageFlags::TRANSFER,
                 vk::AccessFlags::TRANSFER_READ,
+            ),
+            // Read as well as write: a `read_write` texture's loads must be
+            // ordered before whatever overwrites the image next, too.
+            Self::StorageWrite(_) => (
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
             ),
         }
     }

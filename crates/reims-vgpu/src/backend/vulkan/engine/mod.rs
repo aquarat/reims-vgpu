@@ -198,6 +198,69 @@ pub(crate) fn registry_subresource_range(
 /// true by construction, so a fourth creation site cannot get it wrong and
 /// nothing has to scan for one that did.
 pub(crate) fn registry_target_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
+    registry_format_usage(format)
+}
+
+/// The usage set an **optimal-tiling, device-allocated** registry resident is
+/// created with: [`registry_target_usage`], plus the two capabilities that
+/// depend on the device rather than the format alone.
+///
+/// - `STORAGE`, where the device can store to the allocation format, so a
+///   fragment shader may bind the resident as a storage image
+///   (`texture2d<T, access::write>`). Without it on the image there is no
+///   lawful way to bind it later short of recreating it and losing its pixels.
+/// - `ATTACHMENT_FEEDBACK_LOOP_EXT`, where that layout is enabled, so a draw may
+///   sample the colour target it renders into in place.
+///
+/// Still a function of the format, because the device is fixed for the life of
+/// a context: two residents of one allocation format always agree, which is
+/// the recycle bucket's invariant. Both creation sites — the primary target's
+/// and the attachment/secondary one — take their usage from here, so an image
+/// recycled from one into the other carries exactly the usage the receiving
+/// site would have created. (They used to differ by the feedback-loop bit,
+/// which the recycle pool's `(geometry, format)` key could not see.)
+///
+/// Not used for guest-imported linear images: those take
+/// [`registry_target_usage`] alone, because the import's explicit-layout support
+/// query is asked for that set and a storage term the linear layout cannot
+/// honour would decline the import.
+pub(crate) fn registry_resident_usage(
+    ctx: &context::DeviceContext,
+    format: ash::vk::Format,
+) -> ash::vk::ImageUsageFlags {
+    let mut usage = registry_format_usage(format);
+    if format_is_depth(format) {
+        return usage;
+    }
+    if ctx.supports_optimal_storage_image(format) {
+        usage |= ash::vk::ImageUsageFlags::STORAGE;
+    }
+    if ctx.features.attachment_feedback_loop_layout {
+        usage |= ash::vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
+    }
+    usage
+}
+
+/// The usage an image view of a registry resident is created with, when the
+/// view's format differs from the allocation's (`registry_view`, the sRGB
+/// attachment view): `None` to inherit the image's usage, or the image's usage
+/// less `STORAGE` when the view's own format cannot be a storage image.
+///
+/// A view inherits its image's usage unless told otherwise, and a usage the
+/// view's format does not support makes the view invalid. An sRGB view over a
+/// `STORAGE` UNORM allocation is the case: sRGB formats are not storage
+/// formats on any host this device supports.
+pub(crate) fn resident_view_usage(
+    ctx: &context::DeviceContext,
+    image_usage: ash::vk::ImageUsageFlags,
+    view_format: ash::vk::Format,
+) -> Option<ash::vk::ImageUsageFlags> {
+    (image_usage.contains(ash::vk::ImageUsageFlags::STORAGE)
+        && !ctx.supports_optimal_storage_image(view_format))
+    .then(|| image_usage & !ash::vk::ImageUsageFlags::STORAGE)
+}
+
+fn registry_format_usage(format: ash::vk::Format) -> ash::vk::ImageUsageFlags {
     if format_is_depth(format) {
         // A depth resident is only ever attachment N of an ad-hoc framebuffer.
         // No SAMPLED and no TRANSFER: nothing in this device reads a depth

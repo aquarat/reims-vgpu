@@ -759,6 +759,12 @@ pub(crate) struct DeviceContext {
     /// Physical-device support is immutable, while target identities churn, so
     /// the query belongs to the device lifetime rather than each image lifetime.
     pub explicit_linear_support: Mutex<HashMap<(i32, u32), bool>>,
+    /// Per-format answer to "may an optimal-tiling image of this format be a
+    /// storage image" (`VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT`). Read by the
+    /// registry's usage rule ([`super::registry_resident_usage`]) and by the
+    /// fragment storage-image bind. Immutable for a physical device, so it is
+    /// asked once per format for the device's lifetime.
+    pub optimal_storage_support: Mutex<HashMap<i32, bool>>,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -1527,6 +1533,7 @@ impl DeviceContext {
             sampler_anisotropy: features.sampler_anisotropy,
             features,
             explicit_linear_support: Mutex::new(HashMap::new()),
+            optimal_storage_support: Mutex::new(HashMap::new()),
             depth_stencil_format,
             timestamps,
             draw_spans,
@@ -1637,6 +1644,33 @@ impl DeviceContext {
     /// `VkMemoryRequirements` it just queried. It is what keeps a large
     /// allocation out of a heap that could not hold it — see
     /// [`select_memory_type`], which refuses rather than nominating one.
+    /// Whether an optimal-tiling image of `format` may be bound as a storage
+    /// image on this device. See [`Self::optimal_storage_support`].
+    pub(crate) fn supports_optimal_storage_image(&self, format: vk::Format) -> bool {
+        let key = format.as_raw();
+        if let Some(answer) = self
+            .optimal_storage_support
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return *answer;
+        }
+        // SAFETY: a format-properties query needs only the live instance and
+        // physical device this context owns.
+        let answer = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.pd, format)
+        }
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
+        self.optimal_storage_support
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, answer);
+        answer
+    }
+
     pub(crate) fn memory_type_for(
         &self,
         type_bits: u32,
