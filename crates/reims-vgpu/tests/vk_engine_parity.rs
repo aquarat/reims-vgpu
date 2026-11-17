@@ -4349,3 +4349,250 @@ fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
         "a draw since the stamp clears it — the slot is still there"
     );
 }
+
+/// SPIR-V binding the storage-image tests below put their image at: the start
+/// of the translator's storage-texture band, where a reflected
+/// `texture2d<T, access::write>` lands.
+const STORAGE_TEST_BINDING: u32 = reims_vgpu::runtime::spirv_bind::M2V_DEFAULT_DESCRIPTOR_LAYOUT
+    .storage_textures
+    .start;
+
+/// A fragment shader that stores `rgba` into a storage image at its own pixel
+/// and writes no colour output:
+///
+/// ```glsl
+/// layout(set = 0, binding = STORAGE_TEST_BINDING, <format>) uniform writeonly image2D img;
+/// void main() { imageStore(img, ivec2(gl_FragCoord.xy), vec4(rgba)); }
+/// ```
+///
+/// Hand-assembled rather than translated from AIR so the case carries no
+/// third-party bytes and pins exactly the module shape the storage rail binds:
+/// a single 2D storage image (`Sampled = 2`) of an explicit format.
+/// `format` is the SPIR-V `ImageFormat` ordinal (`Rgba16f` = 2, `Rgba8` = 4).
+fn storage_write_fragment(format: u32, rgba: [f32; 4]) -> Vec<u32> {
+    fn op(opcode: u32, operands: &[u32]) -> Vec<u32> {
+        let mut words = vec![((operands.len() as u32 + 1) << 16) | opcode];
+        words.extend_from_slice(operands);
+        words
+    }
+    const MAIN: [u32; 2] = [u32::from_le_bytes(*b"main"), 0];
+    let (void, fn_ty, float, v4f, int, v2i, v2f) = (1, 2, 3, 4, 5, 6, 7);
+    let (in_v4f, frag_coord, image_ty, image_ptr, image) = (8, 9, 10, 11, 12);
+    let (c0, c3, colour, main, label) = (13, 16, 17, 18, 19);
+    let (coord, xy, ixy, loaded) = (20, 21, 22, 23);
+    let mut words = vec![0x0723_0203, 0x0001_0000, 0, 24, 0];
+    words.extend(op(17, &[1])); // OpCapability Shader
+    words.extend(op(14, &[0, 1])); // OpMemoryModel Logical GLSL450
+    words.extend(op(15, &[4, main, MAIN[0], MAIN[1], frag_coord])); // OpEntryPoint Fragment
+    words.extend(op(16, &[main, 7])); // OpExecutionMode OriginUpperLeft
+    words.extend(op(71, &[frag_coord, 11, 15])); // OpDecorate BuiltIn FragCoord
+    words.extend(op(71, &[image, 34, 0])); // OpDecorate DescriptorSet 0
+    words.extend(op(71, &[image, 33, STORAGE_TEST_BINDING])); // OpDecorate Binding
+    words.extend(op(19, &[void]));
+    words.extend(op(33, &[fn_ty, void]));
+    words.extend(op(22, &[float, 32]));
+    words.extend(op(23, &[v4f, float, 4]));
+    words.extend(op(21, &[int, 32, 1]));
+    words.extend(op(23, &[v2i, int, 2]));
+    words.extend(op(23, &[v2f, float, 2]));
+    words.extend(op(32, &[in_v4f, 1, v4f])); // OpTypePointer Input
+    words.extend(op(59, &[in_v4f, frag_coord, 1])); // OpVariable Input
+    words.extend(op(25, &[image_ty, float, 1, 0, 0, 0, 2, format])); // OpTypeImage 2D storage
+    words.extend(op(32, &[image_ptr, 0, image_ty])); // OpTypePointer UniformConstant
+    words.extend(op(59, &[image_ptr, image, 0])); // OpVariable UniformConstant
+    for (i, value) in rgba.iter().enumerate() {
+        words.extend(op(43, &[float, c0 + i as u32, value.to_bits()])); // OpConstant
+    }
+    debug_assert_eq!(c0 + 3, c3);
+    words.extend(op(44, &[v4f, colour, c0, c0 + 1, c0 + 2, c3])); // OpConstantComposite
+    words.extend(op(54, &[void, main, 0, fn_ty])); // OpFunction
+    words.extend(op(248, &[label])); // OpLabel
+    words.extend(op(61, &[v4f, coord, frag_coord])); // OpLoad
+    words.extend(op(79, &[v2f, xy, coord, coord, 0, 1])); // OpVectorShuffle .xy
+    words.extend(op(110, &[v2i, ixy, xy])); // OpConvertFToS
+    words.extend(op(61, &[image_ty, loaded, image])); // OpLoad image
+    words.extend(op(99, &[loaded, ixy, colour])); // OpImageWrite
+    words.extend(op(253, &[])); // OpReturn
+    words.extend(op(56, &[])); // OpFunctionEnd
+    words
+}
+
+/// A heap-placed (host-only) texture's identity, as the runtime keys one.
+fn host_only_storage_texture(w: u32, h: u32) -> TargetIdentity {
+    TargetIdentity::Texture {
+        ref_: 0x5701,
+        width: w,
+        height: h,
+        generation: 1 << 63,
+        stencil: false,
+    }
+}
+
+fn storage_request(
+    vert: &[u32],
+    frag: &[u32],
+    identity: &TargetIdentity,
+    format: ash::vk::Format,
+    content: engine::StorageImageContent,
+) -> DrawRequest {
+    let (w, h) = (identity.width(), identity.height());
+    let mut req = engine_req(vert, frag, w, h);
+    req.frag_used_descriptor_bindings = std::sync::Arc::from([STORAGE_TEST_BINDING]);
+    req.storage_images.push(engine::StorageImageResource {
+        binding: STORAGE_TEST_BINDING,
+        identity: identity.clone(),
+        format,
+        view_format: format,
+        content,
+    });
+    req
+}
+
+/// The texel at the centre of a storage resident, as RGBA halves when the
+/// readback carried the native half-float texel, else as unorm8 widened to the
+/// same scale (`x / 255`) so one comparison serves both.
+fn storage_center(identity: &TargetIdentity) -> [f32; 4] {
+    let (w, h) = (identity.width(), identity.height());
+    let center = ((h / 2) * w + w / 2) as usize;
+    let rb = engine::read_target(identity).expect("read the storage resident back");
+    if rb.texel.native_layout().is_some() {
+        let px = &rb.pixels[center * 8..center * 8 + 8];
+        let half = |bits: u16| {
+            // Normal halves only; every value these tests store is one.
+            let exp = i32::from((bits >> 10) & 0x1f) - 15;
+            let mant = 1.0 + f32::from(bits & 0x3ff) / 1024.0;
+            mant * 2f32.powi(exp)
+        };
+        [0, 1, 2, 3].map(|c| half(u16::from_le_bytes([px[c * 2], px[c * 2 + 1]])))
+    } else {
+        let rgba = rb.into_rgba8().expect("an eight-bit readback");
+        let px = &rgba[center * 4..center * 4 + 4];
+        [0, 1, 2, 3].map(|c| f32::from(px[c]) / 255.0)
+    }
+}
+
+fn assert_storage_center(label: &str, identity: &TargetIdentity, want: [f32; 4]) {
+    let got = storage_center(identity);
+    assert!(
+        got.iter()
+            .zip(want)
+            .all(|(g, w)| (g - w).abs() <= 1.0 / 255.0),
+        "{label}: storage centre {got:?}, expected {want:?}"
+    );
+}
+
+/// The macOS 26 login window's pass in miniature: a fragment shader stores into
+/// an `RGBA16Float` texture it does not render to, the store lands in that
+/// texture's resident, and a later draw's store to the same image is ordered
+/// after the first — the barrier the storage rail records between storage draws.
+///
+/// Run under `VK_LAYER_KHRONOS_validation` with synchronization validation on:
+/// a missing or mis-scoped barrier between the two draws, or a storage view the
+/// format cannot take, is a validation error here before it is a wrong pixel.
+#[test]
+fn a_fragment_storage_write_lands_in_the_textures_resident_and_orders_after_the_last() {
+    let _g = engine_test_session();
+    let (v, _) = triangle_spirv();
+    let identity = host_only_storage_texture(32, 16);
+    let format = ash::vk::Format::R16G16B16A16_SFLOAT;
+    let first = [0.25, 0.5, 0.75, 1.0];
+    let req = storage_request(
+        &v,
+        &storage_write_fragment(2, first),
+        &identity,
+        format,
+        engine::StorageImageContent::LoadOrClear,
+    );
+    if draw_out_or_skip("fragment_storage_first", &req).is_none() {
+        return;
+    }
+    assert_storage_center("first store", &identity, first);
+
+    // Same pipeline layout, another constant: the second draw must not race the
+    // first, and its store is what the resident holds afterwards.
+    let second = [1.0, 0.5, 0.25, 0.5];
+    let req = storage_request(
+        &v,
+        &storage_write_fragment(2, second),
+        &identity,
+        format,
+        engine::StorageImageContent::Load,
+    );
+    engine::execute_draw_request(engine_device(), &req).expect("second storage draw");
+    assert_storage_center("second store", &identity, second);
+}
+
+/// An eight-bit storage image takes the same rail, through an `Rgba8` image
+/// type over an `R8G8B8A8_UNORM` resident.
+#[test]
+fn an_rgba8_fragment_storage_write_lands_in_its_resident() {
+    let _g = engine_test_session();
+    let (v, _) = triangle_spirv();
+    let identity = host_only_storage_texture(16, 16);
+    let rgba = [0.25, 0.5, 0.75, 1.0];
+    let req = storage_request(
+        &v,
+        &storage_write_fragment(4, rgba),
+        &identity,
+        ash::vk::Format::R8G8B8A8_UNORM,
+        engine::StorageImageContent::LoadOrClear,
+    );
+    if draw_out_or_skip("fragment_storage_rgba8", &req).is_none() {
+        return;
+    }
+    assert_storage_center("rgba8 store", &identity, rgba);
+}
+
+/// A guest-backed storage texture whose resident holds nothing of it yet is
+/// refused by name — the shader would otherwise load, and the guest later see,
+/// a recycled image's texels as this texture's — and a storage image that is
+/// also the draw's own colour target is refused before anything is ensured.
+#[test]
+fn fragment_storage_refuses_an_unready_load_and_an_attachment_alias() {
+    let _g = engine_test_session();
+    let (v, _) = triangle_spirv();
+    let frag = storage_write_fragment(2, [0.0, 0.0, 0.0, 1.0]);
+    let unready = TargetIdentity::Surface {
+        id: 0x5702,
+        width: 16,
+        height: 16,
+        generation: 1,
+        format: ash::vk::Format::R16G16B16A16_SFLOAT,
+    };
+    let req = storage_request(
+        &v,
+        &frag,
+        &unready,
+        ash::vk::Format::R16G16B16A16_SFLOAT,
+        engine::StorageImageContent::Load,
+    );
+    match engine::execute_draw_request(engine_device(), &req) {
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP fragment_storage_refusals: {e}");
+            return;
+        }
+        Err(e) => assert!(
+            e.to_string()
+                .contains("vk_draw_exec_storage_image_content_not_ready"),
+            "{e}"
+        ),
+        Ok(_) => panic!("a guest-backed storage image with nothing in its resident was bound"),
+    }
+
+    let attached = host_only_storage_texture(16, 16);
+    let mut req = storage_request(
+        &v,
+        &frag,
+        &attached,
+        ash::vk::Format::R8G8B8A8_UNORM,
+        engine::StorageImageContent::LoadOrClear,
+    );
+    req.target_identity = Some(attached.clone());
+    let e = engine::execute_draw_request(engine_device(), &req)
+        .expect_err("a storage image that is the draw's own colour target");
+    assert!(
+        e.to_string()
+            .contains("vk_draw_validate_storage_image_aliases_attachment"),
+        "{e}"
+    );
+}
