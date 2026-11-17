@@ -2431,6 +2431,92 @@ pub fn reflected_texture_descriptor(
     )
 }
 
+/// Every texture argument reflection classifies as a storage image, with its
+/// descriptor — the set a fragment stage binds through the storage rail.
+pub fn reflected_storage_textures(
+    reflection: &ShaderReflection,
+) -> impl Iterator<Item = (u32, ReflectedTextureDescriptor)> + '_ {
+    reflection.bindings.iter().filter_map(|binding| {
+        if !is_texture_kind(binding.kind) || binding.access != Some(ResourceAccess::Storage) {
+            return None;
+        }
+        reflected_texture_descriptor(reflection, binding.metal_index)
+            .filter(|descriptor| descriptor.access == ReflectedTextureAccess::Storage)
+            .map(|descriptor| (binding.metal_index, descriptor))
+    })
+}
+
+/// Why a reflected storage texture is not the one shape the draw storage rail
+/// binds — a single, single-sampled 2D image — or `None` when it is.
+///
+/// The rail binds a colour-attachment resident, which is exactly that shape;
+/// an array, a cube, a volume or a multisampled image has no resident of its
+/// own to stand for it. The name is the decline's `kind=`.
+pub fn storage_texture_unsupported_shape(
+    reflection: &ShaderReflection,
+    descriptor: ReflectedTextureDescriptor,
+) -> Option<&'static str> {
+    if descriptor.descriptor_count != 1 {
+        return Some("descriptor_array");
+    }
+    let Some(shape) = texture_shape_for_binding(reflection, descriptor.binding) else {
+        return Some("shape_unreflected");
+    };
+    if shape.array_ref {
+        return Some("descriptor_array");
+    }
+    if shape.multisampled {
+        return Some("multisampled");
+    }
+    if shape.arrayed {
+        return Some("arrayed");
+    }
+    match shape.dimension {
+        TextureDimension::D2 => None,
+        TextureDimension::D1 => Some("1d"),
+        TextureDimension::D3 => Some("3d"),
+        TextureDimension::Cube => Some("cube"),
+        TextureDimension::Buffer => Some("buffer"),
+    }
+}
+
+/// The Metal texture indices whose entry-point argument declares
+/// `[[raster_order_group(n)]]`, read from AIR's disassembled metadata.
+///
+/// A raster order group orders the fragment invocations that touch one pixel
+/// through that texture, which Vulkan spells as a fragment-shader interlock.
+/// The translator this device pins parses the qualifier on imageblock members
+/// only and drops it from a texture argument without a trace, so a module
+/// translated from such a shader runs its stores *unordered*. This is the
+/// device's own reading of the one fact it needs to refuse that rather than
+/// guess: the argument node in AIR's metadata, `!{i32 <param>, !"air.texture",
+/// !"air.location_index", i32 <index>, ..., !"air.raster_order_group", i32 <g>,
+/// ...}`.
+///
+/// Every texture argument node in the module is read, not only the entry
+/// point's: a false positive refuses a draw with a name, while a missed one
+/// renders it racy with none.
+pub fn raster_ordered_texture_indices(ll: &str) -> Vec<u32> {
+    let mut indices: Vec<u32> = ll
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            if !line.starts_with('!')
+                || !line.contains("!\"air.texture\"")
+                || !line.contains("!\"air.raster_order_group\"")
+            {
+                return None;
+            }
+            let (_, after) = line.split_once("!\"air.location_index\", i32 ")?;
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// First texture descriptor that cannot be exposed through a sampled-image
 /// render binding. Compute has a storage-image request path; render does not.
 pub fn first_non_sampled_texture_descriptor(
@@ -4409,6 +4495,100 @@ mod more_tests {
                 ..
             })) if binding == TEXTURE_BINDING_BASE + 4
         ));
+    }
+
+    fn storage_shape(dimension: metal2vulkan::meta::TextureDimension) -> TextureShape {
+        TextureShape {
+            dimension,
+            arrayed: false,
+            multisampled: false,
+            component: metal2vulkan::meta::TextureComponent::Float,
+            writable: true,
+            array_ref: false,
+            array_length: None,
+            storage_format: Some(metal2vulkan::meta::TextureFormat::Rgba16f),
+        }
+    }
+
+    /// The storage rail sees exactly the textures reflection classifies as
+    /// storage, and binds only the single 2D shape a colour resident can stand
+    /// for; every other shape is named, not bound.
+    #[test]
+    fn storage_textures_are_listed_and_only_a_single_2d_image_is_bindable() {
+        use metal2vulkan::meta::TextureDimension;
+        let mut reflection = empty_reflection(ShaderStage::Fragment);
+        reflection.bindings.push(texture_binding(
+            TEXTURE_BINDING_BASE + 1,
+            storage_shape(TextureDimension::D2),
+        ));
+        let mut sampled = storage_shape(TextureDimension::D2);
+        sampled.writable = false;
+        reflection
+            .bindings
+            .push(texture_binding(TEXTURE_BINDING_BASE, sampled));
+
+        let listed: Vec<_> = reflected_storage_textures(&reflection).collect();
+        assert_eq!(listed.len(), 1, "the sampled texture is not a storage one");
+        let (index, descriptor) = listed[0];
+        assert_eq!(index, 1);
+        assert_eq!(descriptor.binding, TEXTURE_BINDING_BASE + 1);
+        assert_eq!(
+            storage_texture_unsupported_shape(&reflection, descriptor),
+            None
+        );
+
+        for (dimension, kind) in [
+            (TextureDimension::D1, "1d"),
+            (TextureDimension::D3, "3d"),
+            (TextureDimension::Cube, "cube"),
+        ] {
+            reflection.bindings[0].texture_shape = Some(storage_shape(dimension));
+            assert_eq!(
+                storage_texture_unsupported_shape(&reflection, descriptor),
+                Some(kind)
+            );
+        }
+        let mut arrayed = storage_shape(TextureDimension::D2);
+        arrayed.arrayed = true;
+        reflection.bindings[0].texture_shape = Some(arrayed);
+        assert_eq!(
+            storage_texture_unsupported_shape(&reflection, descriptor),
+            Some("arrayed")
+        );
+        let mut multisampled = storage_shape(TextureDimension::D2);
+        multisampled.multisampled = true;
+        reflection.bindings[0].texture_shape = Some(multisampled);
+        assert_eq!(
+            storage_texture_unsupported_shape(&reflection, descriptor),
+            Some("multisampled")
+        );
+        assert_eq!(
+            storage_texture_unsupported_shape(
+                &reflection,
+                ReflectedTextureDescriptor {
+                    descriptor_count: 4,
+                    ..descriptor
+                }
+            ),
+            Some("descriptor_array")
+        );
+    }
+
+    /// The raster-order reading finds the qualifier on a texture argument node
+    /// wherever it sits in the node, names the argument's Metal index, and
+    /// ignores the same qualifier on an imageblock member or a buffer.
+    #[test]
+    fn raster_order_groups_are_read_from_texture_argument_metadata() {
+        let ll = r#"
+!10 = !{i32 0, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.raster_order_group", i32 0, !"air.arg_type_name", !"texture2d<half, read_write>", !"air.arg_name", !"dst"}
+!11 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float>", !"air.arg_name", !"src"}
+!12 = !{i32 2, !"air.texture", !"air.raster_order_group", i32 1, !"air.location_index", i32 12, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>"}
+!13 = !{i32 0, i32 2, i32 0, !"half", !"user(other)", !"air.raster_order_group", i32 1}
+!14 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.raster_order_group", i32 0, !"air.address_space", i32 1}
+!15 = !{i32 0, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.raster_order_group", i32 2}
+"#;
+        assert_eq!(raster_ordered_texture_indices(ll), vec![3, 12]);
+        assert!(raster_ordered_texture_indices("define void @f() {\n}\n").is_empty());
     }
 
     /// A reflected static sampler. `binding` is the translator's number, because

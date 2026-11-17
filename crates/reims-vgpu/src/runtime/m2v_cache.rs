@@ -24,6 +24,31 @@ use metal2vulkan::reflect::ShaderReflection;
 use crate::observe::Decline;
 
 type FragmentRelocationCache = HashMap<(bool, bool), Arc<ShaderVariant>>;
+
+/// One storage-format specialization of a fragment variant: the variant key and
+/// the `(binding, format)` list `spirv_bind::specialize_image_formats` applied.
+type StorageSpecializationKey = (
+    (bool, bool),
+    Vec<(u32, crate::runtime::spirv_bind::ImageFormat)>,
+);
+
+/// What this device knows about `[[raster_order_group(n)]]` on a fragment
+/// shader's texture arguments — see
+/// [`crate::runtime::spirv_bind::raster_ordered_texture_indices`] for why the
+/// device reads it itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextureRasterOrder {
+    /// The Metal texture indices that declare a raster order group. Empty for
+    /// every shader the question was not asked of: one with no storage texture
+    /// cannot store through an ordered texture.
+    #[default]
+    None,
+    /// These texture indices declare one.
+    Ordered(Arc<[u32]>),
+    /// The metadata could not be read back, so the answer is unknown and a
+    /// storage draw with this shader is refused rather than run unordered.
+    Unreadable,
+}
 type M2vResult<T> = Result<T, M2vCacheDecline>;
 
 /// A specific failure while caching, translating, or post-processing AIR.
@@ -280,6 +305,14 @@ pub struct CachedShader {
     /// the module and those two flags, so each variant is computed once per
     /// shader lifetime instead of mutating a fresh copy per draw.
     frag_reloc: Mutex<FragmentRelocationCache>,
+    /// Raster-order groups on texture arguments, read for a fragment shader
+    /// that has a storage texture. See [`TextureRasterOrder`].
+    pub raster_order: TextureRasterOrder,
+    /// Fragment variants with storage-image formats specialized to the
+    /// textures a draw bound. A handful per shader at most — one per distinct
+    /// set of storage formats the guest binds it with — and each is the module
+    /// a pipeline is keyed on, so it is kept rather than rebuilt per draw.
+    storage_specialized: Mutex<Vec<(StorageSpecializationKey, Arc<Vec<u32>>)>>,
 }
 
 /// One binding numbering of a translated module, beside the reflected
@@ -399,7 +432,44 @@ impl CachedShader {
             words: Arc::new(words),
             base: OnceLock::new(),
             frag_reloc: Mutex::new(HashMap::new()),
+            raster_order: TextureRasterOrder::None,
+            storage_specialized: Mutex::new(Vec::new()),
         }
+    }
+
+    /// This shader's fragment variant `(separate_sampled, buf_collide)`, with
+    /// each storage image's `OpTypeImage` format specialized as `requested`.
+    ///
+    /// Metal carries a storage texture's texel format on the bound texture,
+    /// not in the function type, so a translated module names a stand-in
+    /// (`R32f` for `texture2d<float, write>`) that must become the bound
+    /// texture's own before a view of that texture may be bound to it — the
+    /// specialization the compute rail performs per dispatch, cached here per
+    /// distinct request.
+    pub fn storage_specialized(
+        &self,
+        separate_sampled: bool,
+        buf_collide: bool,
+        requested: &[(u32, crate::runtime::spirv_bind::ImageFormat)],
+    ) -> Result<Arc<Vec<u32>>, crate::runtime::spirv_bind::ImageFormatSpecializeError> {
+        let key = ((separate_sampled, buf_collide), requested.to_vec());
+        {
+            let cache = self
+                .storage_specialized
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((_, words)) = cache.iter().find(|(held, _)| *held == key) {
+                return Ok(words.clone());
+            }
+        }
+        let mut words = (*self.variant(separate_sampled, buf_collide).words).clone();
+        crate::runtime::spirv_bind::specialize_image_formats(&mut words, requested)?;
+        let words = Arc::new(words);
+        self.storage_specialized
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((key, words.clone()));
+        Ok(words)
     }
 
     /// This module in the binding numbering the two stage-collision flags name,
@@ -870,7 +940,53 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
             },
         )?;
     capture_air(air, stage, &spirv);
-    finish_translated(spirv, reflection, stage)
+    let raster_order = fragment_texture_raster_order(&path, &tmp, stage, &reflection);
+    let mut shader = finish_translated(spirv, reflection, stage)?;
+    shader.raster_order = raster_order;
+    Ok(shader)
+}
+
+/// Read `[[raster_order_group]]` off a fragment shader's texture arguments,
+/// when it has a storage texture that one could order.
+///
+/// A second disassembly of the AIR this call just translated, asked only of
+/// the shaders that store from the fragment stage — rare, and asked once per
+/// shader for the cache's life. The translator's reflection does not carry the
+/// qualifier for a texture, which is the whole reason this exists; see
+/// [`crate::runtime::spirv_bind::raster_ordered_texture_indices`].
+fn fragment_texture_raster_order(
+    path: &std::path::Path,
+    tmp: &std::path::Path,
+    stage: Stage,
+    reflection: &ShaderReflection,
+) -> TextureRasterOrder {
+    if !matches!(stage, Stage::Fragment)
+        || crate::runtime::spirv_bind::reflected_storage_textures(reflection)
+            .next()
+            .is_none()
+    {
+        return TextureRasterOrder::None;
+    }
+    let Some(src) = path.to_str() else {
+        return TextureRasterOrder::Unreadable;
+    };
+    match metal2vulkan::tools::air_to_sanitized_ll(src, tmp) {
+        Ok(ll) => {
+            let ordered = crate::runtime::spirv_bind::raster_ordered_texture_indices(&ll);
+            if ordered.is_empty() {
+                TextureRasterOrder::None
+            } else {
+                TextureRasterOrder::Ordered(ordered.into())
+            }
+        }
+        Err(detail) => {
+            crate::observe::fail(format!(
+                "m2v_raster_order reason=disassembly_failed detail={}",
+                log_token(&detail)
+            ));
+            TextureRasterOrder::Unreadable
+        }
+    }
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
