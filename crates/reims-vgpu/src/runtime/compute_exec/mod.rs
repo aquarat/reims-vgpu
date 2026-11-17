@@ -2232,7 +2232,6 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
         if width == 0 || height == 0 {
             return Err(ComputeStatus::MissingTexture("compute_stage_tex_zero_geom"));
         }
-        // sRGB color-renderable surfaces stage as unorm storage (same bpp).
         let view_format = match crate::runtime::draw::effective_view_sample_format_reasoned(
             format,
             view_pixel_format,
@@ -2256,11 +2255,18 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 return Err(ComputeStatus::Unsupported("compute_view_format"));
             }
         };
-        let stage_fmt = match view_format {
-            pixel_format::MTL_FORMAT_BGRA8_UNORM_SRGB => pixel_format::MTL_FORMAT_BGRA8_UNORM,
-            pixel_format::MTL_FORMAT_RGBA8_UNORM_SRGB => pixel_format::MTL_FORMAT_RGBA8_UNORM,
-            other => other,
-        };
+        // The view's own format, transfer function included.
+        //
+        // This used to fold the two eight-bit sRGB formats onto their UNORM
+        // siblings. The bytes staged were the same, but they were bound linear:
+        // a kernel's writes to an sRGB surface were stored unencoded and its
+        // sampled reads of one saw the stored codes as values, with nothing in
+        // the log to say so. Both rails now carry the sRGB formats as
+        // themselves (`storage_selector`, the sampled admission), a sampled
+        // bind decodes through its sRGB view, and a device that cannot hold one
+        // as a storage image refuses the write by name when the module is
+        // specialized.
+        let stage_fmt = view_format;
         let bpp = match pixel_format::bytes_per_pixel(stage_fmt) {
             Some(v) => v,
             None => {

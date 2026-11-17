@@ -3911,3 +3911,81 @@ fn a_linear_srgb_texture_stages_in_its_own_format_for_both_roles() {
     assert_eq!(sampled.pixel_format, MTL_FORMAT_BGRA8_UNORM_SRGB);
     assert_eq!(sampled.bytes, storage.bytes, "the same bytes either way");
 }
+
+/// An IOSurface view in `BGRA8Unorm_sRGB` stages in that format, for a storage
+/// write and a sampled read alike.
+///
+/// The surface path used to fold the view onto `BGRA8Unorm` before staging. The
+/// bytes were the same, but the image was then bound linear: a kernel's writes
+/// were stored unencoded and its reads saw codes as values. The view's format
+/// now reaches the rail, which encodes and decodes through it.
+#[test]
+fn an_srgb_surface_view_stages_in_its_own_format_for_both_roles() {
+    use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::protocol::pixel_format::{
+        StorageImageSelector, MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB,
+    };
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    let sid = 3u32;
+    let ref_texture_ref = 10u32;
+    let pfn = 0x20u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0x5a);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    assert!(state.map_surface(sid));
+    {
+        let m = state.mappings.get_mut(&sid).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    // The surface itself is plain BGRA; the view the guest made is sRGB.
+    assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
+    let view = RefTextureBuilder::new(sid, 0, 10, 0x42)
+        .unknown(0x02)
+        .geometry(MTL_FORMAT_BGRA8_UNORM_SRGB, 4, 4, 1)
+        .trailer([1, 0, 1, 0, 1, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let view = view.bytes();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, view);
+    let off = list_object_entry_offset(ref_texture_ref, 32).unwrap();
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((view.len() as u32) << 8);
+    st32(&mut list_entry[0..], packed);
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
+
+    let storage =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 33, true)
+            .expect("an sRGB surface view stages as a storage destination");
+    assert_eq!((storage.width, storage.height), (4, 4));
+    assert_eq!(storage.pixel_format, MTL_FORMAT_BGRA8_UNORM_SRGB);
+    assert_eq!(
+        storage.storage_selector,
+        Some(StorageImageSelector::Bgra8UnormSrgb)
+    );
+    assert_eq!(storage.bytes.len(), 4 * 4 * 4);
+    match storage.writeback {
+        TextureWriteback::MapperRefTexture {
+            mapping_id, format, ..
+        } => {
+            assert_eq!(mapping_id, sid);
+            assert_eq!(format, MTL_FORMAT_BGRA8_UNORM_SRGB);
+        }
+        _ => panic!("expected a surface writeback"),
+    }
+
+    let sampled =
+        stage_texture_raw::<NeutralStage, _>(&mut state, &mut host, 1, ref_texture_ref, 32, false)
+            .expect("an sRGB surface view stages as a sampled source");
+    assert_eq!(sampled.pixel_format, MTL_FORMAT_BGRA8_UNORM_SRGB);
+    assert_eq!(sampled.bytes, storage.bytes, "the same bytes either way");
+    assert!(matches!(sampled.writeback, TextureWriteback::None));
+}
