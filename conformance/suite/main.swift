@@ -259,6 +259,11 @@ blitIOSurfaceSourceCase(1920, 1080, frames: 4)
 
 blitBufferBackedCase(512, 512)
 
+// Compute writes, reads and read-write round trips of `BGRA8Unorm_sRGB`, over
+// a buffer, in private memory and over an IOSurface. 16 wide so every column
+// of the ladder appears four times; 4 high so a row of the wrong pitch shows.
+srgbStorageCases(16, 4)
+
 // A device-wide waiter-first scheduling defect can stop all later work, so
 // this bounded probe deliberately closes the battery.
 crossQueueSharedEventVisibilityCase()

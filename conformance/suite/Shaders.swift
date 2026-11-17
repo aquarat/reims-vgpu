@@ -409,4 +409,28 @@ kernel void heap_alias_fill(texture2d<float, access::write> output [[texture(0)]
         output.write(value, gid);
     }
 }
+
+// sRGB storage (cases/SrgbStorage.swift). The ladder kernel writes linear
+// values by column, red, green and blue three different rungs so an R/B swap
+// moves values; the texture stores them encoded. The round trip writes back
+// what it read, so a texel's code does not move.
+kernel void srgb_store_ladder(texture2d<float, access::write> out [[texture(0)]],
+                              constant uint2 &extent [[buffer(3)]],
+                              device uint *ran [[buffer(4)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    ran[0] = 1u;
+    if (gid.x >= extent.x || gid.y >= extent.y) { return; }
+    const float ladder[4] = { 0.0f, 0.002f, 0.5f, 1.0f };
+    uint i = gid.x % 4u;
+    out.write(float4(ladder[i], ladder[(i + 1u) % 4u], ladder[(i + 2u) % 4u], 0.5f), gid);
+}
+
+kernel void srgb_round_trip(texture2d<float, access::read_write> tex [[texture(0)]],
+                            constant uint2 &extent [[buffer(3)]],
+                            device uint *ran [[buffer(4)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    ran[0] = 1u;
+    if (gid.x >= extent.x || gid.y >= extent.y) { return; }
+    tex.write(tex.read(gid), gid);
+}
 """
