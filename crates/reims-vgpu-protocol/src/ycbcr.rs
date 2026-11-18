@@ -699,6 +699,10 @@ pub enum TwoPlaneRefusal {
     },
     /// A zero or unrepresentable extent.
     Extent { width: u32, height: u32 },
+    /// `RGB10A8_2P_XR10_sRGB` (551): its color channels decode through
+    /// Metal's own sRGB tables for the extended range, which are measured only
+    /// to within half a `2^-13` step, not recovered exactly.
+    ExtendedSrgbTable { pixel_format: u16 },
 }
 
 impl reims_vgpu_observe::Decline for TwoPlaneRefusal {
@@ -712,6 +716,7 @@ impl reims_vgpu_observe::Decline for TwoPlaneRefusal {
             Self::PitchShort { .. } => "two_plane_pitch_short",
             Self::PlaneShort { .. } => "two_plane_plane_short",
             Self::Extent { .. } => "two_plane_extent",
+            Self::ExtendedSrgbTable { .. } => "two_plane_extended_srgb_table",
         }
     }
 
@@ -721,7 +726,8 @@ impl reims_vgpu_observe::Decline for TwoPlaneRefusal {
             Self::PackedCodes { pixel_format }
             | Self::TwelveBitCodes { pixel_format }
             | Self::RangeUnknown { pixel_format }
-            | Self::MatrixUnknown { pixel_format } => vec![("pf", pf(pixel_format))],
+            | Self::MatrixUnknown { pixel_format }
+            | Self::ExtendedSrgbTable { pixel_format } => vec![("pf", pf(pixel_format))],
             Self::TransferCurve {
                 pixel_format,
                 curve,

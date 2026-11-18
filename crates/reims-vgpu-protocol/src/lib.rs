@@ -58,6 +58,8 @@
 //! - [`residency`] — what a `useResource`/`useHeap` declaration says, split so
 //!   that the half a per-draw binder owes nothing on cannot hide the half it
 //!   does.
+//! - [`two_plane`] — every two-plane colour format converted on the CPU, the
+//!   Y′CbCr ones and `RGB10A8_2P_XR10`, as one type.
 //! - [`ycbcr`] — the two-plane Y′CbCr formats, what their planes hold, and
 //!   the texels Metal reads out of them.
 //! - [`pixel_format`] — the format ordinals, what each one is made of, and the
@@ -145,6 +147,7 @@ pub mod storage_mode;
 pub mod sync;
 pub mod texture_shape;
 pub mod topology;
+pub mod two_plane;
 pub mod vertex_format;
 pub mod vertex_step;
 pub mod visibility;
