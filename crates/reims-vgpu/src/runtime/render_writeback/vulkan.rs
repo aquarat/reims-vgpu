@@ -512,8 +512,12 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // pass and not the no-op this comment used to claim. Both spellings of that
     // declaration must reach the same answer; `ResidentReadSnapshot::bgra` is
     // where they do, and where they did not.
-    let readback = crate::backend::vulkan::engine::read_target(identity)
-        .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
+    let stored = stored_texel_layout(c0.format);
+    let readback = match stored.filter(|&layout| eight_bit_store_loses(layout)) {
+        Some(layout) => crate::backend::vulkan::engine::read_target_keeping(identity, layout),
+        None => crate::backend::vulkan::engine::read_target(identity),
+    }
+    .map_err(|inner| GvaWritebackDecline::CopiedReadRefused { inner })?;
     // Two ways to land a frame, and which one is decided by what the readback
     // actually holds rather than by what this rail wishes it held.
     //
@@ -525,10 +529,24 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     // guest-RAM import serves it instead of losing every frame of it.
     let extent = match readback.texel.native_layout() {
         Some(layout) => {
-            if crate::protocol::pixel_format::store_texel_order(c0.format) != Some(layout) {
+            if stored != Some(layout) {
                 return Err(GvaWritebackDecline::FormatNeedsConversion { format: c0.format });
             }
             crate::runtime::drain::note_store_route("gva_flush_copied_native");
+            // The native twin of `m2v_store_gva`'s content fields: how many
+            // texels of the landed frame are not all-zero bytes. The RGBA8
+            // route's line cannot describe a frame it never narrowed.
+            let bpt = layout.bytes_per_texel() as usize;
+            let nonzero = readback
+                .pixels
+                .chunks_exact(bpt.max(1))
+                .filter(|texel| texel.iter().any(|&b| b != 0))
+                .count();
+            crate::observe::off(format!(
+                "gva_store_native gva={:#x} {}x{} tex_ref={texture_ref} fmt={:#x} \
+                 layout={layout:?} nonzero_texels={nonzero}",
+                c0.target_gva, c0.width, c0.height, c0.format
+            ));
             land_gva_frame_bytes(
                 state,
                 host,
@@ -559,6 +577,27 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::note_resident_content_copied_out(identity);
     crate::runtime::drain::note_store_route("gva_flush_copied");
     Ok(extent)
+}
+
+/// The texel a guest format's own bytes are, as the device stores them: the
+/// layout of its linear spelling, so an sRGB format answers its UNORM sibling's.
+/// `None` for a format with no texel layout.
+pub(crate) fn stored_texel_layout(
+    format: u16,
+) -> Option<crate::protocol::pixel_format::TexelLayout> {
+    let translated = crate::backend::vulkan::translate::pixel::translate(format).ok()?;
+    crate::backend::vulkan::translate::pixel::texel_layout_of(translated.linear_vk)
+}
+
+/// Whether landing a frame of `layout` through eight-bit colour loses values.
+///
+/// The eight-bit unorm layouts narrow and widen back exactly, so the RGBA8
+/// route serves them. Every other layout — half and full float, sixteen-bit and
+/// ten-bit unorm, the packed floats — is clamped to [0, 1] or loses precision
+/// on that route, and its Store must carry the resident's own texel instead.
+pub(crate) fn eight_bit_store_loses(layout: crate::protocol::pixel_format::TexelLayout) -> bool {
+    use crate::protocol::pixel_format::TexelLayout as L;
+    !matches!(layout, L::Rgba8 | L::Bgra8 | L::R8 | L::Rg8)
 }
 
 /// The copying arm's body: convert `rgba` into the destination's own texel
@@ -1020,6 +1059,61 @@ mod gva_copying_arm_tests {
                 &rgba[at..at + (W * 4) as usize],
                 "row {y} of the frame did not reach the guest"
             );
+        }
+    }
+
+    /// Which Stores must keep the resident's own texel: everything whose texel
+    /// has no exact eight-bit form, decided on the stored (linear) layout so an
+    /// sRGB spelling answers as its UNORM sibling.
+    #[test]
+    fn a_store_keeps_its_texel_exactly_when_eight_bits_would_lose_it() {
+        use crate::protocol::pixel_format::{self as p, TexelLayout as L};
+        for (format, layout, loses) in [
+            (p::MTL_FORMAT_RG16_FLOAT, L::Rg16Float, true),
+            (p::MTL_FORMAT_RGBA16_FLOAT, L::Rgba16Float, true),
+            (p::MTL_FORMAT_R16_FLOAT, L::R16Float, true),
+            (p::MTL_FORMAT_RGBA8_UNORM, L::Rgba8, false),
+            (p::MTL_FORMAT_BGRA8_UNORM_SRGB, L::Bgra8, false),
+            (p::MTL_FORMAT_R8_UNORM, L::R8, false),
+        ] {
+            assert_eq!(stored_texel_layout(format), Some(layout), "{format:#x}");
+            assert_eq!(eight_bit_store_loses(layout), loses, "{layout:?}");
+        }
+    }
+
+    /// A native half-float frame lands verbatim: values outside [0, 1] reach the
+    /// guest's pages as the resident held them, where the RGBA8 route clamps
+    /// them. Two RG16Float texels per row, (64.0, -1.0) and (0.5, 2.0).
+    #[test]
+    fn a_native_half_float_frame_lands_its_values_outside_the_unit_interval() {
+        let (mut host, mut state) = fixture();
+        let c0 = ColorRtRequest {
+            width: 2,
+            format: crate::protocol::pixel_format::MTL_FORMAT_RG16_FLOAT,
+            ..request()
+        };
+        let row: Vec<u8> = [0x5400u16, 0xBC00, 0x3800, 0x4000]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let native: Vec<u8> = row.iter().chain(row.iter()).copied().collect();
+        land_gva_frame_bytes(
+            &mut state,
+            &mut host,
+            1,
+            &c0,
+            0,
+            crate::runtime::draw::FrameRows::Native(&native),
+            &licence_for(1),
+            &[],
+        )
+        .expect("the licensed page is writable");
+        let gpa = (DATA_BASE_PFN + 1) << PAGE_SHIFT_ARM64E;
+        for y in 0..H as u64 {
+            let mut got = [0u8; 8];
+            crate::runtime::host::HostMemory::read_gpa(&host, gpa + y * u64::from(BPR), &mut got)
+                .expect("the destination page is guest RAM");
+            assert_eq!(&got[..], &row[..], "row {y}");
         }
     }
 

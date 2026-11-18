@@ -3049,7 +3049,7 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
             return None;
         }
     }
-    let mut px = match read_target_inner(identity) {
+    let mut px = match read_target_inner(identity, None) {
         // `into_bgra8` is a no-op for a resident already in scanout order, which
         // is every one this rail sees on a boot measured so far. A native frame
         // has no scanout order at all — there is nothing to present — so it
@@ -5464,7 +5464,76 @@ fn narrow_readback_to_rgba8(
     // sixteen of. A non-zero reading names the population that would be
     // repaired by teaching this rail's consumers the wider texel.
     crate::runtime::drain::note_store_route("target_read_narrowed");
+    note_narrowed_range(layout, &out, pixels);
     Ok((narrowed, ReadbackTexel::Rgba8))
+}
+
+/// What a half-float readback lost when it was narrowed to unorm8: how many of
+/// its values lay outside `[0, 1]`, which the narrowing clamps, and the range
+/// they spanned. Reported once per layout and extent.
+///
+/// The count is the question. A half-float target whose values all lie in
+/// `[0, 1]` loses only precision; one holding coordinates, distances or signed
+/// values loses the values themselves, and every later pass that reads the
+/// stored frame back computes from the clamp.
+fn note_narrowed_range(layout: TexelLayout, out: &[u8], pixels: u64) {
+    let Some(range) = half_float_range(layout, out, pixels) else {
+        return;
+    };
+    let key = (u64::from(layout.bytes_per_texel()) << 56) ^ pixels;
+    if range.outside_unit == 0 || !crate::observe::first_sight("target_read_narrowed_range", key) {
+        return;
+    }
+    crate::observe::fail(format!(
+        "target_read_narrowed_range reason=target_read_clamped layout={layout:?} pixels={pixels} \
+         values={} outside_unit={} non_finite={} min={} max={} (a half-float target narrowed to \
+         unorm8 for a reader that speaks eight-bit colour; values outside [0,1] were clamped)",
+        range.values, range.outside_unit, range.non_finite, range.min, range.max
+    ));
+}
+
+/// The value census [`note_narrowed_range`] reports.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HalfFloatRange {
+    values: u64,
+    outside_unit: u64,
+    non_finite: u64,
+    min: f32,
+    max: f32,
+}
+
+/// [`HalfFloatRange`] over every channel of `pixels` texels of a half-float
+/// `layout`, or `None` for a layout that is not one.
+fn half_float_range(layout: TexelLayout, bytes: &[u8], pixels: u64) -> Option<HalfFloatRange> {
+    let channels = match layout {
+        TexelLayout::R16Float => 1usize,
+        TexelLayout::Rg16Float => 2,
+        TexelLayout::Rgba16Float => 4,
+        _ => return None,
+    };
+    let len = usize::try_from(pixels).ok()?.checked_mul(channels * 2)?;
+    let mut range = HalfFloatRange {
+        values: 0,
+        outside_unit: 0,
+        non_finite: 0,
+        min: f32::INFINITY,
+        max: f32::NEG_INFINITY,
+    };
+    for half in bytes.get(..len)?.chunks_exact(2) {
+        let v = crate::protocol::pixel_format::f16_to_f32(u16::from_le_bytes([half[0], half[1]]));
+        range.values += 1;
+        if !v.is_finite() {
+            range.non_finite += 1;
+            range.outside_unit += 1;
+            continue;
+        }
+        if !(0.0..=1.0).contains(&v) {
+            range.outside_unit += 1;
+        }
+        range.min = range.min.min(v);
+        range.max = range.max.max(v);
+    }
+    Some(range)
 }
 
 /// The `srcAccessMask` a resident color target's readback must drain.
@@ -5484,6 +5553,38 @@ fn feedback_transition_dependency(layout: ash::vk::ImageLayout) -> ash::vk::Depe
         ash::vk::DependencyFlags::FEEDBACK_LOOP_EXT
     } else {
         ash::vk::DependencyFlags::empty()
+    }
+}
+
+#[cfg(test)]
+mod narrowed_range_tests {
+    use super::*;
+
+    /// The census counts what the eight-bit narrowing clamps — values below 0,
+    /// above 1, and non-finite ones — over every channel the layout carries, and
+    /// answers nothing for a layout that is not half-float.
+    #[test]
+    fn a_half_float_readback_reports_what_the_narrowing_clamps() {
+        // Two Rg16Float texels: (0.5, -1.0) and (2.0, NaN).
+        let halves: [u16; 4] = [0x3800, 0xBC00, 0x4000, 0x7E00];
+        let bytes: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let range = half_float_range(TexelLayout::Rg16Float, &bytes, 2).expect("half-float");
+        assert_eq!(range.values, 4);
+        assert_eq!(range.outside_unit, 3);
+        assert_eq!(range.non_finite, 1);
+        assert_eq!((range.min, range.max), (-1.0, 2.0));
+
+        // In range: nothing outside the unit interval.
+        let unit: Vec<u8> = [0x0000u16, 0x3C00, 0x3800, 0x3400]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let range = half_float_range(TexelLayout::Rgba16Float, &unit, 1).expect("half-float");
+        assert_eq!((range.values, range.outside_unit), (4, 0));
+
+        // Not a half-float layout, and a payload shorter than its extent.
+        assert_eq!(half_float_range(TexelLayout::Rgba8, &unit, 2), None);
+        assert_eq!(half_float_range(TexelLayout::Rg16Float, &bytes, 3), None);
     }
 }
 
@@ -5816,7 +5917,10 @@ fn readback_snapshot(
     Ok((snap, layout))
 }
 
-fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
+fn read_target_inner(
+    identity: &TargetIdentity,
+    keep: Option<TexelLayout>,
+) -> Result<TargetReadback, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -5849,6 +5953,16 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
         )?;
         pools.registry_note_access(identity, read_access);
         counters.note_target_read(rb_size, TargetReadDelivery::Host);
+        // A reader whose destination holds this very texel takes the bytes as
+        // they are: narrowing them to eight bits and widening them again on
+        // the way into the guest's pages would clamp every value outside
+        // [0, 1] and keep 256 levels of the rest.
+        if keep == Some(layout) && !layout.is_four_byte_color() {
+            return Ok(TargetReadback {
+                pixels: out,
+                texel: ReadbackTexel::Native(layout),
+            });
+        }
         // A wide resident is quantized here rather than refused; see
         // `narrow_readback_to_rgba8` for why that direction is the safe one.
         let (pixels, texel) =
@@ -5859,7 +5973,22 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
-    read_target_inner(identity)
+    read_target_inner(identity, None)
+}
+
+/// [`read_target`] for a reader whose destination stores `destination`: a
+/// resident of that same layout comes back as its own texel
+/// ([`ReadbackTexel::Native`]) instead of narrowed to eight-bit colour, and any
+/// other resident is read exactly as [`read_target`] reads it.
+///
+/// The GVA Store is that reader. A half-float render target landed in guest
+/// memory through the eight-bit narrowing is clamped to [0, 1], and every later
+/// pass that samples or loads it from there computes from the clamp.
+pub fn read_target_keeping(
+    identity: &TargetIdentity,
+    destination: TexelLayout,
+) -> Result<TargetReadback, DrawError> {
+    read_target_inner(identity, Some(destination))
 }
 
 /// Run bounded maintenance for dead resources and already-free pool entries.

@@ -249,6 +249,44 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 if landed {
                     note_mapper_ref_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
+                } else if let Some(c0) = req.colors.first().filter(|c0| {
+                    crate::runtime::render_writeback::vulkan::stored_texel_layout(c0.format)
+                        .is_some_and(
+                            crate::runtime::render_writeback::vulkan::eight_bit_store_loses,
+                        )
+                }) {
+                    // The copying rail for a target whose texel has no exact
+                    // eight-bit form: the Store lands the resident's own bytes
+                    // through the GVA writeback owner, which reads it native.
+                    // The block below would narrow it to RGBA8 and widen it back,
+                    // clamping every half-float value outside [0, 1] — and the
+                    // passes that read the frame back from guest memory (iOS
+                    // icon rendering's RG16Float ping-pong among them) then
+                    // compute from the clamp.
+                    note_mapper_ref_texture_store_route("gva_store_sync_native");
+                    let c0 = c0.clone();
+                    match crate::runtime::render_writeback::vulkan::store_gva_frame(
+                        state,
+                        host,
+                        req.task_id,
+                        &identity,
+                        &c0,
+                        c0.texture_ref,
+                        sync_store_pages.as_ref(),
+                        &[],
+                    ) {
+                        // Landed: nothing is owed, so this encode returns
+                        // through the same door the armed Store does.
+                        Ok(_) => gva_store_armed = true,
+                        Err(decline) => {
+                            crate::observe::Emit::decline("gva_store_native_declined", &decline)
+                                .field("gva", format!("{:#x}", c0.target_gva))
+                                .field("geom", format!("{}x{}", c0.width, c0.height))
+                                .field("fmt", format!("{:#x}", c0.format))
+                                .fail_once(c0.target_gva);
+                            draw_rgba = read_resident_chain(req, &identity);
+                        }
+                    }
                 } else {
                     // The copying rail: read the resident the draw just
                     // rendered into and let the synchronous Store block below
@@ -633,7 +671,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // by. Only the loss gets a failure line, and it carries the
                 // census fields so nothing has to be correlated across two.
                 crate::observe::off(format!(
-                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={}",
+                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={} fmt={:#x}",
                     c0.target_gva,
                     c0.width,
                     c0.height,
@@ -644,7 +682,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     rgb_nz,
                     max_rgb,
                     mean_rgb,
-                    c0.row_stride
+                    c0.row_stride,
+                    c0.format
                 ));
                 if !gva_ok {
                     crate::observe::fail(format!(
