@@ -439,11 +439,10 @@ fn resolve_heap_target<M: HostMemory + HostOps>(
 /// sampled rail binds that resident (`draw::two_plane`). Nothing is read from
 /// or written to the guest's planes.
 ///
-/// What the resident does not reproduce is announced once
-/// (`two_plane_target_host_only`): Metal stores each colour channel clamped to
-/// `[-0.752941, 1.252941]` on a grid of `1 / 510` and alpha on `1 / 255`;
-/// the half-float resident keeps the shader's value to half precision,
-/// unclamped.
+/// What the resident does not reproduce is [`host_only_resident_format`]'s to
+/// announce. A memoryless or heap-placed attachment of the same format (the
+/// login window's pass pairs this one with a memoryless 550 attachment) takes
+/// the same resident format there.
 fn resolve_two_plane_target<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -476,22 +475,14 @@ fn resolve_two_plane_target<M: HostMemory + HostOps>(
         height: dual.planes[0].height,
     })?;
     let sample_count = dual.planes[0].sample_count.ok_or(C::TwoPlaneSampleCount)?;
-    if crate::observe::first_sight("two_plane_target_host_only", u64::from(fmt)) {
-        crate::observe::off(format!(
-            "two_plane_target_host_only pf={fmt} resident={TWO_PLANE_TARGET_FORMAT:#x} \
-             (RGB10A8_2P_XR10 attachments render into a host-only RGBA16Float resident: \
-             the extended range is kept, Metal's [-0.752941, 1.252941] clamp and 1/510 \
-             colour and 1/255 alpha grids are not applied, and the guest's planes are \
-             not written)"
-        ));
-    }
+    let format = host_only_resident_format(fmt, "two_plane").ok_or(C::TwoPlaneFormat { fmt })?;
     Ok(ResolvedRenderTarget {
         mapping_id: 0,
         target_gva: 0,
         width,
         height,
         row_stride: 0,
-        format: TWO_PLANE_TARGET_FORMAT,
+        format,
         sample_count,
         host_only: Some(HostTarget::TwoPlane),
     })
@@ -500,6 +491,43 @@ fn resolve_two_plane_target<M: HostMemory + HostOps>(
 /// The format a host-only two-plane colour attachment's resident is created
 /// in, and the one its samples bind: `RGBA16Float`.
 pub(crate) const TWO_PLANE_TARGET_FORMAT: u16 = pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+
+/// The format a host-only colour attachment declared as `fmt` is resident in,
+/// or `None` for one this device does not render into.
+///
+/// A host-only attachment (memoryless or two-plane) has no guest bytes this
+/// device writes, so its resident's format is the device's choice as long as
+/// it holds what the guest's format holds. (A heap-placed attachment is
+/// host-only too, but its sampled rail binds its resident in the declared
+/// format, so it keeps [`pixel_format::render_target_bpp`]'s answer.) Every format
+/// [`pixel_format::render_target_bpp`] admits is its own; `RGB10A8_2P_XR10`,
+/// whose two-plane texels have no single Vulkan format, is resident in
+/// [`TWO_PLANE_TARGET_FORMAT`], which holds its extended range. What that
+/// resident does not reproduce is announced once per kind of attachment
+/// (`two_plane_target_host_only`): Metal stores each colour channel clamped to
+/// `[-0.752941, 1.252941]` on a grid of `1 / 510` and alpha on `1 / 255`, and
+/// the half-float resident keeps the shader's value to half precision,
+/// unclamped.
+fn host_only_resident_format(fmt: u16, kind: &'static str) -> Option<u16> {
+    use crate::protocol::two_plane::MTL_FORMAT_RGB10A8_2P_XR10;
+    if pixel_format::render_target_bpp(fmt).is_some() {
+        return Some(fmt);
+    }
+    if fmt != MTL_FORMAT_RGB10A8_2P_XR10 {
+        return None;
+    }
+    let key =
+        crate::protocol::fnv::fold_bytes(crate::protocol::fnv::FNV_OFFSET_BASIS, kind.as_bytes());
+    if crate::observe::first_sight("two_plane_target_host_only", key) {
+        crate::observe::off(format!(
+            "two_plane_target_host_only kind={kind} pf={fmt} resident={TWO_PLANE_TARGET_FORMAT:#x} \
+             (RGB10A8_2P_XR10 attachments render into a host-only RGBA16Float resident: \
+             the extended range is kept, Metal's [-0.752941, 1.252941] clamp and 1/510 \
+             colour and 1/255 alpha grids are not applied, and no guest bytes are written)"
+        ));
+    }
+    Some(TWO_PLANE_TARGET_FORMAT)
+}
 
 /// The texture descriptor a heap placement record embeds, or `None` when the
 /// entry is not a heap placement at all. The inner `Err` is a heap placement
@@ -566,11 +594,10 @@ fn resolve_memoryless_target<M: HostMemory + HostOps>(
             height: d.height,
         });
     }
-    let fmt =
+    let declared =
         effective_view_sample_format(d.pixel_format, view_fmt_override).unwrap_or(d.pixel_format);
-    if pixel_format::render_target_bpp(fmt).is_none() {
-        return Err(C::MemorylessFormat { fmt });
-    }
+    let fmt = host_only_resident_format(declared, "memoryless")
+        .ok_or(C::MemorylessFormat { fmt: declared })?;
     Ok(ResolvedRenderTarget {
         mapping_id: 0,
         target_gva: 0,
@@ -1962,7 +1989,7 @@ mod tests {
         assert!(cap
             .lines()
             .iter()
-            .any(|l| l.contains("two_plane_target_host_only pf=550")));
+            .any(|l| l.contains("two_plane_target_host_only kind=two_plane pf=550")));
 
         for (body, allocation, fmt) in [
             (dual_plane_fixture_body(540, (8, 4)), 0x1000, 540u16),
@@ -1980,5 +2007,24 @@ mod tests {
                 "{lines:?}"
             );
         }
+    }
+
+    /// A memoryless attachment of `RGB10A8_2P_XR10` (the login window's pass
+    /// pairs one with the two-plane target) is resident in `RGBA16Float` too.
+    #[test]
+    fn an_xr10_memoryless_attachment_takes_the_half_float_resident() {
+        assert_eq!(
+            host_only_resident_format(
+                crate::protocol::two_plane::MTL_FORMAT_RGB10A8_2P_XR10,
+                "memoryless"
+            ),
+            Some(TWO_PLANE_TARGET_FORMAT)
+        );
+        assert_eq!(
+            host_only_resident_format(pixel_format::MTL_FORMAT_BGRA8_UNORM, "memoryless"),
+            Some(pixel_format::MTL_FORMAT_BGRA8_UNORM),
+            "a renderable format is its own"
+        );
+        assert_eq!(host_only_resident_format(540, "memoryless"), None);
     }
 }
