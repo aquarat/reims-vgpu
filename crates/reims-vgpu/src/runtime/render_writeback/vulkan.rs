@@ -861,7 +861,14 @@ pub(crate) fn licence_gva_plane<M: HostMemory + HostOps>(
     // caller that goes on to fail its submit has over-recorded rather than
     // under-recorded — the direction that costs a re-read instead of a wrong
     // frame.
-    state.note_host_wrote_pages(gpas.to_vec());
+    state.note_host_wrote_pages(
+        crate::runtime::host_writes::HostWriteOrigin::GuestPlane {
+            site: "gva_plane_gpu_licence",
+            gva: c0.target_gva,
+            texture_ref: c0.texture_ref,
+        },
+        gpas.to_vec(),
+    );
     Ok(GvaPlaneLicence {
         target,
         gpas: gpas.to_vec(),

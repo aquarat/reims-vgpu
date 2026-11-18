@@ -646,7 +646,7 @@ pub(crate) fn licence_mapper_ref_texture_surface<M: HostMemory + HostOps>(
     // than from zero, because unlike the contig view this rail knows its own
     // rows and has no pointer whose coverage it is restating.
     mapper::note_mapping_write_footprint(state, mapping_id, base_off, span_end - base_off);
-    state.note_host_wrote_mapping(mapping_id);
+    state.note_host_wrote_mapping("mapper_ref_texture_gpu_licence", mapping_id);
     note_readback_phase(
         ReadbackPhase::Resolve,
         resolve_started.elapsed().as_micros() as u64,
@@ -741,7 +741,10 @@ pub fn synchronize_guest_backed_resident(
     };
 
     mapper::note_physical_page_write_footprint(&footprint, base_off, span_end - base_off);
-    state.host_writes.note_footprint(&footprint);
+    state.host_writes.note_footprint(
+        crate::runtime::host_writes::HostWriteOrigin::Site("guest_backed_resident_sync"),
+        &footprint,
+    );
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
     crate::runtime::surface_cache::forget(state, mapping_id);

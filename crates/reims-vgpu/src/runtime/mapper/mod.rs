@@ -2445,12 +2445,12 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
     off: u64,
     mut copy: RunCopy<'_>,
     only: Option<&[(u64, u64)]>,
-    site: &str,
+    site: &'static str,
 ) -> bool {
     if copy.is_write() {
         // Puts bytes into guest pages the hypervisor's dirty bitmap cannot
         // witness. The read direction shares this walk and writes nothing.
-        state.note_host_wrote_mapping(mapping_id);
+        state.note_host_wrote_mapping(site, mapping_id);
     }
     let page_size = state.page_size();
     let len = copy.len();

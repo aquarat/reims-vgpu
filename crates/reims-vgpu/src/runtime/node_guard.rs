@@ -254,7 +254,10 @@ mod tests {
         let mut writes = HostWrites::default();
         assert_eq!(w.observe(&writes, 9 * P, 100), NodeVerdict::FirstSight);
 
-        writes.note_pages(vec![9 * P]);
+        writes.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
         let v = w.observe(&writes, 9 * P, 350);
         assert_eq!(v, NodeVerdict::Wrote { gap_us: 250 });
         assert!(v.is_finding());
@@ -272,7 +275,10 @@ mod tests {
         let mut w = NodeWatch::default();
         let mut writes = HostWrites::default();
         w.observe(&writes, 9 * P, 0);
-        writes.note_pages(vec![8 * P, 10 * P]);
+        writes.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![8 * P, 10 * P],
+        );
         assert_eq!(w.observe(&writes, 9 * P, 1), NodeVerdict::Quiet);
     }
 
