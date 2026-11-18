@@ -1,4 +1,4 @@
-//! Two-plane Y′CbCr textures: where their planes are, and the texels they read.
+//! Two-plane colour textures: where their planes are, and the texels they read.
 //!
 //! A two-plane texture reaches this device two ways, and both end here:
 //!
@@ -13,7 +13,8 @@
 //! Either way the bind needs one image whose texels are what Metal reads, and
 //! neither plane alone is that: plane 0 sampled as a texture is luma read as
 //! colour. So both planes are read and converted on the CPU by
-//! [`crate::protocol::ycbcr::convert`], which owns the arithmetic. The result is
+//! [`TwoPlaneConversion::convert`], which owns the arithmetic — the two-plane
+//! Y′CbCr formats and Apple's `RGB10A8_2P_XR10` (550) alike. The result is
 //! memoized on the planes' bytes: every bind re-reads them, and only a change
 //! re-converts.
 //!
@@ -27,6 +28,15 @@
 //! converted format therefore refuses with `two_plane_matrix_unknown` (or
 //! `two_plane_range_unknown`) rather than guessing BT.601 — see
 //! [`recovered_matrix`] for the one place that answer changes.
+//!
+//! `RGB10A8_2P_XR10` holds a colour word and an alpha **byte** per texel. A
+//! type-12 descriptor that states its alpha plane in 4-byte elements (as the
+//! macOS 26.4 guest's do) does not say which byte of each element, or which
+//! bytes of each row, hold alpha, so it refuses
+//! (`two_plane_alpha_layout_unrecovered`) and writes the plane's byte
+//! statistics out once (`two_plane_alpha_census`) for recovering the layout.
+//! Depth/stencil textures (`Depth32Float_Stencil8`, 260) also arrive as type 12
+//! and are no colour format: they refuse as `two_plane_not_color`.
 
 use std::sync::Arc;
 
@@ -34,9 +44,8 @@ use crate::model::{DeviceState, MappingEntry};
 use crate::protocol::iosurface_pages::{
     decode_device_surface, device_desc_plane, sample_window_from_device_plane,
 };
-use crate::protocol::ycbcr::{
-    self, CodeLayout, Matrix, PlaneRows, Range, TexelRead, TwoPlaneRefusal,
-};
+use crate::protocol::two_plane::{two_plane_conversion, TwoPlaneConversion};
+use crate::protocol::ycbcr::{self, Matrix, PlaneRows, Range, TwoPlaneRefusal};
 use crate::runtime::decode::resource::{DualPlaneTextureDescriptor, TextureLevelLayout};
 use crate::runtime::draw::host_alloc_len;
 use crate::runtime::gva_mem;
@@ -48,8 +57,13 @@ pub use crate::runtime::decode::resource::OBJECT_TYPE_DUAL_PLANE_TEXTURE;
 /// Why a two-plane texture was not bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TwoPlaneBindRefusal {
-    /// The format is not one of the two-plane Y′CbCr ordinals.
+    /// The format is not a two-plane colour format this device converts —
+    /// `Depth32Float_Stencil8` (260) among them.
     NotTwoPlane { pixel_format: u16 },
+    /// `RGB10A8_2P_XR10` over guest memory whose alpha plane the descriptor
+    /// states in elements other than the alpha byte: which byte holds a
+    /// texel's alpha is not recovered.
+    AlphaLayout { bytes_per_element: u32, pitch: u64 },
     /// The format, its terms or its planes' bytes, as the protocol layer
     /// refused them.
     Layout(TwoPlaneRefusal),
@@ -82,8 +96,8 @@ pub(crate) enum TwoPlaneBindRefusal {
         gva: u64,
         len: u64,
     },
-    /// A surface whose plane records are not a luma plane and a chroma plane
-    /// of this format's geometry.
+    /// A surface whose plane records are not the two planes of this format's
+    /// geometry.
     SurfacePlanes {
         plane_count: u32,
         plane: &'static str,
@@ -103,7 +117,8 @@ pub(crate) enum TwoPlaneBindRefusal {
 impl crate::observe::Decline for TwoPlaneBindRefusal {
     fn slug(&self) -> &'static str {
         match self {
-            Self::NotTwoPlane { .. } => "two_plane_not_ycbcr",
+            Self::NotTwoPlane { .. } => "two_plane_not_color",
+            Self::AlphaLayout { .. } => "two_plane_alpha_layout_unrecovered",
             Self::Layout(inner) => inner.slug(),
             Self::Undecoded => "two_plane_descriptor_undecoded",
             Self::Mipmapped { .. } => "two_plane_mipmapped",
@@ -121,6 +136,13 @@ impl crate::observe::Decline for TwoPlaneBindRefusal {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::NotTwoPlane { pixel_format } => vec![("pf", pixel_format.to_string())],
+            Self::AlphaLayout {
+                bytes_per_element,
+                pitch,
+            } => vec![
+                ("bpe", bytes_per_element.to_string()),
+                ("pitch", pitch.to_string()),
+            ],
             Self::Layout(inner) => inner.fields(),
             Self::Undecoded => Vec::new(),
             Self::Mipmapped { levels } => vec![("levels", levels.to_string())],
@@ -218,25 +240,21 @@ pub(crate) struct GuestPlane {
 /// Where a two-plane texture's planes are, and what its texels read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TwoPlanes<P> {
-    pub layout: CodeLayout,
-    pub read: TexelRead,
+    pub conversion: TwoPlaneConversion,
     pub width: u32,
     pub height: u32,
-    pub luma: P,
-    pub chroma: P,
+    pub planes: [P; 2],
 }
 
-/// The format a two-plane object names, as a layout the converter takes, and
-/// how its texels read.
-fn layout_and_read(
+/// The conversion a two-plane object's format names.
+fn conversion_of(
     pixel_format: u16,
     range: Option<Range>,
-) -> Result<(CodeLayout, TexelRead), TwoPlaneBindRefusal> {
-    let format = ycbcr::two_plane_format(pixel_format)
-        .ok_or(TwoPlaneBindRefusal::NotTwoPlane { pixel_format })?;
-    let layout = format.convertible()?;
-    let read = layout.texel_read(range, recovered_matrix())?;
-    Ok((layout, read))
+) -> Result<TwoPlaneConversion, TwoPlaneBindRefusal> {
+    match two_plane_conversion(pixel_format, range, recovered_matrix()) {
+        None => Err(TwoPlaneBindRefusal::NotTwoPlane { pixel_format }),
+        Some(conversion) => Ok(conversion?),
+    }
 }
 
 /// A stated bytes-per-element corroborates the plane's role when it is
@@ -245,80 +263,224 @@ fn bytes_per_element_agrees(stated: u32, want: u32) -> bool {
     stated == 0 || stated == want
 }
 
+const PLANE_NAMES: [&str; 2] = ["plane0", "plane1"];
+
+/// Place one plane of a type-12 texture at the geometry it is checked against.
+fn place_guest_plane(
+    dual: &DualPlaneTextureDescriptor,
+    index: usize,
+    want: (u32, u32),
+    bpe: u32,
+    page_shift: u32,
+) -> Result<GuestPlane, TwoPlaneBindRefusal> {
+    let plane = PLANE_NAMES[index];
+    let tex = &dual.planes[index];
+    let l: TextureLevelLayout = tex.level(0).copied().unwrap_or_default();
+    let stated_bpe = u32::from(tex.bytes_per_element);
+    if (l.width, l.height) != want || !bytes_per_element_agrees(stated_bpe, bpe) {
+        return Err(TwoPlaneBindRefusal::PlaneGeometry {
+            plane,
+            width: l.width,
+            height: l.height,
+            bytes_per_element: stated_bpe,
+            want_width: want.0,
+            want_height: want.1,
+            want_bytes_per_element: bpe,
+        });
+    }
+    let tight = u64::from(want.0) * u64::from(bpe);
+    let window = |span| TwoPlaneBindRefusal::PlaneWindow {
+        plane,
+        offset: l.offset,
+        span,
+        allocation: tex.allocation_size,
+    };
+    if l.row_stride < tight {
+        return Err(window(0));
+    }
+    let span = l.read_span(tight as u32).ok_or_else(|| window(0))?;
+    let (gva, _) = tex.level_gva(0, page_shift).ok_or_else(|| window(span))?;
+    if tex.allocation_size != 0 && l.offset.saturating_add(span) > tex.allocation_size {
+        return Err(window(span));
+    }
+    Ok(GuestPlane {
+        gva,
+        pitch: l.row_stride,
+        span,
+    })
+}
+
 /// Place a type-12 texture's planes in guest memory.
 ///
-/// Plane 0 is the luma plane at the texture's extent; plane 1 is the chroma
-/// plane at the format's chroma extent. Each is checked against what the
-/// format makes of it — extent, and bytes per element where the block states
-/// one — so a descriptor whose planes are not the format's refuses instead of
-/// being read as something else.
+/// Each plane is checked against what the format makes of it — extent, and
+/// bytes per element where the block states one — so a descriptor whose planes
+/// are not the format's refuses instead of being read as something else.
 pub(crate) fn guest_planes(
     dual: &DualPlaneTextureDescriptor,
     page_shift: u32,
 ) -> Result<TwoPlanes<GuestPlane>, TwoPlaneBindRefusal> {
     // A guest-memory texture has no surface, so nothing names its range.
-    let (layout, read) = layout_and_read(dual.pixel_format(), None)?;
+    let conversion = conversion_of(dual.pixel_format(), None)?;
     let levels = dual.planes[0].levels.len();
     if levels != 1 {
         return Err(TwoPlaneBindRefusal::Mipmapped { levels });
     }
-    let place = |plane: &'static str,
-                 index: usize,
-                 want: (u32, u32),
-                 bpe: u32|
-     -> Result<GuestPlane, TwoPlaneBindRefusal> {
-        let tex = &dual.planes[index];
-        let l: TextureLevelLayout = tex.level(0).copied().unwrap_or_default();
-        let stated_bpe = u32::from(tex.bytes_per_element);
-        if (l.width, l.height) != want || !bytes_per_element_agrees(stated_bpe, bpe) {
-            return Err(TwoPlaneBindRefusal::PlaneGeometry {
-                plane,
-                width: l.width,
-                height: l.height,
-                bytes_per_element: stated_bpe,
-                want_width: want.0,
-                want_height: want.1,
-                want_bytes_per_element: bpe,
+    let l0 = dual.planes[0].level(0).copied().unwrap_or_default();
+    let (width, height) = (l0.width, l0.height);
+    let extents = conversion.plane_extents(width, height);
+    let bpe = conversion.plane_bytes_per_texel();
+    // The alpha plane of `RGB10A8_2P_XR10` is a byte a texel. A block stating
+    // wider elements does not say where in each the byte is.
+    if conversion == TwoPlaneConversion::ExtendedRange {
+        let stated = u32::from(dual.planes[1].bytes_per_element);
+        if !bytes_per_element_agrees(stated, bpe[1]) {
+            let pitch = dual.planes[1].level(0).map_or(0, |l| l.row_stride);
+            return Err(TwoPlaneBindRefusal::AlphaLayout {
+                bytes_per_element: stated,
+                pitch,
             });
         }
-        let tight = u64::from(want.0) * u64::from(bpe);
-        let window = |span| TwoPlaneBindRefusal::PlaneWindow {
-            plane,
-            offset: l.offset,
-            span,
-            allocation: tex.allocation_size,
-        };
-        if l.row_stride < tight {
-            return Err(window(0));
-        }
-        let span = l.read_span(tight as u32).ok_or_else(|| window(0))?;
-        let (gva, _) = tex.level_gva(0, page_shift).ok_or_else(|| window(span))?;
-        if tex.allocation_size != 0 && l.offset.saturating_add(span) > tex.allocation_size {
-            return Err(window(span));
-        }
-        Ok(GuestPlane {
-            gva,
-            pitch: l.row_stride,
-            span,
-        })
-    };
-    let luma0 = dual.planes[0].level(0).copied().unwrap_or_default();
-    let (width, height) = (luma0.width, luma0.height);
-    let luma = place("luma", 0, (width, height), layout.luma_bytes_per_texel())?;
-    let chroma = place(
-        "chroma",
-        1,
-        layout.subsampling().chroma_extent(width, height),
-        layout.chroma_bytes_per_texel(),
-    )?;
+    }
+    let plane0 = place_guest_plane(dual, 0, extents[0], bpe[0], page_shift)?;
+    let plane1 = place_guest_plane(dual, 1, extents[1], bpe[1], page_shift)?;
     Ok(TwoPlanes {
-        layout,
-        read,
+        conversion,
         width,
         height,
-        luma,
-        chroma,
+        planes: [plane0, plane1],
     })
+}
+
+/// How many distinct alpha planes [`note_alpha_census`] writes out in one
+/// process.
+const ALPHA_CENSUS_CAP: u32 = 16;
+
+/// Write out what an `RGB10A8_2P_XR10` texture's unrecovered alpha plane holds,
+/// once per extent, so a live guest's bytes can settle where the alpha byte is.
+///
+/// Both planes are read as the descriptor states them. For the alpha plane it
+/// counts the non-zero bytes in each lane of the stated 4-byte elements
+/// (`lanes=`), in the first `w` bytes of each row against the rest of the row
+/// (`row_head=`/`row_tail=`), and in the plane's first `align(w, 16) * h`
+/// bytes — Metal's own alpha rows — against the bytes past them
+/// (`metal_rows=`/`past_metal_rows=`), with the first 32 bytes of rows 0 and
+/// `h / 2`. `color_nonzero=` says whether the colour plane holds anything at
+/// all; an all-zero texture settles nothing.
+fn note_alpha_census<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    dual: &DualPlaneTextureDescriptor,
+    site: crate::runtime::render_writeback::SettleSite,
+) {
+    let l0 = dual.planes[0].level(0).copied().unwrap_or_default();
+    let (w, h) = (l0.width, l0.height);
+    let key = (u64::from(w) << 32) | u64::from(h);
+    if !crate::observe::first_sight("two_plane_alpha_census", key) {
+        return;
+    }
+    if !(0..ALPHA_CENSUS_CAP)
+        .any(|slot| crate::observe::first_sight("two_plane_alpha_census_slot", slot.into()))
+    {
+        return;
+    }
+    let stated = u32::from(dual.planes[1].bytes_per_element).max(1);
+    let read = |state: &mut DeviceState, host: &mut M, index: usize, bpe: u32| {
+        let plane = place_guest_plane(dual, index, (w, h), bpe, state.page_shift).ok()?;
+        let len = host_alloc_len(plane.span)?;
+        crate::runtime::writeback_debt::settle_for_texture(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            plane.gva,
+            plane.span,
+            site,
+        );
+        let mut bytes = vec![0u8; len];
+        gva_mem::read_task_gva_by_id(
+            host,
+            &state.tasks,
+            task_id,
+            plane.gva,
+            &mut bytes,
+            state.page_shift,
+        )
+        .ok()?;
+        Some((plane.pitch as usize, bytes))
+    };
+    let (Some((cpitch, color)), Some((apitch, alpha))) =
+        (read(state, host, 0, 4), read(state, host, 1, stated))
+    else {
+        crate::observe::off(format!(
+            "two_plane_alpha_census task={task_id} ref={texture_ref} {w}x{h} reason=unread"
+        ));
+        return;
+    };
+    let (w, h) = (w as usize, h as usize);
+    let color_nonzero = (0..h)
+        .map(|y| {
+            color[y * cpitch..y * cpitch + 4 * w]
+                .chunks_exact(4)
+                .filter(|t| t.iter().any(|&b| b != 0))
+                .count()
+        })
+        .sum::<usize>();
+    let mut lanes = [0usize; 4];
+    let (mut row_head, mut row_tail) = (0usize, 0usize);
+    let row_len = (stated as usize * w).min(apitch);
+    for y in 0..h {
+        let row = &alpha[y * apitch..(y * apitch + row_len).min(alpha.len())];
+        for (i, &b) in row.iter().enumerate() {
+            if b != 0 {
+                lanes[i % 4] += 1;
+                if i < w {
+                    row_head += 1;
+                } else {
+                    row_tail += 1;
+                }
+            }
+        }
+    }
+    let metal_rows = (w.div_ceil(16) * 16 * h).min(alpha.len());
+    let nonzero = |b: &[u8]| b.iter().filter(|&&v| v != 0).count();
+    let hex = |at: usize| -> String {
+        alpha[at.min(alpha.len())..(at + 32).min(alpha.len())]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    crate::observe::off(format!(
+        "two_plane_alpha_census task={task_id} ref={texture_ref} pf={} {w}x{h} bpe={stated} \
+         pitch={apitch} color_nonzero={color_nonzero} lanes={lanes:?} row_head={row_head} \
+         row_tail={row_tail} metal_rows={} past_metal_rows={} row0={} row_mid={}",
+        dual.pixel_format(),
+        nonzero(&alpha[..metal_rows]),
+        nonzero(&alpha[metal_rows..]),
+        hex(0),
+        hex((h / 2) * apitch),
+    ));
+}
+
+/// A type-12 texture's texels, converted: placement and read in one, with the
+/// census an unrecovered alpha plane writes out.
+pub(crate) fn guest_texels<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    dual: &DualPlaneTextureDescriptor,
+    site: crate::runtime::render_writeback::SettleSite,
+) -> Result<TwoPlaneTexels, TwoPlaneBindRefusal> {
+    let planes = match guest_planes(dual, state.page_shift) {
+        Err(refusal @ TwoPlaneBindRefusal::AlphaLayout { .. }) => {
+            note_alpha_census(state, host, task_id, texture_ref, dual, site);
+            return Err(refusal);
+        }
+        placed => placed?,
+    };
+    load_guest(state, host, task_id, texture_ref, &planes, site)
 }
 
 /// One plane of an IOSurface mapping, as the existing surface readers take it.
@@ -326,14 +488,14 @@ pub(crate) type SurfacePlane = mapping_write::SurfaceWindow;
 
 /// Place a texture of a two-plane `pixel_format` over an IOSurface mapping.
 ///
-/// The texture is over the surface's plane 0, and Metal reads plane 1 as its
-/// chroma; the surface's own plane records say where each is. A surface that
-/// does not list exactly two planes matching the format's luma and chroma
-/// geometry refuses — over plane 1, or over a three-plane surface, Metal reads
-/// planes this device would have to guess at.
+/// The texture is over the surface's plane 0, and Metal reads plane 1 beside
+/// it; the surface's own plane records say where each is. A surface that does
+/// not list exactly two planes matching the format's geometry refuses — over
+/// plane 1, or over a three-plane surface, Metal reads planes this device would
+/// have to guess at.
 ///
-/// The range comes from the surface's OSType, which its device descriptor
-/// carries.
+/// A Y′CbCr format's range comes from the surface's OSType, which its device
+/// descriptor carries.
 pub(crate) fn surface_planes(
     mapping: &MappingEntry,
     pixel_format: u16,
@@ -344,52 +506,38 @@ pub(crate) fn surface_planes(
     let range = surface
         .as_ref()
         .and_then(|s| ycbcr::range_of_surface_fourcc(s.pixel_format));
-    let (layout, read) = layout_and_read(pixel_format, range)?;
+    let conversion = conversion_of(pixel_format, range)?;
     let plane_count = surface.as_ref().map_or(0, |s| u32::from(s.plane_count));
-    let place = |plane: &'static str,
-                 index: u32,
-                 format: u16,
-                 extent: (u32, u32),
-                 bpe: u32|
-     -> Result<SurfacePlane, TwoPlaneBindRefusal> {
-        let refusal = TwoPlaneBindRefusal::SurfacePlanes { plane_count, plane };
+    let formats = conversion.plane_formats();
+    let extents = conversion.plane_extents(width, height);
+    let bpes = conversion.plane_bytes_per_texel();
+    let place = |index: usize| -> Result<SurfacePlane, TwoPlaneBindRefusal> {
+        let refusal = TwoPlaneBindRefusal::SurfacePlanes {
+            plane_count,
+            plane: PLANE_NAMES[index],
+        };
         if plane_count != 2 {
             return Err(refusal);
         }
-        let (record, _) = device_desc_plane(&mapping.device_desc, index).ok_or(refusal)?;
-        if !bytes_per_element_agrees(u32::from(record.bytes_per_element), bpe) {
+        let (record, _) = device_desc_plane(&mapping.device_desc, index as u32).ok_or(refusal)?;
+        if !bytes_per_element_agrees(u32::from(record.bytes_per_element), bpes[index]) {
             return Err(refusal);
         }
+        let (w, h) = extents[index];
         let (base_off, bpr, span_end) =
-            sample_window_from_device_plane(&record, format, extent.0, extent.1).ok_or(refusal)?;
+            sample_window_from_device_plane(&record, formats[index], w, h).ok_or(refusal)?;
         Ok(SurfacePlane {
             base_off,
             bpr,
             span_end,
-            bpp: bpe,
+            bpp: bpes[index],
         })
     };
-    let luma = place(
-        "luma",
-        0,
-        layout.luma_plane_format(),
-        (width, height),
-        layout.luma_bytes_per_texel(),
-    )?;
-    let chroma = place(
-        "chroma",
-        1,
-        layout.chroma_plane_format(),
-        layout.subsampling().chroma_extent(width, height),
-        layout.chroma_bytes_per_texel(),
-    )?;
     Ok(TwoPlanes {
-        layout,
-        read,
+        conversion,
         width,
         height,
-        luma,
-        chroma,
+        planes: [place(0)?, place(1)?],
     })
 }
 
@@ -398,26 +546,21 @@ pub(crate) fn surface_planes(
 pub(crate) struct TwoPlaneTexels {
     pub width: u32,
     pub height: u32,
-    pub layout: CodeLayout,
-    /// Tightly packed in [`CodeLayout::output_layout`].
+    pub conversion: TwoPlaneConversion,
+    /// Tightly packed in [`TwoPlaneConversion::output_layout`].
     pub bytes: Arc<Vec<u8>>,
     /// From [`DeviceState::next_sampled_content_generation`]: changes exactly
     /// when the planes' bytes did.
     pub generation: u64,
+    /// The guest address of plane 0's first texel, for a guest-memory texture.
+    pub plane0_gva: Option<u64>,
 }
 
 /// Where a memoized conversion's planes were read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TwoPlaneSource {
-    Guest {
-        luma_gva: u64,
-        chroma_gva: u64,
-    },
-    Surface {
-        mapping_id: u32,
-        luma_off: u64,
-        chroma_off: u64,
-    },
+    Guest { gvas: [u64; 2] },
+    Surface { mapping_id: u32, offsets: [u64; 2] },
 }
 
 /// The key of [`DeviceState::two_plane_memo`]: everything besides the planes'
@@ -428,36 +571,35 @@ pub struct TwoPlaneMemoKey {
     source: TwoPlaneSource,
     width: u32,
     height: u32,
-    luma_pitch: u64,
-    chroma_pitch: u64,
-    layout: CodeLayout,
-    read: TexelRead,
+    pitches: [u64; 2],
+    conversion: TwoPlaneConversion,
 }
 
 /// See [`DeviceState::two_plane_memo`].
 #[derive(Clone, Debug)]
 pub struct TwoPlaneMemo {
-    /// The planes' bytes as last read, luma then chroma.
+    /// The planes' bytes as last read, plane 0 then plane 1.
     native: Vec<u8>,
     texels: Arc<Vec<u8>>,
     generation: u64,
 }
 
-/// Convert `native` (luma bytes, then chroma bytes) unless the memo already
+/// Convert `native` (plane 0's bytes, then plane 1's) unless the memo already
 /// holds a conversion of exactly these bytes under `key`.
-fn convert_memoized<P>(
+fn convert_memoized(
     state: &mut DeviceState,
     key: TwoPlaneMemoKey,
-    planes: &TwoPlanes<P>,
     native: Vec<u8>,
-    luma_len: usize,
+    plane0_len: usize,
+    plane0_gva: Option<u64>,
 ) -> Result<TwoPlaneTexels, TwoPlaneBindRefusal> {
     let done = |bytes, generation| TwoPlaneTexels {
-        width: planes.width,
-        height: planes.height,
-        layout: planes.layout,
+        width: key.width,
+        height: key.height,
+        conversion: key.conversion,
         bytes,
         generation,
+        plane0_gva,
     };
     match state.two_plane_memo.get_touch(&key) {
         Some(memo) if memo.native == native => {
@@ -467,19 +609,17 @@ fn convert_memoized<P>(
         Some(_) => crate::runtime::drain::note_store_route("two_plane_memo_changed"),
         None => crate::runtime::drain::note_store_route("two_plane_memo_absent"),
     }
-    let (luma, chroma) = native.split_at(luma_len);
-    let texels = ycbcr::convert(
-        planes.layout,
-        planes.read,
-        planes.width,
-        planes.height,
+    let (plane0, plane1) = native.split_at(plane0_len);
+    let texels = key.conversion.convert(
+        key.width,
+        key.height,
         PlaneRows {
-            bytes: luma,
-            pitch: key.luma_pitch as usize,
+            bytes: plane0,
+            pitch: key.pitches[0] as usize,
         },
         PlaneRows {
-            bytes: chroma,
-            pitch: key.chroma_pitch as usize,
+            bytes: plane1,
+            pitch: key.pitches[1] as usize,
         },
     )?;
     let generation = state.next_sampled_content_generation();
@@ -510,8 +650,9 @@ pub(crate) fn load_guest<M: HostMemory + HostOps>(
     site: crate::runtime::render_writeback::SettleSite,
 ) -> Result<TwoPlaneTexels, TwoPlaneBindRefusal> {
     let mut native = Vec::new();
-    let mut luma_len = 0;
-    for (plane, p) in [("luma", planes.luma), ("chroma", planes.chroma)] {
+    let mut plane0_len = 0;
+    for (index, p) in planes.planes.into_iter().enumerate() {
+        let plane = PLANE_NAMES[index];
         let len = host_alloc_len(p.span).ok_or(TwoPlaneBindRefusal::HostLen {
             plane,
             span: p.span,
@@ -540,24 +681,21 @@ pub(crate) fn load_guest<M: HostMemory + HostOps>(
             gva: p.gva,
             len: p.span,
         })?;
-        if plane == "luma" {
-            luma_len = len;
+        if index == 0 {
+            plane0_len = len;
         }
     }
     let key = TwoPlaneMemoKey {
         task_id,
         source: TwoPlaneSource::Guest {
-            luma_gva: planes.luma.gva,
-            chroma_gva: planes.chroma.gva,
+            gvas: planes.planes.map(|p| p.gva),
         },
         width: planes.width,
         height: planes.height,
-        luma_pitch: planes.luma.pitch,
-        chroma_pitch: planes.chroma.pitch,
-        layout: planes.layout,
-        read: planes.read,
+        pitches: planes.planes.map(|p| p.pitch),
+        conversion: planes.conversion,
     };
-    convert_memoized(state, key, planes, native, luma_len)
+    convert_memoized(state, key, native, plane0_len, Some(planes.planes[0].gva))
 }
 
 /// Read a two-plane texture's planes out of an IOSurface mapping and convert
@@ -569,20 +707,13 @@ pub(crate) fn load_surface<M: HostMemory + HostOps>(
     mapping_id: u32,
     planes: &TwoPlanes<SurfacePlane>,
 ) -> Result<TwoPlaneTexels, TwoPlaneBindRefusal> {
-    let (cw, ch) = planes
-        .layout
-        .subsampling()
-        .chroma_extent(planes.width, planes.height);
+    let extents = planes.conversion.plane_extents(planes.width, planes.height);
     let mut native = Vec::new();
-    let mut luma_len = 0;
+    let mut plane0_len = 0;
     let mut pitches = [0u64; 2];
-    for (i, (plane, window, (w, h))) in [
-        ("luma", planes.luma, (planes.width, planes.height)),
-        ("chroma", planes.chroma, (cw, ch)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (index, window) in planes.planes.into_iter().enumerate() {
+        let plane = PLANE_NAMES[index];
+        let (w, h) = extents[index];
         let tight = w * window.bpp;
         let span = u64::from(tight) * u64::from(h);
         let len = host_alloc_len(span).ok_or(TwoPlaneBindRefusal::HostLen { plane, span })?;
@@ -604,26 +735,23 @@ pub(crate) fn load_surface<M: HostMemory + HostOps>(
         ) {
             return Err(TwoPlaneBindRefusal::SurfaceRead { plane, mapping_id });
         }
-        pitches[i] = u64::from(tight);
-        if i == 0 {
-            luma_len = len;
+        pitches[index] = u64::from(tight);
+        if index == 0 {
+            plane0_len = len;
         }
     }
     let key = TwoPlaneMemoKey {
         task_id,
         source: TwoPlaneSource::Surface {
             mapping_id,
-            luma_off: planes.luma.base_off,
-            chroma_off: planes.chroma.base_off,
+            offsets: planes.planes.map(|p| p.base_off),
         },
         width: planes.width,
         height: planes.height,
-        luma_pitch: pitches[0],
-        chroma_pitch: pitches[1],
-        layout: planes.layout,
-        read: planes.read,
+        pitches,
+        conversion: planes.conversion,
     };
-    convert_memoized(state, key, planes, native, luma_len)
+    convert_memoized(state, key, native, plane0_len, None)
 }
 
 #[cfg(test)]

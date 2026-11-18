@@ -1,13 +1,13 @@
-//! The compute stager's bind of a two-plane Y′CbCr texture.
+//! The compute stager's bind of a two-plane colour texture.
 //!
 //! A compute function samples or reads a two-plane texture the way a fragment
 //! function does: as the texels Metal reads, one image. So this stages the
 //! conversion [`crate::runtime::two_plane`] produces, in the single-plane format
-//! that holds it ([`CodeLayout::output_pixel_format`]), and never a plane. A
+//! that holds it ([`TwoPlaneConversion::output_pixel_format`]), and never a plane. A
 //! storage binding refuses: the image is a converted copy, and a write to it
 //! would reach neither plane.
 //!
-//! [`CodeLayout::output_pixel_format`]: crate::protocol::ycbcr::CodeLayout::output_pixel_format
+//! [`TwoPlaneConversion::output_pixel_format`]: crate::protocol::two_plane::TwoPlaneConversion::output_pixel_format
 
 use super::{ComputeStatus, RailStage, StagedTexture, TextureWriteback};
 use crate::model::DeviceState;
@@ -37,7 +37,7 @@ fn staged<R: RailStage>(
 ) -> StagedTexture<R> {
     StagedTexture {
         binding,
-        pixel_format: texels.layout.output_pixel_format(),
+        pixel_format: texels.conversion.output_pixel_format(),
         storage_selector: None,
         width: texels.width,
         height: texels.height,
@@ -60,26 +60,24 @@ pub(super) fn stage_guest<R: RailStage, M: HostMemory + HostOps>(
 ) -> Result<StagedTexture<R>, ComputeStatus> {
     let resource = objects::resolve_resource(state, host, task_id, texture_ref)
         .map_err(|_| refuse(task_id, texture_ref, TwoPlaneBindRefusal::Undecoded))?;
-    let planes = match resource.decoded() {
-        Ok(Descriptor::DualPlaneTexture(dual)) => two_plane::guest_planes(dual, state.page_shift),
-        _ => Err(TwoPlaneBindRefusal::Undecoded),
-    }
-    .map_err(|refusal| refuse(task_id, texture_ref, refusal))?;
+    let Ok(Descriptor::DualPlaneTexture(dual)) = resource.decoded() else {
+        return Err(refuse(task_id, texture_ref, TwoPlaneBindRefusal::Undecoded));
+    };
     if is_storage {
         return Err(refuse(
             task_id,
             texture_ref,
             TwoPlaneBindRefusal::StorageBind {
-                pixel_format: planes.layout.pixel_format(),
+                pixel_format: dual.pixel_format(),
             },
         ));
     }
-    let texels = two_plane::load_guest(
+    let texels = two_plane::guest_texels(
         state,
         host,
         task_id,
         texture_ref,
-        &planes,
+        dual,
         crate::runtime::render_writeback::SettleSite::ComputeStageTexture,
     )
     .map_err(|refusal| refuse(task_id, texture_ref, refusal))?;
