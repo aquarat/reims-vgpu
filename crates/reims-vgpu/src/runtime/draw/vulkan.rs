@@ -983,60 +983,6 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
     }
 }
 
-/// The object-list entry and descriptor bytes behind a sampled `texture_ref`,
-/// reporting when the ref names something that is not a texture.
-///
-/// Four rails resolve a texture ref through the second rung of the object-list
-/// ladder — `mipmap`, `draw::texture_view` and `compute_exec` name
-/// `[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS]` to
-/// [`objects::resolve_descriptor`], and `draw::render_target` writes the pair
-/// out — and the two sampled-path sites in this file did not. They went
-/// `lookup_list_entry` -> `read_descriptor` -> `decode_texture_descriptor`, so
-/// **any** object whose descriptor is at least `TEXTURE_DESC_GEOMETRY_LEN`
-/// bytes decodes as a texture and yields a plausible extent rather than a
-/// refusal. That is the hazard `protocol::iosurface_pages` documents for the
-/// `TEXTURE_DESC_WIDTH` name collision, reached a different way.
-///
-/// # It reports and does not refuse, on purpose
-///
-/// Adding the rung as a *decline* would turn a resolve that currently produces
-/// geometry into `DrawPreparationDecline::TextureResolveMissing`, which loses
-/// the draw — a behaviour change on the pathway this device is verified on,
-/// justified by nothing yet measured. Whether a guest ever binds a non-texture
-/// ref here is exactly what is not known, and the four rails that do check
-/// cannot answer it because they refuse before anything is counted. So the
-/// answer stays what it was and the log now says when it was reached; a driven
-/// boot reading this slug is what decides whether the rung becomes a refusal.
-pub(super) fn sampled_texture_descriptor<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    texture_ref: u32,
-) -> Option<(
-    crate::runtime::decode::resource::ListObjectEntry,
-    std::sync::Arc<[u8]>,
-)> {
-    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
-    let entry = resource.entry;
-    use crate::runtime::decode::resource::{
-        OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE
-        && entry.object_type != OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
-    {
-        let slug = crate::observe::ladder_slug!("draw_sampled_texture", wrong_type);
-        if degrade_log_first(texture_ref, slug) {
-            crate::observe::fail(format!(
-                "sampled_source_degraded reason={slug} task={task_id} ref={texture_ref} \
-                 object_type={} (decoded as a texture descriptor anyway; geometry \
-                 comes from a record of another kind)",
-                entry.object_type
-            ));
-        }
-    }
-    Some((entry, std::sync::Arc::clone(&resource.descriptor)))
-}
-
 /// Resolve a sampled texture ref to `(width, height, mapping_id, source)`.
 ///
 /// Backend-neutral: the returned [`SampledSourceRequest`] is either an engine
@@ -1853,13 +1799,18 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
 
-    // The last-resort sampled rung. The geometry comes from the decoded texture
-    // descriptor and from nowhere else. Neither a payload shorter than the
-    // descriptor's own extent nor a descriptor naming no extent at all is a
-    // geometry this call may invent one for: the caller turns `None` into a
-    // typed `DrawPreparationDecline::TextureResolveMissing`, which names the ref
-    // and the stage. `TextureDescriptor::extent` owns the second check and says
-    // what clamping the two fields up would have bound instead.
+    // The last-resort sampled rung. The geometry is the extent the loader read
+    // the bytes at, and comes from nowhere else: the loader resolves a texture
+    // view to its base texture's level, so only it knows which texture's extent
+    // the bytes have. This rung used to decode the descriptor of `texture_ref`
+    // itself — for a view, a view record decoded as a texture
+    // (`draw_sampled_texture_wrong_type`) — and refused every sampled view of a
+    // linear texture as `TextureResolveMissing`: the iOS Simulator's icon
+    // passes bind an `A8Unorm` view of an `R8Unorm` mask and lost every draw.
+    // A payload shorter than that extent is still refused rather than padded:
+    // the caller turns `None` into a typed
+    // `DrawPreparationDecline::TextureResolveMissing`, which names the ref and
+    // the stage.
     //
     // The layout is carried rather than assumed. This rung answered
     // `TexelLayout::Rgba8` unconditionally and sized its own length check at
@@ -1868,7 +1819,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // the rung a `RGBA16Float` display-profile LUT actually lands on, because
     // the three rungs above are reached only for a resource the draw already
     // knows is a linear texture.
-    let (mut bytes, layout) = load_sampled_rgba_static(
+    let super::texture_view::LinearLoad {
+        mut bytes,
+        format: layout,
+        width: w,
+        height: h,
+        planes,
+    } = load_sampled_rgba_static(
         state,
         host,
         task_id,
@@ -1876,14 +1833,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
-    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let tex = decode_texture_descriptor(&desc).ok()?;
-    let (w, h) = tex.extent()?;
-    let planes = tex.levels.first()?.planes();
-    let need = (w as usize)
-        .saturating_mul(h as usize)
-        .saturating_mul(planes as usize)
-        .saturating_mul(layout.layout().bytes_per_texel() as usize);
+    let need = sampled_payload_len(w, h, planes, layout)?;
     if bytes.len() < need {
         return None;
     }
@@ -1899,6 +1849,24 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
         ),
     ))
+}
+
+/// The bytes a sampled upload of `planes` depth planes of a `width` x `height`
+/// level holds in `layout`, or `None` for an extent with no texels or one past
+/// the address space.
+pub(super) fn sampled_payload_len(
+    width: u32,
+    height: u32,
+    planes: u32,
+    layout: SampledByteFormat,
+) -> Option<usize> {
+    if width == 0 || height == 0 || planes == 0 {
+        return None;
+    }
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(planes as usize)?
+        .checked_mul(layout.layout().bytes_per_texel() as usize)
 }
 
 /// Whether a decoded resource object owns the resident reached by the surface

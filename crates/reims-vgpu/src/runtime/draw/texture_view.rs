@@ -695,6 +695,27 @@ impl crate::observe::Decline for LinearLoadRefusal {
     }
 }
 
+/// One level of a linear texture as the CPU loaders read it: the bytes, the
+/// layout they are in, and the extent they were read at.
+///
+/// The extent travels with the bytes because a caller that re-derives it from
+/// the texture *ref* it asked about gets the wrong answer whenever that ref is
+/// a texture view: the bytes are the base texture's level, and the view's own
+/// record is not a texture descriptor at all. The Vulkan bind's last rung did
+/// exactly that, decoded the view record as a texture, and refused every
+/// sampled view of a linear texture — the iOS Simulator's icon masks among
+/// them (an `A8Unorm` view over an `R8Unorm` render target).
+#[derive(Debug)]
+pub(crate) struct LinearLoad {
+    pub bytes: Vec<u8>,
+    pub format: SampledByteFormat,
+    /// The level's own extent, in texels.
+    pub width: u32,
+    pub height: u32,
+    /// Depth planes of the level: 1 for a 2D texture.
+    pub planes: u32,
+}
+
 /// Load a linear (buffer-backed) texture for sampling, keeping the layout its
 /// bytes are in.
 ///
@@ -716,7 +737,7 @@ pub(crate) fn load_linear_texture_host<M: HostMemory + HostOps>(
     format_override: Option<u16>,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Option<(Vec<u8>, SampledByteFormat)> {
+) -> Option<LinearLoad> {
     load_linear_texture_impl(
         state,
         host,
@@ -764,13 +785,20 @@ pub(crate) fn load_cube_faces<M: HostMemory + HostOps>(
     // Face zero is read first so the format and the whole capacity are known
     // before the loop, which is what lets the six faces pack with one
     // allocation and leaves no "no face was read" case to invent a refusal for.
-    let (first_bytes, format) =
-        load_linear_texture_impl(state, host, task_id, texture_ref, 0, 0, None, native, site)?;
+    let LinearLoad {
+        bytes: first_bytes,
+        format,
+        ..
+    } = load_linear_texture_impl(state, host, task_id, texture_ref, 0, 0, None, native, site)?;
     let mut packed: Vec<u8> = Vec::with_capacity(first_bytes.len() * CUBE_FACES as usize);
     packed.extend_from_slice(&first_bytes);
     drop(first_bytes);
     for face in 1..CUBE_FACES {
-        let (bytes, byte_format) = load_linear_texture_impl(
+        let LinearLoad {
+            bytes,
+            format: byte_format,
+            ..
+        } = load_linear_texture_impl(
             state,
             host,
             task_id,
@@ -1005,7 +1033,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     format_override: Option<u16>,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Result<(Vec<u8>, SampledByteFormat), LinearLoadRefusal> {
+) -> Result<LinearLoad, LinearLoadRefusal> {
     use LinearLoadRefusal as R;
     let (_entry, desc_bytes) = objects::resolve_descriptor(
         state,
@@ -1126,7 +1154,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
                 )
                 .is_ok()
             })?;
-        return Ok((rgba, fmt));
+        return Ok(LinearLoad {
+            bytes: rgba,
+            format: fmt,
+            width: w,
+            height: h,
+            planes,
+        });
     }
     // Padded rows. When the source bytes are already in the final upload order
     // (RGBA8 always; BGRA8 and half-float colour under a native upload), read
@@ -1170,7 +1204,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
                 row: u32::try_from(row_index).unwrap_or(u32::MAX),
             })?;
         }
-        return Ok((rgba, SampledByteFormat::from_source(fmt, sample_fmt)));
+        return Ok(LinearLoad {
+            bytes: rgba,
+            format: SampledByteFormat::from_source(fmt, sample_fmt),
+            width: w,
+            height: h,
+            planes,
+        });
     }
     // The ordinal is parsed once, above the row loop, and the parse *is* the
     // format refusal — a format with no CPU arm declines here rather than after
@@ -1200,10 +1240,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    Ok((
-        rgba,
-        SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt),
-    ))
+    Ok(LinearLoad {
+        bytes: rgba,
+        format: SampledByteFormat::from_source(TexelLayout::Rgba8, sample_fmt),
+        width: w,
+        height: h,
+        planes,
+    })
 }
 
 ///
