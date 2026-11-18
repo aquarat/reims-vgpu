@@ -2308,6 +2308,14 @@ pub enum SeedOrder {
     Rgba8,
     /// Guest scanout order — B, G, R, A in memory.
     Bgra8,
+    /// The attachment's own texel, staged as it is.
+    ///
+    /// For an attachment whose texel has no exact eight-bit form: a half-float
+    /// target seeded through RGBA8 is clamped to [0, 1] before the pass that
+    /// loads it runs, so the pass composites onto a different frame from the
+    /// one the guest stored. The engine stages these bytes only under an
+    /// attachment of this same layout, and refuses the seed otherwise.
+    Native(crate::protocol::pixel_format::TexelLayout),
 }
 
 /// Where a sampled image's content comes from.

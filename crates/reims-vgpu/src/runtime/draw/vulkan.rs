@@ -7441,6 +7441,49 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     }
 }
 
+/// The LOAD seed of a GVA colour attachment whose texel has no exact eight-bit
+/// form, in that texel, read from the guest's pages — or `None` to keep the
+/// RGBA8 seed the request already carries.
+///
+/// Only when the host renders the guest's format natively, so the attachment
+/// is that layout and the engine can stage the bytes as they are; and only
+/// when the loader hands the frame back in that layout at the attachment's
+/// extent.
+fn native_gva_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    width: u32,
+    height: u32,
+) -> Option<(Vec<u8>, TexelLayout)> {
+    let layout = crate::runtime::render_writeback::vulkan::stored_texel_layout(c0.format).filter(
+        |&layout| crate::runtime::render_writeback::vulkan::eight_bit_store_loses(layout),
+    )?;
+    let attachment = translate::pixel::color_attachment(c0.format)
+        .ok()
+        .and_then(|(attachment, _)| translate::pixel::texel_layout_of(attachment.vk))?;
+    if attachment != layout || c0.texture_ref == 0 {
+        return None;
+    }
+    let loaded = super::load_sampled_rgba_static(
+        state,
+        host,
+        task_id,
+        c0.texture_ref,
+        native_uploads_asking_host(),
+        crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
+    )?;
+    let fits = loaded.format.layout() == layout
+        && (loaded.width, loaded.height, loaded.planes) == (width, height, 1);
+    if !fits {
+        crate::runtime::drain::note_store_route("load_seed_native_declined");
+        return None;
+    }
+    crate::runtime::drain::note_store_route("load_seed_native");
+    Some((loaded.bytes, layout))
+}
+
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -9064,7 +9107,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // that layer being dropped, and everything outside the
                     // geometry this pass draws goes blank.
                     let mut seed_door = "none";
-                    if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                    // A wide GVA attachment is seeded with its own texel from
+                    // the guest's pages: the RGBA8 seed below would clamp a
+                    // half-float frame to [0, 1] before this pass loads it.
+                    let native_seed = (c0.target_seed_rgba.is_some() && c0.target_gva != 0)
+                        .then(|| native_gva_seed(state, host, req.task_id, c0, w, h))
+                        .flatten();
+                    if let Some((bytes, layout)) = native_seed {
+                        seed_door = "color_seed_native";
+                        target_rgba8 = Some(std::sync::Arc::new(bytes));
+                        seed_order = crate::backend::vulkan::engine::SeedOrder::Native(layout);
+                    } else if let Some(seed) = c0.target_seed_rgba.as_ref() {
                         seed_door = "color_seed";
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             // seed_color_load selected this by RT provenance.

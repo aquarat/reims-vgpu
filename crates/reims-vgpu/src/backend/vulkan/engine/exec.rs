@@ -1481,17 +1481,23 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         // third factor that overflows. A refusal rather than a clamp, because
         // this length is what the next line compares the buffer against and a
         // wrapped one would let a short buffer match.
+        // A native seed is the attachment's own texel; every other seed is
+        // RGBA8 in one of the two orders.
+        let seed_bytes_per_texel = match req.target_seed_order {
+            SeedOrder::Native(layout) => layout.bytes_per_texel(),
+            SeedOrder::Rgba8 | SeedOrder::Bgra8 => crate::protocol::pixel_format::RGBA8_BPP,
+        };
         let Some(expected) = reims_vgpu_protocol::extent::tight_image_bytes(
             req.width,
             req.height,
-            crate::protocol::pixel_format::RGBA8_BPP as usize,
+            seed_bytes_per_texel as usize,
         ) else {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::UnrepresentableImageBytes {
                     width: req.width,
                     height: req.height,
                     layers: 1,
-                    bytes_per_texel: crate::protocol::pixel_format::RGBA8_BPP,
+                    bytes_per_texel: seed_bytes_per_texel,
                 },
             ));
         };
@@ -3624,7 +3630,32 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some((rgba8, layout))
     });
-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+    // A native seed is staged only under an attachment of its own layout: the
+    // copy converts nothing, so any other attachment would read the bytes as a
+    // texel they are not.
+    if let SeedOrder::Native(seed_layout) = req.target_seed_order {
+        if seed_bytes.is_some() && seed_wide.map(|(_, layout)| layout) != Some(seed_layout) {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::SeedFormatUnwritable {
+                    format: color0_format,
+                },
+            ));
+        }
+    }
+    let seed_slot = if let Some((native, _)) =
+        seed_wide.filter(|_| matches!(req.target_seed_order, SeedOrder::Native(_)))
+    {
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(ctx, native.len() as u64, counters)?
+        };
+        {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, native.len() as u64);
+            pools.write_staging(ctx, &slot, native)?;
+        }
+        counters.note_seed_upload(native.len() as u64);
+        Some(slot)
+    } else if let Some((rgba8, layout)) = seed_wide {
         // The seed's own order first, because `expand_rgba8_to_texel` reads
         // semantic RGBA8 — the same normalization the four-byte arm folds into
         // its copy, done here as a step because a widening pass cannot also
@@ -8642,6 +8673,24 @@ mod tests {
             validation_slug(&req),
             "vk_draw_validate_target_seed_length",
             "a seed one byte short must still be caught"
+        );
+    }
+
+    /// A native seed is measured in its own texel, not RGBA8's: an RGBA16Float
+    /// seed of a 4x4 target is 128 bytes, and one sized as RGBA8 is refused.
+    #[test]
+    fn a_native_seed_is_measured_in_its_own_texel() {
+        use crate::protocol::pixel_format::TexelLayout;
+        let mut req = guest_run_req(4, 4, 4 * 4 * 4, 0);
+        req.target_seed_order = SeedOrder::Native(TexelLayout::Rgba16Float);
+        req.target_rgba8 = Some(std::sync::Arc::new(vec![0u8; 4 * 4 * 8]));
+        assert!(validate_v1(&req).is_ok(), "eight bytes a texel");
+
+        req.target_rgba8 = Some(std::sync::Arc::new(vec![0u8; 4 * 4 * 4]));
+        assert_eq!(
+            validation_slug(&req),
+            "vk_draw_validate_target_seed_length",
+            "an RGBA16Float seed sized as RGBA8 is half a frame"
         );
     }
 
