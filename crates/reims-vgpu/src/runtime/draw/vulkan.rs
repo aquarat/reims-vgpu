@@ -1256,11 +1256,19 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     let mut surface: Option<u32> = None;
     let resolved_resource =
         resource.or_else(|| objects::resolve_resource(state, host, task_id, texture_ref).ok());
-    // A two-plane Y'CbCr texture binds its two planes converted, never a plane.
+    // A two-plane texture binds the resident a pass rendered into it, or its two
+    // planes converted; never a plane.
     if let Some(resource) = resolved_resource.as_ref().filter(|resource| {
         resource.entry.object_type == crate::runtime::two_plane::OBJECT_TYPE_DUAL_PLANE_TEXTURE
     }) {
-        return super::two_plane::sampled_source(state, host, task_id, texture_ref, resource);
+        return super::two_plane::sampled_source(
+            state,
+            host,
+            task_id,
+            texture_ref,
+            resource,
+            may_bind_resident,
+        );
     }
     if let Some(resource) = resolved_resource.as_ref() {
         let entry = resource.entry;
@@ -6617,7 +6625,8 @@ fn note_mapper_ref_texture_store_route(route: &'static str) {
 /// neither of the namespaces the other attachments use can name it. It lives in
 /// the texture-ref namespace, named by the ref, with the owning task and its
 /// kind folded into the generation so two tasks' refs never share a resident:
-/// bit 63 tags a heap texture, bit 62 a memoryless one, bits 32.. the task. The
+/// bit 63 tags a heap texture, bit 62 a memoryless one, both bits a two-plane
+/// texture, bits 32.. the task. The
 /// depth chain's texture identities carry generation 0, so they cannot collide.
 ///
 /// A memoryless resident holds nothing the guest can observe, so reusing it
@@ -6639,6 +6648,10 @@ pub(crate) fn host_target_identity(
     let tag = match kind {
         crate::runtime::draw::HostTarget::Heap => 1u64 << HEAP_TAG_BIT,
         crate::runtime::draw::HostTarget::Memoryless => 1u64 << MEMORYLESS_TAG_BIT,
+        // Both tag bits: the one combination the two kinds above leave free.
+        crate::runtime::draw::HostTarget::TwoPlane => {
+            (1u64 << HEAP_TAG_BIT) | (1u64 << MEMORYLESS_TAG_BIT)
+        }
     };
     crate::backend::vulkan::engine::TargetIdentity::Texture {
         ref_: texture_ref,

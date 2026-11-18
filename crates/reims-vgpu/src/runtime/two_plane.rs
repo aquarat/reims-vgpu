@@ -63,7 +63,11 @@ pub(crate) enum TwoPlaneBindRefusal {
     /// `RGB10A8_2P_XR10` over guest memory whose alpha plane the descriptor
     /// states in elements other than the alpha byte: which byte holds a
     /// texel's alpha is not recovered.
-    AlphaLayout { bytes_per_element: u32, pitch: u64 },
+    AlphaLayout {
+        pixel_format: u16,
+        bytes_per_element: u32,
+        pitch: u64,
+    },
     /// The format, its terms or its planes' bytes, as the protocol layer
     /// refused them.
     Layout(TwoPlaneRefusal),
@@ -137,9 +141,11 @@ impl crate::observe::Decline for TwoPlaneBindRefusal {
         match self {
             Self::NotTwoPlane { pixel_format } => vec![("pf", pixel_format.to_string())],
             Self::AlphaLayout {
+                pixel_format,
                 bytes_per_element,
                 pitch,
             } => vec![
+                ("pf", pixel_format.to_string()),
                 ("bpe", bytes_per_element.to_string()),
                 ("pitch", pitch.to_string()),
             ],
@@ -336,6 +342,7 @@ pub(crate) fn guest_planes(
         if !bytes_per_element_agrees(stated, bpe[1]) {
             let pitch = dual.planes[1].level(0).map_or(0, |l| l.row_stride);
             return Err(TwoPlaneBindRefusal::AlphaLayout {
+                pixel_format: conversion.pixel_format(),
                 bytes_per_element: stated,
                 pitch,
             });

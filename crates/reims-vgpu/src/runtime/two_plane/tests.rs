@@ -472,6 +472,7 @@ fn the_census_xr10_texture_refuses_its_unrecovered_alpha_plane_and_writes_a_cens
     assert_eq!(
         guest_texels(&mut state, &mut host, task_id, texture_ref, dual, site).unwrap_err(),
         TwoPlaneBindRefusal::AlphaLayout {
+            pixel_format: 550,
             bytes_per_element: 4,
             pitch: 1280
         }

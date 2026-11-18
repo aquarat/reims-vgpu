@@ -1,8 +1,12 @@
 //! The sampled draw rail's bind of a two-plane colour texture in guest memory.
 //!
-//! [`crate::runtime::two_plane`] places the planes and converts them; this hands
-//! the converted texels to the engine as CPU bytes, with the content identity
-//! that lets an unchanged pair skip the engine's own hash.
+//! A texture a render pass drew into (`RGB10A8_2P_XR10`, a host-only colour
+//! attachment, `render_target::resolve_two_plane_target`) has its content in
+//! the engine's resident, not in the guest's planes: a sample binds that
+//! resident. Otherwise [`crate::runtime::two_plane`] places the planes and
+//! converts them, and this hands the converted texels to the engine as CPU
+//! bytes, with the content identity that lets an unchanged pair skip the
+//! engine's own hash.
 
 use super::vulkan::{LinearSampleIdentity, SampledSourceRequest};
 use crate::model::{DeviceState, TaskResource};
@@ -10,6 +14,40 @@ use crate::protocol::pixel_format::SampledByteFormat;
 use crate::runtime::decode::resource::Descriptor;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::two_plane::{self, TwoPlaneBindRefusal};
+
+/// The resident a render pass left for this two-plane texture, when one did.
+///
+/// Keyed exactly as the attachment was (`HostTarget::TwoPlane`, the ref and
+/// the extent), and bound in the format the resident was created in.
+fn rendered_resident(
+    task_id: u32,
+    texture_ref: u32,
+    dual: &crate::runtime::decode::resource::DualPlaneTextureDescriptor,
+    may_bind_resident: bool,
+) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    let (width, height) = dual.planes[0].extent()?;
+    let identity = super::vulkan::host_target_identity(
+        super::HostTarget::TwoPlane,
+        task_id,
+        texture_ref,
+        width,
+        height,
+    );
+    if !(may_bind_resident && crate::backend::vulkan::engine::resident_content_ready(&identity)) {
+        return None;
+    }
+    let (attachment, _) = crate::backend::vulkan::translate::pixel::color_attachment(
+        super::render_target::TWO_PLANE_TARGET_FORMAT,
+    )
+    .ok()?;
+    crate::runtime::drain::note_store_route("sampled_two_plane_resident");
+    Some((
+        width,
+        height,
+        0,
+        SampledSourceRequest::Target(identity, attachment.vk),
+    ))
+}
 
 /// The sampled source of a type-12 `resource`, or `None` after naming why on
 /// the failure channel (once per task, reference and reason).
@@ -19,7 +57,13 @@ pub(super) fn sampled_source<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
     resource: &TaskResource,
+    may_bind_resident: bool,
 ) -> Option<(u32, u32, u32, SampledSourceRequest)> {
+    if let Ok(Descriptor::DualPlaneTexture(dual)) = resource.decoded() {
+        if let Some(bound) = rendered_resident(task_id, texture_ref, dual, may_bind_resident) {
+            return Some(bound);
+        }
+    }
     let loaded = match resource.decoded() {
         Ok(Descriptor::DualPlaneTexture(dual)) => two_plane::guest_texels(
             state,

@@ -427,6 +427,80 @@ fn resolve_heap_target<M: HostMemory + HostOps>(
     })())
 }
 
+/// Resolve a two-plane (type-12) texture as a host-only colour attachment.
+///
+/// Only `RGB10A8_2P_XR10` (550) is a colour attachment of two planes. Its
+/// texels are a `BGR10_XR` colour word and an alpha byte, and where a guest
+/// texture keeps the alpha byte is not recovered (its descriptors state the
+/// alpha plane in 4-byte elements; see `runtime::two_plane`), so this device
+/// cannot write the guest's planes. The attachment is executed as host-only
+/// storage keyed by its ref, as a heap texture's is, in `RGBA16Float`
+/// ([`TWO_PLANE_TARGET_FORMAT`]), which holds the format's extended range; the
+/// sampled rail binds that resident (`draw::two_plane`). Nothing is read from
+/// or written to the guest's planes.
+///
+/// What the resident does not reproduce is announced once
+/// (`two_plane_target_host_only`): Metal stores each colour channel clamped to
+/// `[-0.752941, 1.252941]` on a grid of `1 / 510` and alpha on `1 / 255`;
+/// the half-float resident keeps the shader's value to half precision,
+/// unclamped.
+fn resolve_two_plane_target<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    entry: &crate::runtime::decode::resource::ListObjectEntry,
+    level: u32,
+    view_fmt_override: Option<u16>,
+) -> Result<ResolvedRenderTarget, RenderTargetCause> {
+    use crate::protocol::two_plane::MTL_FORMAT_RGB10A8_2P_XR10;
+    use RenderTargetCause as C;
+    let bytes = objects::read_descriptor(state, host, task_id, entry).ok_or(C::TwoPlaneDecode {
+        decode: "two_plane_desc_read",
+    })?;
+    let dual = crate::runtime::decode::resource::decode_dual_plane_texture_descriptor(&bytes)
+        .map_err(|status| C::TwoPlaneDecode {
+            decode: crate::observe::Decline::slug(&status),
+        })?;
+    let fmt = dual.pixel_format();
+    if fmt != MTL_FORMAT_RGB10A8_2P_XR10 || view_fmt_override.is_some_and(|v| v != fmt) {
+        return Err(C::TwoPlaneFormat {
+            fmt: view_fmt_override.unwrap_or(fmt),
+        });
+    }
+    let levels = dual.planes[0].levels.len() as u32;
+    if level != 0 || levels != 1 {
+        return Err(C::TwoPlaneShape { level, levels });
+    }
+    let (width, height) = dual.planes[0].extent().ok_or(C::ZeroExtent {
+        width: dual.planes[0].width,
+        height: dual.planes[0].height,
+    })?;
+    let sample_count = dual.planes[0].sample_count.ok_or(C::TwoPlaneSampleCount)?;
+    if crate::observe::first_sight("two_plane_target_host_only", u64::from(fmt)) {
+        crate::observe::off(format!(
+            "two_plane_target_host_only pf={fmt} resident={TWO_PLANE_TARGET_FORMAT:#x} \
+             (RGB10A8_2P_XR10 attachments render into a host-only RGBA16Float resident: \
+             the extended range is kept, Metal's [-0.752941, 1.252941] clamp and 1/510 \
+             colour and 1/255 alpha grids are not applied, and the guest's planes are \
+             not written)"
+        ));
+    }
+    Ok(ResolvedRenderTarget {
+        mapping_id: 0,
+        target_gva: 0,
+        width,
+        height,
+        row_stride: 0,
+        format: TWO_PLANE_TARGET_FORMAT,
+        sample_count,
+        host_only: Some(HostTarget::TwoPlane),
+    })
+}
+
+/// The format a host-only two-plane colour attachment's resident is created
+/// in, and the one its samples bind: `RGBA16Float`.
+pub(crate) const TWO_PLANE_TARGET_FORMAT: u16 = pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+
 /// The texture descriptor a heap placement record embeds, or `None` when the
 /// entry is not a heap placement at all. The inner `Err` is a heap placement
 /// whose record did not decode.
@@ -684,6 +758,16 @@ pub(super) enum RenderTargetCause {
     },
     /// A heap-placed texture in a format this device will not render into.
     HeapFormat { fmt: u16 },
+    /// A two-plane (type-12) entry whose descriptor did not decode.
+    TwoPlaneDecode { decode: &'static str },
+    /// A two-plane texture of a shape this rail does not attach: a mip view or
+    /// a mipmapped texture.
+    TwoPlaneShape { level: u32, levels: u32 },
+    /// A two-plane texture in a format this device does not render into, or a
+    /// view of it in another format: everything but `RGB10A8_2P_XR10`.
+    TwoPlaneFormat { fmt: u16 },
+    /// A two-plane texture whose trailer did not establish a sample count.
+    TwoPlaneSampleCount,
 }
 
 impl RenderTargetCause {
@@ -745,6 +829,10 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::HeapDecode { .. } => crate::observe::ladder_slug!("rt_heap", desc_decode),
             C::HeapShape { .. } => "rt_heap_shape",
             C::HeapFormat { .. } => "rt_heap_format",
+            C::TwoPlaneDecode { .. } => crate::observe::ladder_slug!("rt_two_plane", desc_decode),
+            C::TwoPlaneShape { .. } => "rt_two_plane_shape",
+            C::TwoPlaneFormat { .. } => "rt_two_plane_format",
+            C::TwoPlaneSampleCount => "rt_two_plane_sample_count",
         }
     }
 
@@ -819,7 +907,8 @@ impl crate::observe::Decline for RenderTargetRefusal {
             C::WrongType { object_type } => v.push(("object_type", object_type.to_string())),
             C::LinearDescDecode { decode }
             | C::MemorylessDescDecode { decode }
-            | C::HeapDecode { decode } => v.push(("decode", decode.to_string())),
+            | C::HeapDecode { decode }
+            | C::TwoPlaneDecode { decode } => v.push(("decode", decode.to_string())),
             C::LinearDescIncomplete {
                 format,
                 width,
@@ -830,9 +919,10 @@ impl crate::observe::Decline for RenderTargetRefusal {
                 v.push(("dims", format!("{width}x{height}")));
                 v.push(("bpr", row_stride.to_string()));
             }
-            C::LinearFormat { fmt } | C::MemorylessFormat { fmt } | C::HeapFormat { fmt } => {
-                v.push(("fmt", format!("{fmt:#x}")))
-            }
+            C::LinearFormat { fmt }
+            | C::MemorylessFormat { fmt }
+            | C::HeapFormat { fmt }
+            | C::TwoPlaneFormat { fmt } => v.push(("fmt", format!("{fmt:#x}"))),
             C::LinearLevelStride { row_stride } => v.push(("bpr", row_stride.to_string())),
             C::LinearLevelSpan { row_stride, height } => {
                 v.push(("bpr", row_stride.to_string()));
@@ -888,7 +978,12 @@ impl crate::observe::Decline for RenderTargetRefusal {
             | C::RefTextureSurfaceZero
             | C::NoListEntry
             | C::LinearDescRead
-            | C::MemorylessDescRead => {}
+            | C::MemorylessDescRead
+            | C::TwoPlaneSampleCount => {}
+            C::TwoPlaneShape { level, levels } => {
+                v.push(("level", level.to_string()));
+                v.push(("levels", levels.to_string()));
+            }
         }
         v
     }
@@ -1180,6 +1275,10 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     let entry = live.ok_or(C::NoListEntry.at(resolved_ref))?;
     if entry.object_type == OBJECT_TYPE_MEMORYLESS_TEXTURE {
         return resolve_memoryless_target(state, host, task_id, &entry, level, view_fmt_override)
+            .map_err(|cause| cause.at(resolved_ref));
+    }
+    if entry.object_type == crate::runtime::two_plane::OBJECT_TYPE_DUAL_PLANE_TEXTURE {
+        return resolve_two_plane_target(state, host, task_id, &entry, level, view_fmt_override)
             .map_err(|cause| cause.at(resolved_ref));
     }
     if entry.object_type != OBJECT_TYPE_TEXTURE
@@ -1836,5 +1935,50 @@ mod tests {
             line.contains(" bpr=256 tight=512"),
             "the refusal must carry the stride it compared against: {line}"
         );
+    }
+
+    /// The login window's `RGB10A8_2P_XR10` texture, as the guest described
+    /// it, is a colour attachment: host-only, in `RGBA16Float`, at its extent.
+    /// No other two-plane format is one, and `Depth32Float_Stencil8` (which
+    /// arrives as type 12 too) is not a colour attachment.
+    #[test]
+    fn an_xr10_two_plane_texture_attaches_host_only_and_nothing_else_two_plane_does() {
+        use crate::runtime::two_plane::tests::{
+            dual_plane_fixture_body, guest_type12_texture, CENSUS_D32S8, CENSUS_XR10_352,
+        };
+        let g = &CENSUS_XR10_352;
+        let (mut state, host, task, texture_ref) =
+            guest_type12_texture(&g.body(), g.allocation, &[]);
+        let cap = crate::observe::FailCapture::start();
+        let rt = lookup_render_target(&mut state, &host, task, attach(texture_ref))
+            .expect("an XR10 two-plane texture is a colour attachment");
+        assert_eq!(
+            (rt.mapping_id, rt.target_gva, rt.width, rt.height),
+            (0, 0, 352, 128)
+        );
+        assert_eq!(rt.format, TWO_PLANE_TARGET_FORMAT);
+        assert_eq!(rt.sample_count, 1, "the trailer's decoded sample count");
+        assert_eq!(rt.host_only, Some(HostTarget::TwoPlane));
+        assert!(cap
+            .lines()
+            .iter()
+            .any(|l| l.contains("two_plane_target_host_only pf=550")));
+
+        for (body, allocation, fmt) in [
+            (dual_plane_fixture_body(540, (8, 4)), 0x1000, 540u16),
+            (CENSUS_D32S8.body(), 0x1000, 260),
+        ] {
+            let (mut state, host, task, texture_ref) = guest_type12_texture(&body, allocation, &[]);
+            let cap = crate::observe::FailCapture::start();
+            assert!(lookup_render_target(&mut state, &host, task, attach(texture_ref)).is_none());
+            let lines = cap.lines();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("reason=rt_two_plane_format")
+                        && l.contains(&format!("fmt={fmt:#x}"))),
+                "{lines:?}"
+            );
+        }
     }
 }

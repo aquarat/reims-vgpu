@@ -538,6 +538,11 @@ pub enum HostTarget {
     /// storage, as the compute rail already does: its contents persist across
     /// passes and are what a later sample of the same ref reads.
     Heap,
+    /// A two-plane colour texture (object tag 12, `RGB10A8_2P_XR10`) whose
+    /// guest planes this device does not write. Executed as host-only storage
+    /// in `RGBA16Float`, persisting across passes like a heap texture; a later
+    /// sample of the same ref binds the resident.
+    TwoPlane,
 }
 
 /// One `setVisibilityResultMode:offset:`, as the encoder state it is.
@@ -2612,6 +2617,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route(match kind {
                 HostTarget::Memoryless => "mrt_slot_memoryless",
                 HostTarget::Heap => "mrt_slot_heap",
+                HostTarget::TwoPlane => "mrt_slot_two_plane",
             });
             colors.push(ColorRtRequest {
                 slot,
