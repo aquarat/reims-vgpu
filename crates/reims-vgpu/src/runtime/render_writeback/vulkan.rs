@@ -542,9 +542,21 @@ pub(crate) fn store_gva_frame<M: HostMemory + HostOps>(
                 .chunks_exact(bpt.max(1))
                 .filter(|texel| texel.iter().any(|&b| b != 0))
                 .count();
+            let range = crate::backend::vulkan::engine::half_float_range(
+                layout,
+                &readback.pixels,
+                u64::from(c0.width) * u64::from(c0.height),
+            )
+            .map(|r| {
+                format!(
+                    " non_finite={} outside_unit={} min={} max={}",
+                    r.non_finite, r.outside_unit, r.min, r.max
+                )
+            })
+            .unwrap_or_default();
             crate::observe::off(format!(
-                "gva_store_native gva={:#x} {}x{} tex_ref={texture_ref} fmt={:#x} \
-                 layout={layout:?} nonzero_texels={nonzero}",
+                "gva_store_native gva={:#x} {}x{} task={task_id} tex_ref={texture_ref} fmt={:#x} \
+                 layout={layout:?} nonzero_texels={nonzero}{range}",
                 c0.target_gva, c0.width, c0.height, c0.format
             ));
             land_gva_frame_bytes(

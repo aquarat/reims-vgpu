@@ -198,6 +198,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         record_plane_draw(req);
         req.chain_resident_established = false;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
+        if engine.is_ok() {
+            note_draw_shape(req);
+        }
         // Set from the result itself rather than inside the arms, because the
         // arms are where this went wrong: the refusal slug was assigned only in
         // `Err`, every `Ok` arm left it `None`, and the tail spelled `None`
@@ -7441,6 +7444,104 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     }
 }
 
+/// Publish each stored secondary MRT attachment over guest memory, as the
+/// primary's GVA Store does: armed as its resident's authoritative frame where
+/// the deferred rail can be armed, landed in the guest's pages now otherwise.
+///
+/// A secondary attachment is rendered into a registry resident keyed by its
+/// own guest pages and was never written back or armed. Its pages kept what
+/// they held before, so a later pass that sampled the texture — which asks
+/// whether the resident is authoritative, and otherwise reads the pages — read
+/// that instead of what the pass rendered. The iOS icon passes render an
+/// `RG16Float` field into slot 1 and sample it in the next pass, which read
+/// zeros (`lin_rung_guest_blank` on the slot's ref). Armed, the resident serves
+/// the sample and a guest read of the pages pays the debt; landed, the pages
+/// hold the frame. Both go through the writeback owner the primary uses, which
+/// keeps a half-float texel as it is.
+fn store_secondary_gva_targets<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+    secondaries: &[crate::backend::vulkan::engine::SecondaryColorTarget],
+    deferral_allowed: bool,
+) {
+    for (c, secondary) in req.colors.iter().skip(1).zip(secondaries) {
+        let stores =
+            reims_vgpu_protocol::pass_action::store_action_publishes_single_sample(c.store_action);
+        if c.target_gva == 0 || c.texture_ref == 0 || !stores {
+            continue;
+        }
+        let Some(window) = crate::backend::vulkan::gva_window(&secondary.identity) else {
+            continue;
+        };
+        let armed = deferral_allowed
+            && crate::runtime::writeback_debt::arm_gva(
+                crate::backend::vulkan::VulkanBackend,
+                state,
+                host,
+                req.task_id,
+                c,
+                window,
+            );
+        if armed {
+            crate::runtime::drain::note_store_route("mrt_secondary_gva_armed");
+            continue;
+        }
+        let pages = sync_store_allowed_pages(state, host, req.task_id, Some(c), true);
+        match crate::runtime::render_writeback::vulkan::store_gva_frame(
+            state,
+            host,
+            req.task_id,
+            &secondary.identity,
+            c,
+            c.texture_ref,
+            pages.as_ref(),
+            &[],
+        ) {
+            Ok(_) => crate::runtime::drain::note_store_route("mrt_secondary_gva_landed"),
+            Err(decline) => {
+                crate::observe::Emit::decline("mrt_secondary_store_lost", &decline)
+                    .field("slot", c.slot)
+                    .field("gva", format!("{:#x}", c.target_gva))
+                    .field("geom", format!("{}x{}", c.width, c.height))
+                    .field("fmt", format!("{:#x}", c.format))
+                    .fail_once(c.target_gva);
+            }
+        }
+    }
+}
+
+/// What a draw that executed bound, once per pipeline, task and colour target.
+///
+/// The refusal lines carry this shape and the successes carried nothing, so a
+/// chain of passes that runs without a refusal and still ends in an empty
+/// image — the iOS icon passes — could not be followed from one target to the
+/// next. Keyed on the colour target as well as the pipeline because one
+/// pipeline renders many targets and the question is which one fed which.
+fn note_draw_shape(req: &DrawEncodeRequest) {
+    let color_ref = req.colors.first().map(|c| c.texture_ref).unwrap_or(0);
+    let key = crate::backend::hash::hash_u64(
+        u64::from(req.pipeline_ref) << 32 | u64::from(req.task_id),
+        u64::from(color_ref),
+    );
+    if !crate::observe::first_sight("draw_shape", key) {
+        return;
+    }
+    crate::observe::off(format!(
+        "draw_shape pipe={} task={} geom={} vtx={} colors=[{}] ftex=[{}] vtex=[{}]",
+        req.pipeline_ref,
+        req.task_id,
+        req.colors
+            .first()
+            .map(|c| format!("{}x{}", c.width, c.height))
+            .unwrap_or_else(|| "0x0".to_string()),
+        req.vertex_count,
+        color_target_diag(&req.colors),
+        texture_bind_diag(&req.fragment_textures),
+        texture_bind_diag(&req.vertex_textures),
+    ));
+}
+
 /// The LOAD seed of a GVA colour attachment whose texel has no exact eight-bit
 /// form, in that texel, read from the guest's pages — or `None` to keep the
 /// RGBA8 seed the request already carries.
@@ -7481,6 +7582,19 @@ fn native_gva_seed<M: HostMemory + HostOps>(
         return None;
     }
     crate::runtime::drain::note_store_route("load_seed_native");
+    if let Some(range) = crate::backend::vulkan::engine::half_float_range(
+        layout,
+        &loaded.bytes,
+        u64::from(width) * u64::from(height),
+    )
+    .filter(|range| range.non_finite != 0)
+    {
+        crate::observe::off(format!(
+            "load_seed_native_non_finite task={task_id} ref={} gva={:#x} {width}x{height} \
+             layout={layout:?} non_finite={} min={} max={}",
+            c0.texture_ref, c0.target_gva, range.non_finite, range.min, range.max
+        ));
+    }
     Some((loaded.bytes, layout))
 }
 
@@ -10199,6 +10313,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        store_secondary_gva_targets(
+            state,
+            host,
+            req,
+            &resources.secondary_targets,
+            gpu_only_content_allowed,
+        );
         store_fragment_storage_textures(
             state,
             host,

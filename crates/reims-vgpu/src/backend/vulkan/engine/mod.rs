@@ -5494,17 +5494,21 @@ fn note_narrowed_range(layout: TexelLayout, out: &[u8], pixels: u64) {
 
 /// The value census [`note_narrowed_range`] reports.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct HalfFloatRange {
-    values: u64,
-    outside_unit: u64,
-    non_finite: u64,
-    min: f32,
-    max: f32,
+pub(crate) struct HalfFloatRange {
+    pub(crate) values: u64,
+    pub(crate) outside_unit: u64,
+    pub(crate) non_finite: u64,
+    pub(crate) min: f32,
+    pub(crate) max: f32,
 }
 
 /// [`HalfFloatRange`] over every channel of `pixels` texels of a half-float
 /// `layout`, or `None` for a layout that is not one.
-fn half_float_range(layout: TexelLayout, bytes: &[u8], pixels: u64) -> Option<HalfFloatRange> {
+pub(crate) fn half_float_range(
+    layout: TexelLayout,
+    bytes: &[u8],
+    pixels: u64,
+) -> Option<HalfFloatRange> {
     let channels = match layout {
         TexelLayout::R16Float => 1usize,
         TexelLayout::Rg16Float => 2,
