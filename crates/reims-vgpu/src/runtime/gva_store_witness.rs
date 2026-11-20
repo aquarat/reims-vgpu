@@ -504,10 +504,16 @@ mod tests {
         assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
 
         // Somewhere else: still quiet, because the ask is page-exact.
-        state.note_host_wrote_pages(vec![9 * PAGE]);
+        state.note_host_wrote_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * PAGE],
+        );
         assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
 
-        state.note_host_wrote_pages(vec![4 * PAGE]);
+        state.note_host_wrote_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![4 * PAGE],
+        );
         assert_eq!(
             reach(&state, &host, key(0xabc)),
             GvaWriteReach::Host(HostWriteVerdict::Overlap)
@@ -545,7 +551,10 @@ mod tests {
 
         armed(&mut state, &mut host, key(0xabc), &pages);
         for i in 0..256u64 {
-            state.note_host_wrote_pages(vec![(100 + i) * PAGE]);
+            state.note_host_wrote_pages(
+                crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+                vec![(100 + i) * PAGE],
+            );
         }
         assert_eq!(
             reach(&state, &host, key(0xabc)),
@@ -554,9 +563,15 @@ mod tests {
         );
 
         armed(&mut state, &mut host, key(0xabc), &pages);
-        state.note_host_wrote_pages(vec![3 * PAGE]);
+        state.note_host_wrote_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![3 * PAGE],
+        );
         for i in 0..256u64 {
-            state.note_host_wrote_pages(vec![(100 + i) * PAGE]);
+            state.note_host_wrote_pages(
+                crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+                vec![(100 + i) * PAGE],
+            );
         }
         assert_eq!(
             reach(&state, &host, key(0xabc)),
@@ -575,7 +590,10 @@ mod tests {
         let mut host = FakeHost::new();
         let pages = [3 * PAGE];
         // The order `store_gva_frame` uses: record the write, then stamp.
-        state.note_host_wrote_pages(pages.to_vec());
+        state.note_host_wrote_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            pages.to_vec(),
+        );
         armed(&mut state, &mut host, key(0xabc), &pages);
         assert_eq!(reach(&state, &host, key(0xabc)), GvaWriteReach::Quiet);
     }

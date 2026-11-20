@@ -92,13 +92,14 @@ pub fn sweep(state: &mut crate::model::DeviceState) {
         }
         crate::observe::fail(format!(
             "released_pages reason=released_write_after_release gpa={:#x} \
-             released_at={} wrote_at={} armed={} (this device wrote to a guest page after the \
-             guest released it; the guest is entitled to have given that page to something \
+             released_at={} wrote_at={} armed={} {} (this device wrote to a guest page after \
+             the guest released it; the guest is entitled to have given that page to something \
              else, including its own page table)",
             hit.gpa,
             hit.released_at,
             hit.wrote_at,
             writes.armed_pages(),
+            hit.origin,
         ));
     }
 }
@@ -181,13 +182,56 @@ mod tests {
 
     const P: u64 = 4096;
 
+    /// A finding names the writer and the object it wrote, so a boot's findings
+    /// can be sorted by which rail wrote after the release — the question a
+    /// count of pages alone could not answer.
+    #[test]
+    fn a_finding_names_the_writer_that_wrote_after_the_release() {
+        use crate::runtime::host_writes::HostWriteOrigin;
+        let mut w = HostWrites::default();
+        w.release_page(9 * P);
+        w.release_page(11 * P);
+        let span = HostWriteOrigin::TaskSpan {
+            site: "gva_view_walk",
+            task: 12,
+            gva: 0x2c8000,
+        };
+        w.note_pages(span, vec![9 * P]);
+        let surface = HostWriteOrigin::Mapping {
+            site: "mapping_write",
+            mapping: 37,
+        };
+        w.note_page_iter(surface, [11 * P]);
+        let found = w.take_released_writes();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].origin, span);
+        assert_eq!(found[1].origin, surface);
+        assert_eq!(
+            found[0].origin.to_string(),
+            "writer=gva_view_walk task=12 gva=0x2c8000"
+        );
+        assert_eq!(found[1].origin.to_string(), "writer=mapping_write mid=37");
+        assert_eq!(
+            HostWriteOrigin::GuestPlane {
+                site: "gva_plane_gpu_licence",
+                gva: 0x1000,
+                texture_ref: 4
+            }
+            .to_string(),
+            "writer=gva_plane_gpu_licence gva=0x1000 ref=4"
+        );
+    }
+
     /// A released page nobody writes to reports nothing and stays armed — it is
     /// waiting for a write that may still come.
     #[test]
     fn a_released_page_nobody_wrote_to_stays_armed_and_quiet() {
         let mut w = HostWrites::default();
         w.release_page(9 * P);
-        w.note_pages(vec![3 * P, 4 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![3 * P, 4 * P],
+        );
         assert!(w.take_released_writes().is_empty());
         assert_eq!(w.armed_pages(), 1);
     }
@@ -197,10 +241,16 @@ mod tests {
     #[test]
     fn a_write_after_the_release_is_reported_once() {
         let mut w = HostWrites::default();
-        w.note_pages(vec![P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![P],
+        );
         let released_at = w.epoch();
         w.release_page(9 * P);
-        w.note_pages(vec![9 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
 
         let found = w.take_released_writes();
         assert_eq!(found.len(), 1);
@@ -213,7 +263,10 @@ mod tests {
             "a page that reported is not armed again"
         );
 
-        w.note_pages(vec![9 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
         assert!(
             w.take_released_writes().is_empty(),
             "one late write is one finding, not one per write for the rest of the boot"
@@ -225,7 +278,10 @@ mod tests {
     #[test]
     fn a_write_before_the_release_is_not_a_finding() {
         let mut w = HostWrites::default();
-        w.note_pages(vec![9 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
         w.release_page(9 * P);
         assert!(w.take_released_writes().is_empty());
         assert_eq!(w.armed_pages(), 1, "still armed, still waiting");
@@ -240,7 +296,10 @@ mod tests {
         w.release_page(9 * P);
         w.remap_page(9 * P);
         assert_eq!(w.armed_pages(), 0);
-        w.note_pages(vec![9 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
         assert!(w.take_released_writes().is_empty());
     }
 
@@ -257,7 +316,10 @@ mod tests {
         let mut w = HostWrites::default();
         w.release_page(9 * P);
         w.remap_page(9 * P);
-        w.note_pages(vec![9 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
         assert!(
             w.take_released_writes().is_empty(),
             "a write through the other task's live mapping is ordinary work"
@@ -269,12 +331,21 @@ mod tests {
     #[test]
     fn a_second_release_does_not_forgive_a_write_that_already_landed() {
         let mut w = HostWrites::default();
-        w.note_pages(vec![P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![P],
+        );
         let first = w.epoch();
         w.release_page(9 * P);
-        w.note_pages(vec![7 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![7 * P],
+        );
         w.release_page(9 * P);
-        w.note_pages(vec![9 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
         let found = w.take_released_writes();
         assert_eq!(found.len(), 1);
         assert_eq!(
@@ -313,13 +384,19 @@ mod tests {
     fn sixty_thousand_released_pages_are_all_armed_and_all_answer() {
         const N: u64 = 62_666;
         let mut w = HostWrites::default();
-        w.note_pages(vec![0]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![0],
+        );
         for page in 1..=N {
             w.release_page(page * P);
         }
         assert_eq!(w.armed_pages(), N);
         // The last page released is well past any capacity the watch had.
-        w.note_pages(vec![N * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![N * P],
+        );
         let found = w.take_released_writes();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].gpa, N * P);
@@ -336,7 +413,10 @@ mod tests {
         assert_eq!(w.epoch(), 0, "nothing written yet");
         w.release_page(9 * P);
         assert_eq!(w.armed_pages(), 1);
-        w.note_pages(vec![9 * P]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![9 * P],
+        );
         assert_eq!(w.take_released_writes().len(), 1);
     }
 
@@ -350,7 +430,10 @@ mod tests {
             .expect("one contiguous allocation");
         let mut w = HostWrites::default();
         w.release_page(300 * P);
-        w.note_footprint(&footprint);
+        w.note_footprint(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            &footprint,
+        );
         let found = w.take_released_writes();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].gpa, 300 * P);
@@ -361,12 +444,18 @@ mod tests {
     #[test]
     fn a_flood_of_findings_is_counted_rather_than_lost_silently() {
         let mut w = HostWrites::default();
-        w.note_pages(vec![0]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![0],
+        );
         let pages: Vec<u64> = (1..=200u64).map(|page| page * P).collect();
         for &gpa in &pages {
             w.release_page(gpa);
         }
-        w.note_pages(pages);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            pages,
+        );
         let found = w.take_released_writes();
         assert_eq!(found.len() as u64 + w.dropped_released_writes(), 200);
         assert!(
@@ -388,7 +477,10 @@ mod tests {
         let mut w = HostWrites::new(crate::model::PAGE_SHIFT_ARM64E);
         w.release_page(3 * ARM_PAGE);
         // An address inside the same 16 KiB page, not at its base.
-        w.note_pages(vec![3 * ARM_PAGE + 4096]);
+        w.note_pages(
+            crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+            vec![3 * ARM_PAGE + 4096],
+        );
         let found = w.take_released_writes();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].gpa, 3 * ARM_PAGE);

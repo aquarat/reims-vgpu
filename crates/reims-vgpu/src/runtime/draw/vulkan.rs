@@ -198,6 +198,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         record_plane_draw(req);
         req.chain_resident_established = false;
         let engine = try_metal2vulkan_draw(state, host, req, writeback_guest);
+        if engine.is_ok() {
+            note_draw_shape(req);
+        }
         // Set from the result itself rather than inside the arms, because the
         // arms are where this went wrong: the refusal slug was assigned only in
         // `Err`, every `Ok` arm left it `None`, and the tail spelled `None`
@@ -249,6 +252,44 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 if landed {
                     note_mapper_ref_texture_store_route("gva_resident_authoritative");
                     gva_store_armed = true;
+                } else if let Some(c0) = req.colors.first().filter(|c0| {
+                    crate::runtime::render_writeback::vulkan::stored_texel_layout(c0.format)
+                        .is_some_and(
+                            crate::runtime::render_writeback::vulkan::eight_bit_store_loses,
+                        )
+                }) {
+                    // The copying rail for a target whose texel has no exact
+                    // eight-bit form: the Store lands the resident's own bytes
+                    // through the GVA writeback owner, which reads it native.
+                    // The block below would narrow it to RGBA8 and widen it back,
+                    // clamping every half-float value outside [0, 1] — and the
+                    // passes that read the frame back from guest memory (iOS
+                    // icon rendering's RG16Float ping-pong among them) then
+                    // compute from the clamp.
+                    note_mapper_ref_texture_store_route("gva_store_sync_native");
+                    let c0 = c0.clone();
+                    match crate::runtime::render_writeback::vulkan::store_gva_frame(
+                        state,
+                        host,
+                        req.task_id,
+                        &identity,
+                        &c0,
+                        c0.texture_ref,
+                        sync_store_pages.as_ref(),
+                        &[],
+                    ) {
+                        // Landed: nothing is owed, so this encode returns
+                        // through the same door the armed Store does.
+                        Ok(_) => gva_store_armed = true,
+                        Err(decline) => {
+                            crate::observe::Emit::decline("gva_store_native_declined", &decline)
+                                .field("gva", format!("{:#x}", c0.target_gva))
+                                .field("geom", format!("{}x{}", c0.width, c0.height))
+                                .field("fmt", format!("{:#x}", c0.format))
+                                .fail_once(c0.target_gva);
+                            draw_rgba = read_resident_chain(req, &identity);
+                        }
+                    }
                 } else {
                     // The copying rail: read the resident the draw just
                     // rendered into and let the synchronous Store block below
@@ -633,7 +674,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // by. Only the loss gets a failure line, and it carries the
                 // census fields so nothing has to be correlated across two.
                 crate::observe::off(format!(
-                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={}",
+                    "m2v_store_gva gva={:#x} {}x{} pipe={} tex_ref={} load={} ok={} rgb_nz={} max_rgb={} mean_rgb={} bpr={} fmt={:#x}",
                     c0.target_gva,
                     c0.width,
                     c0.height,
@@ -644,7 +685,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     rgb_nz,
                     max_rgb,
                     mean_rgb,
-                    c0.row_stride
+                    c0.row_stride,
+                    c0.format
                 ));
                 if !gva_ok {
                     crate::observe::fail(format!(
@@ -981,60 +1023,6 @@ pub(super) fn fragment_attachment_alias_sample<'a>(
         }
         _ => None,
     }
-}
-
-/// The object-list entry and descriptor bytes behind a sampled `texture_ref`,
-/// reporting when the ref names something that is not a texture.
-///
-/// Four rails resolve a texture ref through the second rung of the object-list
-/// ladder — `mipmap`, `draw::texture_view` and `compute_exec` name
-/// `[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS]` to
-/// [`objects::resolve_descriptor`], and `draw::render_target` writes the pair
-/// out — and the two sampled-path sites in this file did not. They went
-/// `lookup_list_entry` -> `read_descriptor` -> `decode_texture_descriptor`, so
-/// **any** object whose descriptor is at least `TEXTURE_DESC_GEOMETRY_LEN`
-/// bytes decodes as a texture and yields a plausible extent rather than a
-/// refusal. That is the hazard `protocol::iosurface_pages` documents for the
-/// `TEXTURE_DESC_WIDTH` name collision, reached a different way.
-///
-/// # It reports and does not refuse, on purpose
-///
-/// Adding the rung as a *decline* would turn a resolve that currently produces
-/// geometry into `DrawPreparationDecline::TextureResolveMissing`, which loses
-/// the draw — a behaviour change on the pathway this device is verified on,
-/// justified by nothing yet measured. Whether a guest ever binds a non-texture
-/// ref here is exactly what is not known, and the four rails that do check
-/// cannot answer it because they refuse before anything is counted. So the
-/// answer stays what it was and the log now says when it was reached; a driven
-/// boot reading this slug is what decides whether the rung becomes a refusal.
-pub(super) fn sampled_texture_descriptor<M: HostMemory>(
-    state: &DeviceState,
-    host: &M,
-    task_id: u32,
-    texture_ref: u32,
-) -> Option<(
-    crate::runtime::decode::resource::ListObjectEntry,
-    std::sync::Arc<[u8]>,
-)> {
-    let resource = objects::resolve_resource(state, host, task_id, texture_ref).ok()?;
-    let entry = resource.entry;
-    use crate::runtime::decode::resource::{
-        OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE
-        && entry.object_type != OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
-    {
-        let slug = crate::observe::ladder_slug!("draw_sampled_texture", wrong_type);
-        if degrade_log_first(texture_ref, slug) {
-            crate::observe::fail(format!(
-                "sampled_source_degraded reason={slug} task={task_id} ref={texture_ref} \
-                 object_type={} (decoded as a texture descriptor anyway; geometry \
-                 comes from a record of another kind)",
-                entry.object_type
-            ));
-        }
-    }
-    Some((entry, std::sync::Arc::clone(&resource.descriptor)))
 }
 
 /// Resolve a sampled texture ref to `(width, height, mapping_id, source)`.
@@ -1861,13 +1849,18 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
 
-    // The last-resort sampled rung. The geometry comes from the decoded texture
-    // descriptor and from nowhere else. Neither a payload shorter than the
-    // descriptor's own extent nor a descriptor naming no extent at all is a
-    // geometry this call may invent one for: the caller turns `None` into a
-    // typed `DrawPreparationDecline::TextureResolveMissing`, which names the ref
-    // and the stage. `TextureDescriptor::extent` owns the second check and says
-    // what clamping the two fields up would have bound instead.
+    // The last-resort sampled rung. The geometry is the extent the loader read
+    // the bytes at, and comes from nowhere else: the loader resolves a texture
+    // view to its base texture's level, so only it knows which texture's extent
+    // the bytes have. This rung used to decode the descriptor of `texture_ref`
+    // itself — for a view, a view record decoded as a texture
+    // (`draw_sampled_texture_wrong_type`) — and refused every sampled view of a
+    // linear texture as `TextureResolveMissing`: the iOS Simulator's icon
+    // passes bind an `A8Unorm` view of an `R8Unorm` mask and lost every draw.
+    // A payload shorter than that extent is still refused rather than padded:
+    // the caller turns `None` into a typed
+    // `DrawPreparationDecline::TextureResolveMissing`, which names the ref and
+    // the stage.
     //
     // The layout is carried rather than assumed. This rung answered
     // `TexelLayout::Rgba8` unconditionally and sized its own length check at
@@ -1876,7 +1869,13 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
     // the rung a `RGBA16Float` display-profile LUT actually lands on, because
     // the three rungs above are reached only for a resource the draw already
     // knows is a linear texture.
-    let (mut bytes, layout) = load_sampled_rgba_static(
+    let super::texture_view::LinearLoad {
+        mut bytes,
+        format: layout,
+        width: w,
+        height: h,
+        planes,
+    } = load_sampled_rgba_static(
         state,
         host,
         task_id,
@@ -1884,14 +1883,7 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
         native_uploads_asking_host(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
     )?;
-    let (_entry, desc) = sampled_texture_descriptor(state, host, task_id, texture_ref)?;
-    let tex = decode_texture_descriptor(&desc).ok()?;
-    let (w, h) = tex.extent()?;
-    let planes = tex.levels.first()?.planes();
-    let need = (w as usize)
-        .saturating_mul(h as usize)
-        .saturating_mul(planes as usize)
-        .saturating_mul(layout.layout().bytes_per_texel() as usize);
+    let need = sampled_payload_len(w, h, planes, layout)?;
     if bytes.len() < need {
         return None;
     }
@@ -1907,6 +1899,24 @@ pub(super) fn resolve_sampled_source<M: HostMemory + HostOps>(
             crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture,
         ),
     ))
+}
+
+/// The bytes a sampled upload of `planes` depth planes of a `width` x `height`
+/// level holds in `layout`, or `None` for an extent with no texels or one past
+/// the address space.
+pub(super) fn sampled_payload_len(
+    width: u32,
+    height: u32,
+    planes: u32,
+    layout: SampledByteFormat,
+) -> Option<usize> {
+    if width == 0 || height == 0 || planes == 0 {
+        return None;
+    }
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(planes as usize)?
+        .checked_mul(layout.layout().bytes_per_texel() as usize)
 }
 
 /// Whether a decoded resource object owns the resident reached by the surface
@@ -7505,6 +7515,160 @@ pub(super) fn honour_gva_load_elision<M: HostMemory + HostOps>(
     }
 }
 
+/// Publish each stored secondary MRT attachment over guest memory, as the
+/// primary's GVA Store does: armed as its resident's authoritative frame where
+/// the deferred rail can be armed, landed in the guest's pages now otherwise.
+///
+/// A secondary attachment is rendered into a registry resident keyed by its
+/// own guest pages and was never written back or armed. Its pages kept what
+/// they held before, so a later pass that sampled the texture — which asks
+/// whether the resident is authoritative, and otherwise reads the pages — read
+/// that instead of what the pass rendered. The iOS icon passes render an
+/// `RG16Float` field into slot 1 and sample it in the next pass, which read
+/// zeros (`lin_rung_guest_blank` on the slot's ref). Armed, the resident serves
+/// the sample and a guest read of the pages pays the debt; landed, the pages
+/// hold the frame. Both go through the writeback owner the primary uses, which
+/// keeps a half-float texel as it is.
+fn store_secondary_gva_targets<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+    secondaries: &[crate::backend::vulkan::engine::SecondaryColorTarget],
+    deferral_allowed: bool,
+) {
+    for (c, secondary) in req.colors.iter().skip(1).zip(secondaries) {
+        let stores =
+            reims_vgpu_protocol::pass_action::store_action_publishes_single_sample(c.store_action);
+        if c.target_gva == 0 || c.texture_ref == 0 || !stores {
+            continue;
+        }
+        let Some(window) = crate::backend::vulkan::gva_window(&secondary.identity) else {
+            continue;
+        };
+        let armed = deferral_allowed
+            && crate::runtime::writeback_debt::arm_gva(
+                crate::backend::vulkan::VulkanBackend,
+                state,
+                host,
+                req.task_id,
+                c,
+                window,
+            );
+        if armed {
+            crate::runtime::drain::note_store_route("mrt_secondary_gva_armed");
+            continue;
+        }
+        let pages = sync_store_allowed_pages(state, host, req.task_id, Some(c), true);
+        match crate::runtime::render_writeback::vulkan::store_gva_frame(
+            state,
+            host,
+            req.task_id,
+            &secondary.identity,
+            c,
+            c.texture_ref,
+            pages.as_ref(),
+            &[],
+        ) {
+            Ok(_) => crate::runtime::drain::note_store_route("mrt_secondary_gva_landed"),
+            Err(decline) => {
+                crate::observe::Emit::decline("mrt_secondary_store_lost", &decline)
+                    .field("slot", c.slot)
+                    .field("gva", format!("{:#x}", c.target_gva))
+                    .field("geom", format!("{}x{}", c.width, c.height))
+                    .field("fmt", format!("{:#x}", c.format))
+                    .fail_once(c.target_gva);
+            }
+        }
+    }
+}
+
+/// What a draw that executed bound, once per pipeline, task and colour target.
+///
+/// The refusal lines carry this shape and the successes carried nothing, so a
+/// chain of passes that runs without a refusal and still ends in an empty
+/// image — the iOS icon passes — could not be followed from one target to the
+/// next. Keyed on the colour target as well as the pipeline because one
+/// pipeline renders many targets and the question is which one fed which.
+fn note_draw_shape(req: &DrawEncodeRequest) {
+    let color_ref = req.colors.first().map(|c| c.texture_ref).unwrap_or(0);
+    let key = crate::backend::hash::hash_u64(
+        u64::from(req.pipeline_ref) << 32 | u64::from(req.task_id),
+        u64::from(color_ref),
+    );
+    if !crate::observe::first_sight("draw_shape", key) {
+        return;
+    }
+    crate::observe::off(format!(
+        "draw_shape pipe={} task={} geom={} vtx={} colors=[{}] ftex=[{}] vtex=[{}]",
+        req.pipeline_ref,
+        req.task_id,
+        req.colors
+            .first()
+            .map(|c| format!("{}x{}", c.width, c.height))
+            .unwrap_or_else(|| "0x0".to_string()),
+        req.vertex_count,
+        color_target_diag(&req.colors),
+        texture_bind_diag(&req.fragment_textures),
+        texture_bind_diag(&req.vertex_textures),
+    ));
+}
+
+/// The LOAD seed of a GVA colour attachment whose texel has no exact eight-bit
+/// form, in that texel, read from the guest's pages — or `None` to keep the
+/// RGBA8 seed the request already carries.
+///
+/// Only when the host renders the guest's format natively, so the attachment
+/// is that layout and the engine can stage the bytes as they are; and only
+/// when the loader hands the frame back in that layout at the attachment's
+/// extent.
+fn native_gva_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    c0: &ColorRtRequest,
+    width: u32,
+    height: u32,
+) -> Option<(Vec<u8>, TexelLayout)> {
+    let layout = crate::runtime::render_writeback::vulkan::stored_texel_layout(c0.format).filter(
+        |&layout| crate::runtime::render_writeback::vulkan::eight_bit_store_loses(layout),
+    )?;
+    let attachment = translate::pixel::color_attachment(c0.format)
+        .ok()
+        .and_then(|(attachment, _)| translate::pixel::texel_layout_of(attachment.vk))?;
+    if attachment != layout || c0.texture_ref == 0 {
+        return None;
+    }
+    let loaded = super::load_sampled_rgba_static(
+        state,
+        host,
+        task_id,
+        c0.texture_ref,
+        native_uploads_asking_host(),
+        crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
+    )?;
+    let fits = loaded.format.layout() == layout
+        && (loaded.width, loaded.height, loaded.planes) == (width, height, 1);
+    if !fits {
+        crate::runtime::drain::note_store_route("load_seed_native_declined");
+        return None;
+    }
+    crate::runtime::drain::note_store_route("load_seed_native");
+    if let Some(range) = crate::backend::vulkan::engine::half_float_range(
+        layout,
+        &loaded.bytes,
+        u64::from(width) * u64::from(height),
+    )
+    .filter(|range| range.non_finite != 0)
+    {
+        crate::observe::off(format!(
+            "load_seed_native_non_finite task={task_id} ref={} gva={:#x} {width}x{height} \
+             layout={layout:?} non_finite={} min={} max={}",
+            c0.texture_ref, c0.target_gva, range.non_finite, range.min, range.max
+        ));
+    }
+    Some((loaded.bytes, layout))
+}
+
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -9128,7 +9292,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // that layer being dropped, and everything outside the
                     // geometry this pass draws goes blank.
                     let mut seed_door = "none";
-                    if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                    // A wide GVA attachment is seeded with its own texel from
+                    // the guest's pages: the RGBA8 seed below would clamp a
+                    // half-float frame to [0, 1] before this pass loads it.
+                    let native_seed = (c0.target_seed_rgba.is_some() && c0.target_gva != 0)
+                        .then(|| native_gva_seed(state, host, req.task_id, c0, w, h))
+                        .flatten();
+                    if let Some((bytes, layout)) = native_seed {
+                        seed_door = "color_seed_native";
+                        target_rgba8 = Some(std::sync::Arc::new(bytes));
+                        seed_order = crate::backend::vulkan::engine::SeedOrder::Native(layout);
+                    } else if let Some(seed) = c0.target_seed_rgba.as_ref() {
                         seed_door = "color_seed";
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             // seed_color_load selected this by RT provenance.
@@ -10210,6 +10384,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        store_secondary_gva_targets(
+            state,
+            host,
+            req,
+            &resources.secondary_targets,
+            gpu_only_content_allowed,
+        );
         store_fragment_storage_textures(
             state,
             host,

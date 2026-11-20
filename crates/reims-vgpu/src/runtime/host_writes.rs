@@ -194,6 +194,56 @@ impl Default for EpochChunk {
     }
 }
 
+/// Which writer named a write's pages, and the object it was writing.
+///
+/// Carried only so a [`ReleasedWrite`] can say who wrote after the release.
+/// The finding used to name the page and two epochs and nothing else, so a
+/// boot that reported 281 of them could not say whether they were a compute
+/// writeback, a render Store or a surface flush — the question the next fix
+/// depends on. The variants are the handles each writer actually has; none
+/// is invented for a writer that does not know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostWriteOrigin {
+    /// A write through a task's page tables, starting at `gva`.
+    TaskSpan {
+        site: &'static str,
+        task: u32,
+        gva: u64,
+    },
+    /// A GPU copy into the guest pages behind a linear texture plane.
+    GuestPlane {
+        site: &'static str,
+        gva: u64,
+        texture_ref: u32,
+    },
+    /// A write into a surface mapping's pages.
+    Mapping { site: &'static str, mapping: u32 },
+    /// A writer that names its pages and no object.
+    Site(&'static str),
+    /// Test fixtures.
+    #[cfg(test)]
+    Unattributed,
+}
+
+impl std::fmt::Display for HostWriteOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TaskSpan { site, task, gva } => {
+                write!(f, "writer={site} task={task} gva={gva:#x}")
+            }
+            Self::GuestPlane {
+                site,
+                gva,
+                texture_ref,
+            } => write!(f, "writer={site} gva={gva:#x} ref={texture_ref}"),
+            Self::Mapping { site, mapping } => write!(f, "writer={site} mid={mapping}"),
+            Self::Site(site) => write!(f, "writer={site}"),
+            #[cfg(test)]
+            Self::Unattributed => write!(f, "writer=unattributed"),
+        }
+    }
+}
+
 /// A write this device recorded against a page the guest had taken back.
 ///
 /// Both epochs travel with it: `released_at` is the write census epoch current
@@ -209,6 +259,8 @@ pub struct ReleasedWrite {
     pub released_at: u64,
     /// Write census epoch of the write that landed on it afterwards.
     pub wrote_at: u64,
+    /// Who wrote it, and to which object.
+    pub origin: HostWriteOrigin,
 }
 
 /// How many findings the report queue holds between drains.
@@ -228,6 +280,7 @@ struct HitSink<'a> {
     hits: &'a mut Vec<ReleasedWrite>,
     hits_dropped: &'a mut u64,
     page_shift: u32,
+    origin: HostWriteOrigin,
 }
 
 impl HitSink<'_> {
@@ -252,6 +305,7 @@ impl HitSink<'_> {
                     gpa: page << self.page_shift,
                     released_at,
                     wrote_at: at,
+                    origin: self.origin,
                 });
             } else {
                 *self.hits_dropped += 1;
@@ -261,7 +315,14 @@ impl HitSink<'_> {
 }
 
 impl PageEpochs {
-    fn note_page_range(&mut self, mut page: u64, mut count: usize, epoch: u64, page_shift: u32) {
+    fn note_page_range(
+        &mut self,
+        mut page: u64,
+        mut count: usize,
+        epoch: u64,
+        page_shift: u32,
+        origin: HostWriteOrigin,
+    ) {
         let Self {
             chunks,
             armed,
@@ -274,6 +335,7 @@ impl PageEpochs {
             hits,
             hits_dropped,
             page_shift,
+            origin,
         };
         while count != 0 {
             let chunk_key = page / EPOCHS_PER_CHUNK as u64;
@@ -340,7 +402,7 @@ impl PageEpochs {
         }
     }
 
-    fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32)
+    fn note_pages<I>(&mut self, pages: I, epoch: u64, page_shift: u32, origin: HostWriteOrigin)
     where
         I: IntoIterator<Item = u64>,
     {
@@ -356,6 +418,7 @@ impl PageEpochs {
             hits,
             hits_dropped,
             page_shift,
+            origin,
         };
         let mut pages = pages.into_iter().peekable();
         while let Some(gpa) = pages.next() {
@@ -477,37 +540,44 @@ impl HostWrites {
     /// The mapping id is not stored. It was, while the record was a ring that
     /// resolved the page list again at read time and had to refuse once the
     /// mapping moved; capturing the pages here is what retired that refusal.
-    pub fn note_mapping(&mut self, pages: Option<&[u64]>) {
+    pub fn note_mapping(&mut self, origin: HostWriteOrigin, pages: Option<&[u64]>) {
         self.epoch = self.epoch.wrapping_add(1);
         match pages {
-            Some(p) => self
-                .pages
-                .note_pages(p.iter().copied(), self.epoch, self.page_shift),
+            Some(p) => {
+                self.pages
+                    .note_pages(p.iter().copied(), self.epoch, self.page_shift, origin)
+            }
             None => self.pages.note_unknown(self.epoch),
         }
     }
 
     /// Record a write covering exactly `pages` (page-aligned guest addresses).
-    pub fn note_pages(&mut self, pages: Vec<u64>) {
+    pub fn note_pages(&mut self, origin: HostWriteOrigin, pages: Vec<u64>) {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages
+            .note_pages(pages, self.epoch, self.page_shift, origin);
     }
 
     /// Record an already-resolved page iterator without materializing a second
     /// allocation. The caller retains ownership of the allocation identity;
     /// this type owns only its page-exact epochs.
-    pub fn note_page_iter<I>(&mut self, pages: I)
+    pub fn note_page_iter<I>(&mut self, origin: HostWriteOrigin, pages: I)
     where
         I: IntoIterator<Item = u64>,
     {
         self.epoch = self.epoch.wrapping_add(1);
-        self.pages.note_pages(pages, self.epoch, self.page_shift);
+        self.pages
+            .note_pages(pages, self.epoch, self.page_shift, origin);
     }
 
     /// Record the exact page runs retained with an admitted guest allocation.
     /// The run partition was derived once with the resource, so a repeated
     /// Store updates slices rather than rebuilding adjacency page by page.
-    pub fn note_footprint(&mut self, footprint: &crate::runtime::guest_ram::GuestPageFootprint) {
+    pub fn note_footprint(
+        &mut self,
+        origin: HostWriteOrigin,
+        footprint: &crate::runtime::guest_ram::GuestPageFootprint,
+    ) {
         self.epoch = self.epoch.wrapping_add(1);
         if footprint.page_size() != (1u64 << self.page_shift) {
             self.pages.note_unknown(self.epoch);
@@ -520,6 +590,7 @@ impl HostWrites {
                 run.end - run.start,
                 self.epoch,
                 self.page_shift,
+                origin,
             );
         }
     }
@@ -599,7 +670,7 @@ mod tests {
     fn a_write_to_other_pages_leaves_this_window_quiet() {
         let mut w = HostWrites::default();
         let mark = w.epoch();
-        w.note_pages(vec![9 * P, 10 * P]);
+        w.note_pages(HostWriteOrigin::Unattributed, vec![9 * P, 10 * P]);
         assert_eq!(
             w.wrote_any_since(mark, &[3 * P, 4 * P]),
             HostWriteVerdict::Quiet
@@ -615,10 +686,10 @@ mod tests {
     #[test]
     fn a_write_the_reader_already_saw_does_not_answer_for_a_later_mark() {
         let mut w = HostWrites::default();
-        w.note_pages(vec![4 * P]);
+        w.note_pages(HostWriteOrigin::Unattributed, vec![4 * P]);
         let after = w.epoch();
         assert_eq!(w.wrote_any_since(after, &[4 * P]), HostWriteVerdict::Quiet);
-        w.note_pages(vec![4 * P]);
+        w.note_pages(HostWriteOrigin::Unattributed, vec![4 * P]);
         assert_eq!(
             w.wrote_any_since(after, &[4 * P]),
             HostWriteVerdict::Overlap
@@ -653,7 +724,7 @@ mod tests {
         let mut w = HostWrites::default();
         let stale = w.epoch();
         for i in 0..4096u64 {
-            w.note_pages(vec![(100 + i) * P]);
+            w.note_pages(HostWriteOrigin::Unattributed, vec![(100 + i) * P]);
         }
         assert_eq!(
             w.wrote_any_since(stale, &[3 * P]),
@@ -674,7 +745,7 @@ mod tests {
     fn a_write_repeated_every_frame_occupies_one_entry() {
         let mut w = HostWrites::default();
         for _ in 0..10_000 {
-            w.note_pages(vec![4 * P, 5 * P]);
+            w.note_pages(HostWriteOrigin::Unattributed, vec![4 * P, 5 * P]);
         }
         assert_eq!(w.pages.recorded_pages(), 2);
         assert_eq!(
@@ -690,7 +761,7 @@ mod tests {
         let mut w = HostWrites::default();
         let mark = w.epoch();
         let far = (EPOCHS_PER_CHUNK as u64 * 4096) + 3 * P;
-        w.note_pages(vec![3 * P, far]);
+        w.note_pages(HostWriteOrigin::Unattributed, vec![3 * P, far]);
         assert_eq!(w.wrote_any_since(mark, &[3 * P]), HostWriteVerdict::Overlap);
         assert_eq!(w.wrote_any_since(mark, &[far]), HostWriteVerdict::Overlap);
         assert_eq!(w.pages.recorded_pages(), 2);
@@ -706,7 +777,7 @@ mod tests {
             .expect("one contiguous allocation chunk");
         let mut w = HostWrites::default();
         let before = w.epoch();
-        w.note_footprint(&footprint);
+        w.note_footprint(HostWriteOrigin::Unattributed, &footprint);
         let after_full = w.epoch();
         assert_eq!(w.pages.recorded_pages(), EPOCHS_PER_CHUNK);
         assert_eq!(
@@ -718,7 +789,7 @@ mod tests {
             HostWriteVerdict::Quiet
         );
 
-        w.note_pages(vec![7 * P]);
+        w.note_pages(HostWriteOrigin::Unattributed, vec![7 * P]);
         assert_eq!(
             w.wrote_any_since(after_full, &[7 * P]),
             HostWriteVerdict::Overlap
@@ -737,7 +808,7 @@ mod tests {
             .expect("arm64 footprint");
         let mut w = HostWrites::default();
         let mark = w.epoch();
-        w.note_footprint(&footprint);
+        w.note_footprint(HostWriteOrigin::Unattributed, &footprint);
         assert_eq!(
             w.wrote_any_since(mark, &[0x9000]),
             HostWriteVerdict::Unnamed
@@ -752,7 +823,10 @@ mod tests {
         const ARM_PAGE: u64 = 1 << crate::model::PAGE_SHIFT_ARM64E;
         let mut w = HostWrites::new(crate::model::PAGE_SHIFT_ARM64E);
         let mark = w.epoch();
-        w.note_pages(vec![3 * ARM_PAGE, 4 * ARM_PAGE]);
+        w.note_pages(
+            HostWriteOrigin::Unattributed,
+            vec![3 * ARM_PAGE, 4 * ARM_PAGE],
+        );
         assert_eq!(w.pages.recorded_pages(), 2);
         assert_eq!(
             w.wrote_any_since(mark, &[4 * ARM_PAGE]),
@@ -776,11 +850,11 @@ mod tests {
     fn a_mapping_re_pointed_after_the_write_is_still_answered_by_the_pages_it_wrote() {
         let mut w = HostWrites::default();
         let mark = w.epoch();
-        w.note_mapping(Some(&[7 * P]));
+        w.note_mapping(HostWriteOrigin::Unattributed, Some(&[7 * P]));
         assert_eq!(w.wrote_any_since(mark, &[7 * P]), HostWriteVerdict::Overlap);
         assert_eq!(w.wrote_any_since(mark, &[8 * P]), HostWriteVerdict::Quiet);
         // Whatever the mapping is re-pointed at, this write's pages do not move.
-        w.note_mapping(Some(&[8 * P]));
+        w.note_mapping(HostWriteOrigin::Unattributed, Some(&[8 * P]));
         assert_eq!(w.wrote_any_since(mark, &[7 * P]), HostWriteVerdict::Overlap);
         assert_eq!(w.wrote_any_since(mark, &[3 * P]), HostWriteVerdict::Quiet);
     }
@@ -791,7 +865,7 @@ mod tests {
     fn a_mapping_write_that_cannot_name_all_its_pages_invalidates_everything_older() {
         let mut w = HostWrites::default();
         let mark = w.epoch();
-        w.note_mapping(None);
+        w.note_mapping(HostWriteOrigin::Unattributed, None);
         assert_eq!(w.wrote_any_since(mark, &[3 * P]), HostWriteVerdict::Unnamed);
     }
 

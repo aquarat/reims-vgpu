@@ -3615,6 +3615,176 @@ fn mrt_draw_request_texture_view_mip_level_view_of_linear_as_color_rt() {
     assert_eq!(c0.row_stride, 128, "level-1 row stride");
 }
 
+/// A sampled texture view of a linear texture is read at its **base's** level
+/// extent, in the view's format — the shape of the iOS Simulator's icon mask: an
+/// `A8Unorm` view of an `R8Unorm` render target.
+///
+/// The loader resolves the view to its base and level, so it is the only place
+/// that knows which texture's extent the bytes have, and it now says. The
+/// Vulkan bind's last rung used to take the extent from the descriptor of the
+/// ref it was asked about — the view record, decoded as a texture — and refused
+/// every such bind, which on a simulator UI test was every icon pass:
+/// `draw_prepare_texture_resolve_missing … type=8 … reason=view_base_or_swizzle`
+/// and 181 skipped 192x192 draws.
+///
+/// The view names level 1, whose extent (32x16) differs from the base's level 0
+/// (64x32) and from anything in the view record, so an extent taken from either
+/// fails here.
+#[test]
+fn a_sampled_view_of_a_linear_texture_is_read_at_its_base_levels_extent() {
+    use crate::protocol::endian::{st16, st32, st64};
+    use crate::protocol::pixel_format::{MTL_FORMAT_A8_UNORM, MTL_FORMAT_R8_UNORM};
+    use crate::runtime::decode::resource::{
+        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE,
+        OBJECT_TYPE_TEXTURE_VIEW, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN,
+        TEXTURE_DESC_LEVEL_RECORDS, TEXTURE_DESC_MIPMAP_LEVEL_COUNT,
+        TEXTURE_DESC_MIP_LEVEL_RECORD_LEN, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH, TEXTURE_LEVEL_HEIGHT, TEXTURE_LEVEL_OFFSET,
+        TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE, TEXTURE_LEVEL_WIDTH,
+        TEXTURE_VIEW_DESC_BASE_REF, TEXTURE_VIEW_DESC_LEN, TEXTURE_VIEW_DESC_LEVEL_BASE,
+        TEXTURE_VIEW_DESC_LEVEL_COUNT, TEXTURE_VIEW_DESC_OPCODE, TEXTURE_VIEW_DESC_PIXEL_FORMAT,
+        TEXTURE_VIEW_DESC_SLICE_BASE, TEXTURE_VIEW_DESC_SLICE_COUNT, TEXTURE_VIEW_DESC_TEXTURE_REF,
+        TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
+        TEXTURE_VIEW_OPCODE_RANGED,
+    };
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
+
+    // R8Unorm base, two levels: L0 64x32 at +0 (pitch 64), L1 32x16 at +0x2000
+    // (pitch 48, padded past its 32 texels).
+    let (base_ref, view_ref, handle) = (5u32, 8u32, 5u64);
+    let (l1_off, l1_w, l1_h, l1_bpr) = (0x2000u64, 32u32, 16u32, 48u64);
+    let body = TEXTURE_DESC_BASE_LEN + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
+    let mut b = vec![0u8; body];
+    st64(&mut b[0..], 0x4000); // allocation_size
+    st32(&mut b[8..], handle as u32);
+    st16(&mut b[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 2);
+    st32(&mut b[TEXTURE_DESC_USED_SIZE..], 64 * 32);
+    st32(&mut b[TEXTURE_DESC_ROW_STRIDE..], 64);
+    st32(&mut b[TEXTURE_DESC_WIDTH..], 64);
+    st32(&mut b[TEXTURE_DESC_WIDTH + 4..], 32); // height
+    let rec = TEXTURE_DESC_LEVEL_RECORDS;
+    st64(&mut b[rec + TEXTURE_LEVEL_OFFSET..], l1_off);
+    st64(&mut b[rec + TEXTURE_LEVEL_SIZE..], l1_bpr * u64::from(l1_h));
+    st64(&mut b[rec + TEXTURE_LEVEL_ROW_STRIDE..], l1_bpr);
+    st32(&mut b[rec + TEXTURE_LEVEL_WIDTH..], l1_w);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT..], l1_h);
+    st32(&mut b[rec + TEXTURE_LEVEL_HEIGHT + 4..], 1); // depth
+    st16(
+        &mut b[TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN..],
+        MTL_FORMAT_R8_UNORM,
+    );
+    let base_desc_gva = 0x200u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], base_desc_gva, &b);
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&base_desc_gva.to_le_bytes());
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        list_object_entry_offset(base_ref, 32).unwrap(),
+        &le,
+    );
+
+    // Level 1's texels, a function of position; its row padding a value no
+    // texel holds.
+    let texel = |x: u32, y: u32| ((x * 7 + y * 13 + 1) % 0xE0) as u8;
+    let mut level = vec![0xEEu8; (l1_bpr * u64::from(l1_h)) as usize];
+    for y in 0..l1_h {
+        for x in 0..l1_w {
+            level[(u64::from(y) * l1_bpr + u64::from(x)) as usize] = texel(x, y);
+        }
+    }
+    let level_gva = (handle << RESOURCE_PAGE_SHIFT) + l1_off;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], level_gva, &level);
+
+    // An A8Unorm view of level 1.
+    let len = TEXTURE_VIEW_MIN_RANGED;
+    let mut desc = vec![0u8; len];
+    st32(
+        &mut desc[TEXTURE_VIEW_DESC_OPCODE..],
+        TEXTURE_VIEW_OPCODE_RANGED,
+    );
+    st32(&mut desc[TEXTURE_VIEW_DESC_LEN..], len as u32);
+    st32(&mut desc[TEXTURE_VIEW_DESC_TEXTURE_REF..], view_ref);
+    st32(&mut desc[TEXTURE_VIEW_DESC_BASE_REF..], base_ref);
+    st16(
+        &mut desc[TEXTURE_VIEW_DESC_PIXEL_FORMAT..],
+        MTL_FORMAT_A8_UNORM,
+    );
+    st16(
+        &mut desc[TEXTURE_VIEW_DESC_TEXTURE_TYPE..],
+        TEXTURE_VIEW_MTL_TYPE_2D,
+    );
+    st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_BASE..], 1);
+    st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
+    st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
+    st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
+    let desc_gva = 0x400u64;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(
+        &mut le[0..],
+        (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8),
+    );
+    le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        list_object_entry_offset(view_ref, 32).unwrap(),
+        &le,
+    );
+
+    let loaded = load_sampled_rgba_static(
+        &mut state,
+        &mut host,
+        1,
+        view_ref,
+        NativeUploads::NONE,
+        crate::runtime::render_writeback::SettleSite::LinearTextureSampled,
+    )
+    .expect("an A8Unorm view of an R8Unorm linear texture loads");
+    assert_eq!(
+        (loaded.width, loaded.height, loaded.planes),
+        (l1_w, l1_h, 1),
+        "the view's level of its base, not level 0 and not the view record"
+    );
+    assert_eq!(loaded.format.layout(), TexelLayout::Rgba8);
+    assert_eq!(loaded.bytes.len(), (l1_w * l1_h * 4) as usize);
+    // A8: the byte is alpha, red/green/blue are zero, the padding is gone.
+    for y in 0..l1_h {
+        for x in 0..l1_w {
+            let at = ((y * l1_w + x) * 4) as usize;
+            assert_eq!(
+                &loaded.bytes[at..at + 4],
+                &[0, 0, 0, texel(x, y)],
+                "texel ({x},{y})"
+            );
+        }
+    }
+}
+
+/// The last sampled rung's length check, which used to be sized from a
+/// descriptor and is now sized from the loader's own extent.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_sampled_payload_is_its_extent_times_its_layouts_texel() {
+    let rgba8 = SampledByteFormat::synthesised(TexelLayout::Rgba8);
+    assert_eq!(sampled_payload_len(32, 16, 1, rgba8), Some(32 * 16 * 4));
+    assert_eq!(sampled_payload_len(32, 16, 3, rgba8), Some(32 * 16 * 3 * 4));
+    // No texels is no payload, not an empty one.
+    assert_eq!(sampled_payload_len(0, 16, 1, rgba8), None);
+    assert_eq!(sampled_payload_len(32, 0, 1, rgba8), None);
+    assert_eq!(sampled_payload_len(32, 16, 0, rgba8), None);
+}
+
 #[test]
 fn view_swizzle_remaps_rgba8_pixels() {
     // Every CPU remap must report itself: this is the path the Vulkan
@@ -6802,103 +6972,6 @@ fn a_degradation_reports_once_per_pipeline_and_slug() {
     assert!(
         degrade_log_first(b, "depth_load_readback_failed"),
         "the same degradation on a different pipeline is a different report"
-    );
-}
-
-/// A sampled bind naming an object that is not a texture is reported, and the
-/// answer it gets does not change.
-///
-/// The two sampled-source sites in `draw::vulkan` resolved a `texture_ref`
-/// without the second ladder rung, so a ref naming any object with a long
-/// enough descriptor decoded as a texture and produced a plausible extent —
-/// while `mipmap`, `draw::texture_view`, `compute_exec` and
-/// `draw::render_target` all ask the type for the same field. Turning the rung
-/// into a refusal here would lose a draw on the pathway this device is verified
-/// on, so it reports; this pins both halves of that, because a probe that
-/// quietly started refusing would be the bug it was added to measure.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn a_sampled_ref_naming_another_object_kind_is_reported_and_still_resolves() {
-    use crate::protocol::endian::{st32, st64};
-    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::runtime::decode::resource::{
-        list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN,
-    };
-    use crate::runtime::gva_mem::write_task_gva_arm64e;
-    use crate::runtime::objects::OBJECT_TYPE_REF_TEXTURE;
-
-    // One task, one object list, and two refs into it — same descriptor bytes,
-    // different object type in the entry.
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let (dir_pfn, root_pfn) = (2u32, 3u32);
-    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(dir_gpa, 0x20, 0);
-    host.map_range(root_gpa, 0x4000, 0);
-    let mut d = [0u8; 8];
-    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-    assert!(host.write_gpa(dir_gpa, &d).is_ok());
-    for i in 0..4u32 {
-        let pfn = 4 + i;
-        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-        let mut pte = [0u8; 4];
-        st32(&mut pte, pfn);
-        assert!(host.write_gpa(root_gpa + (i as u64) * 4, &pte).is_ok());
-    }
-    state.define_task(1, 0x1000, dir_pfn);
-    assert!(state.set_object_list(1, 0, 32));
-
-    let body = TEXTURE_DESC_BASE_LEN;
-    let mut desc = vec![0u8; body];
-    st64(&mut desc[0..], 0x1000);
-    st32(&mut desc[8..], 1);
-    let desc_gva = 0x200u64;
-    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
-    let put_entry = |host: &mut FakeHost, obj_ref: u32, object_type: u8| {
-        let off = list_object_entry_offset(obj_ref, 32).expect("entry in range");
-        let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
-        st32(&mut le[0..], (object_type as u32) | ((body as u32) << 8));
-        le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        write_task_gva_arm64e(host, &state.tasks[1], off, &le);
-    };
-    let (texture_ref, view_ref) = (6u32, 7u32);
-    put_entry(&mut host, texture_ref, OBJECT_TYPE_TEXTURE);
-    put_entry(&mut host, view_ref, OBJECT_TYPE_REF_TEXTURE);
-
-    crate::observe::redirect_logs_for_tests();
-    let before = std::fs::read_to_string(crate::observe::fail_log_path())
-        .unwrap_or_default()
-        .len();
-
-    // A real texture resolves and says nothing.
-    assert!(
-        super::vulkan::sampled_texture_descriptor(&state, &host, 1, texture_ref).is_some(),
-        "a texture ref resolves"
-    );
-    // Another kind resolves exactly the same way — the bytes are the bytes —
-    // and the rung is named.
-    let (entry, bytes) = super::vulkan::sampled_texture_descriptor(&state, &host, 1, view_ref)
-        .expect("the answer does not change: the descriptor still resolves");
-    assert_eq!(entry.object_type, OBJECT_TYPE_REF_TEXTURE);
-    assert_eq!(bytes.len(), body);
-
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
-    let tail = &log[before.min(log.len())..];
-    let line = tail
-        .lines()
-        .find(|l| l.contains("draw_sampled_texture_wrong_type"))
-        .expect("the second ladder rung must name itself");
-    assert!(
-        line.contains(&format!("ref={view_ref}")) && line.contains("object_type=5"),
-        "the line must name the ref and what it found: {line}"
-    );
-    assert!(
-        !tail
-            .lines()
-            .any(|l| l.contains("draw_sampled_texture_wrong_type") && l.contains("ref=6")),
-        "a texture ref must not be reported"
     );
 }
 

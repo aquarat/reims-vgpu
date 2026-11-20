@@ -5707,8 +5707,12 @@ impl DeviceState {
 
     /// The same, for a writer that walked the guest page tables and so knows
     /// exactly which pages it landed in even though it names no mapping.
-    pub fn note_host_wrote_pages(&mut self, pages: Vec<u64>) {
-        self.host_writes.note_pages(pages);
+    pub fn note_host_wrote_pages(
+        &mut self,
+        origin: crate::runtime::host_writes::HostWriteOrigin,
+        pages: Vec<u64>,
+    ) {
+        self.host_writes.note_pages(origin, pages);
     }
 
     /// Every guest page a mapping covers, or `None` when the set cannot be
@@ -5750,7 +5754,8 @@ impl DeviceState {
     }
 
     /// The same, for a writer that knows which mapping's pages it is landing in.
-    pub fn note_host_wrote_mapping(&mut self, mapping_id: u32) {
+    /// `site` names the writer, for a write a released page later reports.
+    pub fn note_host_wrote_mapping(&mut self, site: &'static str, mapping_id: u32) {
         let Some(entries) = self
             .mappings
             .get(&mapping_id)
@@ -5771,11 +5776,16 @@ impl DeviceState {
             self.host_writes.note_unknown();
             return;
         }
-        self.host_writes
-            .note_page_iter(entries.iter().map(|&entry| {
+        self.host_writes.note_page_iter(
+            crate::runtime::host_writes::HostWriteOrigin::Mapping {
+                site,
+                mapping: mapping_id,
+            },
+            entries.iter().map(|&entry| {
                 crate::protocol::iosurface_pages::entry_gpa_shift(entry, shift)
                     .expect("page entries were validated above")
-            }));
+            }),
+        );
     }
 
     /// Issue a sampled-content generation that has never been issued before.
@@ -6699,8 +6709,13 @@ mod fail_vocabulary_tests {
         let mut epoch = state.host_writes.epoch();
         for announce in [
             &mut DeviceState::note_host_wrote_guest_ram as &mut dyn FnMut(&mut DeviceState),
-            &mut |s: &mut DeviceState| s.note_host_wrote_pages(vec![0x1000]),
-            &mut |s: &mut DeviceState| s.note_host_wrote_mapping(7),
+            &mut |s: &mut DeviceState| {
+                s.note_host_wrote_pages(
+                    crate::runtime::host_writes::HostWriteOrigin::Unattributed,
+                    vec![0x1000],
+                )
+            },
+            &mut |s: &mut DeviceState| s.note_host_wrote_mapping("test", 7),
         ] {
             announce(&mut state);
             let now = state.host_writes.epoch();

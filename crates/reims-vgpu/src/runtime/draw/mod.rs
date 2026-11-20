@@ -3707,7 +3707,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
     // A colour LOAD seed is copied into a render target through the RGBA8-shaped
     // seed path, so this arm takes no native layout — the bytes must be what
     // that path reads them as.
-    let (rgba, _layout) = load_sampled_rgba_static(
+    let loaded = load_sampled_rgba_static(
         state,
         host,
         task_id,
@@ -3715,7 +3715,7 @@ fn seed_color_load<M: HostMemory + HostOps>(
         NativeUploads::NONE,
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
-    Some(rgba)
+    Some(loaded.bytes)
 }
 
 /// This device's own last publication of a mapper-ref-texture surface, when the
@@ -3942,28 +3942,29 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
     texture_ref: u32,
     native: NativeUploads,
     site: crate::runtime::render_writeback::SettleSite,
-) -> Option<(Vec<u8>, SampledByteFormat)> {
+) -> Option<texture_view::LinearLoad> {
+    // Every arm answers the extent it read along with the bytes. A caller must
+    // not re-derive it from `texture_ref`: for a texture view that ref names a
+    // view record, and the bytes are its base's level — see
+    // [`texture_view::LinearLoad`].
+    let rgba8 = |(width, height, bytes): (u32, u32, Vec<u8>), source| texture_view::LinearLoad {
+        bytes,
+        format: SampledByteFormat::from_source(TexelLayout::Rgba8, source),
+        width,
+        height,
+        planes: 1,
+    };
     // Opcode-9 buffer-backed texture (texture-view): sample the source buffer directly.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, None) {
         let source = bt.desc.pixel_format;
-        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt).map(
-            |(_, _, r)| {
-                (
-                    r,
-                    SampledByteFormat::from_source(TexelLayout::Rgba8, source),
-                )
-            },
-        );
+        return load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)
+            .map(|loaded| rgba8(loaded, source));
     }
     // Mapper-ref-texture path via resolve.
     if let Some(mid) = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref) {
         let source = mapping_declared_format(state, mid, None);
-        return load_mapper_ref_texture_mapping_rgba(state, host, mid, None).map(|(_, _, r)| {
-            (
-                r,
-                SampledByteFormat::from_source(TexelLayout::Rgba8, source),
-            )
-        });
+        return load_mapper_ref_texture_mapping_rgba(state, host, mid, None)
+            .map(|loaded| rgba8(loaded, source));
     }
     // Texture-view view → base texture + mip + format. The view's SWIZZLE is
     // deliberately not consulted here: it is a property of the view, not of the
@@ -3982,14 +3983,8 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
             return None;
         }
         let source = mapping_declared_format(state, mid, fmt_override);
-        return load_mapper_ref_texture_mapping_rgba(state, host, mid, fmt_override).map(
-            |(_, _, r)| {
-                (
-                    r,
-                    SampledByteFormat::from_source(TexelLayout::Rgba8, source),
-                )
-            },
-        );
+        return load_mapper_ref_texture_mapping_rgba(state, host, mid, fmt_override)
+            .map(|loaded| rgba8(loaded, source));
     }
     // The only rung here that can answer in anything but RGBA8. The three above
     // convert unconditionally — `load_buffer_texture_rgba` and
