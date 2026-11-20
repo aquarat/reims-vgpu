@@ -1037,6 +1037,7 @@ fn execute_submission<M: HostMemory + HostOps>(
         *measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
+    crate::runtime::writeback_debt::submit_surface_stores(state, host);
 }
 
 /// Run one submission whose plan step has already answered, from the inputs it

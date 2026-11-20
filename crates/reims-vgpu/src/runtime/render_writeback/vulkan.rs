@@ -90,7 +90,18 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     // to lend. Reading the `Err` as fatal cost 34 frames a boot on exactly the
     // host class that has no second rail, and no boot of a capable host could
     // have shown it.
-    let leased = match crate::backend::vulkan::engine::read_target_leased(identity) {
+    // An IOSurface is also a texture allocation. Preserve its native texels
+    // when the resident holds that very layout; a round trip through scanout
+    // order clamps half-float channels and loses precision even within [0,1].
+    let native = state.mappings.get(&mapping_id).and_then(|m| {
+        let format = crate::runtime::mapping_write::mapping_store_format(m);
+        native_surface_copy(format, identity.resident_format()).map(|layout| (format, layout))
+    });
+    let lease = match native {
+        Some(_) => Ok(None),
+        None => crate::backend::vulkan::engine::read_target_leased(identity),
+    };
+    let leased = match lease {
         Ok(leased) => leased,
         Err(decline) => {
             // The typed fields, not `Display`. `TargetReadDecline::UnknownIdentity`
@@ -133,12 +144,28 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
         leased => {
             drop(leased);
             crate::runtime::drain::note_store_route("render_flush_copied");
-            match crate::backend::vulkan::engine::read_target(identity) {
-                Ok(rb) => {
-                    // A mapping is scanout-ordered eight-bit colour, so a native
-                    // readback has nothing this rail can land. Named rather than
-                    // reinterpreted — the bytes are a texel the mapping cannot
-                    // mean.
+            let read = match native {
+                Some((_, layout)) => {
+                    crate::backend::vulkan::engine::read_target_keeping(identity, layout)
+                }
+                None => crate::backend::vulkan::engine::read_target(identity),
+            };
+            match (read, native) {
+                (Ok(rb), Some((format, layout))) if rb.texel.native_layout() == Some(layout) => {
+                    let ok = crate::runtime::mapping_write::write_native_image(
+                        state,
+                        host,
+                        mapping_id,
+                        &rb.pixels,
+                        width.saturating_mul(layout.bytes_per_texel()),
+                        width,
+                        height,
+                        format,
+                    );
+                    (ok, rb.pixels.len())
+                }
+                (Ok(rb), _) => {
+                    // Only a readback in colour order can take the converting writer.
                     let texel = rb.texel;
                     match rb.into_bgra8() {
                         Some(scanout) => {
@@ -163,7 +190,7 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
                         }
                     }
                 }
-                Err(e) => {
+                (Err(e), _) => {
                     // Typed, for the reason the lease decline above is: this is
                     // the one line that says *why* the frame was unreadable, and
                     // `Display` on a `DrawError` prints the slug alone.
@@ -189,6 +216,15 @@ pub fn store_render_frame<M: HostMemory + HostOps>(
     }
     finish(state, mapping_id, identity, frame_len, started, false);
     true
+}
+
+fn native_surface_copy(
+    format: u16,
+    held: ash::vk::Format,
+) -> Option<crate::protocol::pixel_format::TexelLayout> {
+    use crate::backend::vulkan::translate::pixel::{texel_layout_of, verbatim_texel};
+    let (destination, _) = verbatim_texel(format)?;
+    texel_layout_of(held).filter(|&layout| held == destination && eight_bit_store_loses(layout))
 }
 
 /// Publish a Store for a resident whose attachment memory is the guest mapping.
@@ -1091,6 +1127,28 @@ mod gva_copying_arm_tests {
             assert_eq!(stored_texel_layout(format), Some(layout), "{format:#x}");
             assert_eq!(eight_bit_store_loses(layout), loses, "{layout:?}");
         }
+    }
+
+    #[test]
+    fn a_copied_surface_preserves_wide_texels_only_for_the_matching_allocation() {
+        use crate::protocol::pixel_format::{self as p, TexelLayout};
+        use ash::vk::Format;
+        assert_eq!(
+            native_surface_copy(p::MTL_FORMAT_RGBA16_FLOAT, Format::R16G16B16A16_SFLOAT),
+            Some(TexelLayout::Rgba16Float)
+        );
+        assert_eq!(
+            native_surface_copy(p::MTL_FORMAT_RGBA16_FLOAT, Format::R16G16B16A16_UNORM),
+            None
+        );
+        assert_eq!(
+            native_surface_copy(p::MTL_FORMAT_BGRA8_UNORM, Format::R16G16B16A16_SFLOAT),
+            None
+        );
+        assert_eq!(
+            native_surface_copy(p::MTL_FORMAT_BGRA8_UNORM, Format::B8G8R8A8_UNORM),
+            None
+        );
     }
 
     /// A native half-float frame lands verbatim: values outside [0, 1] reach the

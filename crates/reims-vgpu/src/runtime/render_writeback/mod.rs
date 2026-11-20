@@ -9,7 +9,8 @@
 //! These functions implement the transfer half of resource synchronization.
 //! The render Store itself normally leaves the frame in its engine resident;
 //! [`crate::runtime::writeback_debt`] calls back here when an explicit
-//! synchronize or an actual guest-byte reader requires a guest copy. An eager
+//! synchronize, a guest-byte reader, or completion of a submission that wrote
+//! a shared IOSurface requires a guest copy. An eager
 //! fallback may call the same functions at Store time, so both timings produce
 //! identical bytes through one implementation.
 //!
@@ -25,10 +26,11 @@
 //! in the ways below.
 //!
 //! Twelve driven macos-13 sustained-animation boots, six an arm: **90 % of
-//! mapper-ref-texture Stores are superseded before anything reads their pages**, `store_us`
+//! mapper-ref-texture Stores were superseded before a device-side read**, `store_us`
 //! falls 0.89 against 9.56 us a chain, `draw_us` 14.62 against 26.52, and five
 //! of six on-arm boots present at 105.8-109.2 Hz against a 77.2-78.6 Hz
-//! baseline. GVA targets use the same ownership rule now; their debt is keyed by
+//! baseline. Those counters could not see direct guest CPU reads; coalescing
+//! shared surfaces is now bounded by submission completion. GVA debt is keyed by
 //! the task-local resource reference and paid into its retained transfer backing.
 //!
 //! ## What that rail corrected here

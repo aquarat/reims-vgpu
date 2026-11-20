@@ -1,11 +1,11 @@
 //! Resource-validity ownership for render targets.
 //!
-//! A render Store preserves pixels in the host attachment. It does not imply a
-//! host-to-guest transfer. The guest makes that transfer observable by naming
-//! the resource in `CmdSynchronizeResources`, or this device needs the guest
-//! bytes itself for a fallback reader. Until then, [`PendingWritebacks`] records
-//! that the engine image is authoritative and repeated Stores into the resource
-//! replace one another without touching guest RAM.
+//! Repeated render Stores can replace one another while the engine image is
+//! authoritative. For a mapped IOSurface the guest can lock and read the
+//! shared pages after command-buffer completion without another device call.
+//! [`submit_surface_stores`] therefore bounds that deferral to the producing
+//! submission. An ordinary texture's transfer backing has a different
+//! lifetime: synchronize and fallback readers request its bytes by name.
 //!
 //! # A resource owns its transfer backing
 //!
@@ -34,8 +34,7 @@
 //! A named synchronize pays only its object list through
 //! [`submit_for_resources`]. Readers that know a mapping or texture call
 //! [`pay_for_mapping`] or [`pay_for_texture`]. Only a genuinely unnameable
-//! aliasing reader uses [`pay_all`]. Completion stamps alone do not publish
-//! resources.
+//! aliasing reader uses [`pay_all`].
 //!
 //! The engine's `gpu_only_content` flag keeps an unpaid image alive. A
 //! successful payment calls `note_resident_content_copied_out`; replacement,
@@ -760,18 +759,36 @@ pub fn pay_all<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
     if state.pending_writebacks.is_empty() {
         return;
     }
-    for mapping_id in state.pending_writebacks.mappings_by_age() {
-        let Some(debt) = state.pending_writebacks.take(mapping_id) else {
-            continue;
-        };
-        pay(state, host, mapping_id, debt, "wbdebt_paid_all");
-    }
+    pay_surfaces(state, host, "wbdebt_paid_all");
     let rail = crate::backend::selected();
     for plane in state.pending_writebacks.gvas_by_age() {
         let Some(debt) = state.pending_writebacks.take_gva_plane(plane) else {
             continue;
         };
         let _ = pay_gva(rail, state, host, plane, debt, GvaPaySite::All);
+    }
+}
+
+/// Queue the surviving writes to shared IOSurfaces *before* the executor
+/// takes this packet's completion point. The direct-copy rail is ordered on
+/// that queue; the CPU-copy rail lands its rows before returning. Neither
+/// requires a device-wide wait here. A GVA transfer debt is not such a write.
+pub(super) fn submit_surface_stores<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    pay_surfaces(state, host, "wbdebt_paid_submission");
+}
+
+fn pay_surfaces<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    route: &'static str,
+) {
+    for mapping_id in state.pending_writebacks.mappings_by_age() {
+        if let Some(debt) = state.pending_writebacks.take(mapping_id) {
+            pay(state, host, mapping_id, debt, route);
+        }
     }
 }
 
@@ -2077,6 +2094,30 @@ mod tests {
         assert_eq!(previous.map(|debt| debt.generation), Some(7));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.get_gva(key).map(|debt| debt.generation), Some(8));
+    }
+
+    #[test]
+    fn submission_retires_shared_surface_stores_and_leaves_transfer_backings_alone() {
+        let mut state = DeviceState::new(crate::model::DeviceId::default(), 12);
+        let mut host = crate::runtime::FakeHost::new();
+        let key = GvaResourceKey {
+            task_id: 4,
+            texture_ref: 7,
+        };
+        let transfer = gva_debt(3);
+        let _ = state.pending_writebacks.arm_gva(key, transfer);
+        // An expired mapping exercises the generation guard without a GPU;
+        // even this decision must be made before submission completion.
+        for id in [7, 8, 7] {
+            assert!(state
+                .pending_writebacks
+                .arm(id, ident(id, 4, 4, 3), 4, 4, 3)
+                .is_none());
+        }
+        assert_eq!(state.pending_writebacks.len(), 3);
+        submit_surface_stores(&mut state, &mut host);
+        assert_eq!(state.pending_writebacks.len(), 1);
+        assert!(state.pending_writebacks.get_gva(key).is_some());
     }
 
     /// The pages an owed GVA plane covers are what the reach alarm compares a
