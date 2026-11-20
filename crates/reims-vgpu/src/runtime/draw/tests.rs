@@ -1134,6 +1134,7 @@ fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderRefl
         tessellation: None,
         imageblock_layouts: vec![],
         implicit_imageblock_attachments: vec![],
+        texture_raster_order_groups: vec![],
         fragment_imageblock: None,
         datalayout: None,
         runtime_sampler_specializations: vec![],
@@ -8214,12 +8215,8 @@ fn float_write_shape() -> metal2vulkan::meta::TextureShape {
 #[cfg(feature = "backend-vulkan")]
 fn storage_shader(
     reflection: metal2vulkan::reflect::ShaderReflection,
-    raster_order: crate::runtime::m2v_cache::TextureRasterOrder,
 ) -> crate::runtime::m2v_cache::CachedShader {
-    let mut shader =
-        crate::runtime::m2v_cache::CachedShader::new(Vec::new(), std::sync::Arc::new(reflection));
-    shader.raster_order = raster_order;
-    shader
+    crate::runtime::m2v_cache::CachedShader::new(Vec::new(), std::sync::Arc::new(reflection))
 }
 
 /// What the fragment storage rail cannot bind is refused by name, before any
@@ -8230,7 +8227,7 @@ fn storage_shader(
 #[test]
 fn fragment_storage_admission_names_each_refusal() {
     use crate::backend::vulkan::engine::DrawPreparationDecline as D;
-    use crate::runtime::m2v_cache::TextureRasterOrder;
+    use metal2vulkan::passes::FragmentInterlock;
     use metal2vulkan::reflect::ResourceAccess;
 
     const BINDING: u32 = 600;
@@ -8248,11 +8245,14 @@ fn fragment_storage_admission_names_each_refusal() {
         )
     };
 
-    let admitted = storage_shader(storage(), TextureRasterOrder::None);
-    assert_eq!(admit_fragment_storage_textures(&admitted, &bound), Ok(()));
+    let admitted = storage_shader(storage());
+    assert_eq!(
+        admit_fragment_storage_textures(&admitted, &bound, 1),
+        Ok(())
+    );
 
     assert_eq!(
-        admit_fragment_storage_textures(&admitted, &[]),
+        admit_fragment_storage_textures(&admitted, &[], 1),
         Err(D::StorageTextureUnbound {
             index: 1,
             binding: BINDING
@@ -8260,25 +8260,35 @@ fn fragment_storage_admission_names_each_refusal() {
         "a statically used storage texture with nothing bound"
     );
 
-    let ordered = storage_shader(storage(), TextureRasterOrder::Ordered(vec![1].into()));
+    let mut reflection = storage();
+    reflection.texture_raster_order_groups.push((1, 7));
+    let mut ordered = storage_shader(reflection);
     assert_eq!(
-        admit_fragment_storage_textures(&ordered, &bound),
+        admit_fragment_storage_textures(&ordered, &bound, 1),
         Err(D::RasterOrderedTextureUnsupported { index: 1 })
     );
-    let unreadable = storage_shader(storage(), TextureRasterOrder::Unreadable);
+    ordered.fragment_interlock = Some(FragmentInterlock::Sample);
+    assert_eq!(admit_fragment_storage_textures(&ordered, &bound, 1), Ok(()));
     assert_eq!(
-        admit_fragment_storage_textures(&unreadable, &bound),
-        Err(D::RasterOrderedTextureUnsupported { index: u32::MAX })
+        admit_fragment_storage_textures(&ordered, &bound, 4),
+        Err(D::RasterOrderedTextureMultisample {
+            index: 1,
+            raster_samples: 4
+        })
     );
+    ordered.fragment_interlock = Some(FragmentInterlock::Pixel);
+    assert_eq!(admit_fragment_storage_textures(&ordered, &bound, 4), Ok(()));
 
     let mut cube = float_write_shape();
     cube.dimension = metal2vulkan::meta::TextureDimension::Cube;
-    let cube = storage_shader(
-        fragment_texture_reflection(1, BINDING, cube, Some(ResourceAccess::Storage)),
-        TextureRasterOrder::None,
-    );
+    let cube = storage_shader(fragment_texture_reflection(
+        1,
+        BINDING,
+        cube,
+        Some(ResourceAccess::Storage),
+    ));
     assert_eq!(
-        admit_fragment_storage_textures(&cube, &bound),
+        admit_fragment_storage_textures(&cube, &bound, 1),
         Err(D::TextureDimensionUnsupported {
             stage: "fragment",
             index: 1,
@@ -8288,12 +8298,14 @@ fn fragment_storage_admission_names_each_refusal() {
         })
     );
 
-    let unclassified = storage_shader(
-        fragment_texture_reflection(1, BINDING, float_write_shape(), None),
-        TextureRasterOrder::None,
-    );
+    let unclassified = storage_shader(fragment_texture_reflection(
+        1,
+        BINDING,
+        float_write_shape(),
+        None,
+    ));
     assert_eq!(
-        admit_fragment_storage_textures(&unclassified, &bound),
+        admit_fragment_storage_textures(&unclassified, &bound, 1),
         Err(D::TextureAccessUnsupported {
             stage: "fragment",
             index: 1,
@@ -8303,16 +8315,17 @@ fn fragment_storage_admission_names_each_refusal() {
         })
     );
 
-    // A shader with no storage texture is not asked about raster order at all:
-    // the reading is only taken for shaders that store.
+    // Ordinary sampled textures remain outside storage admission.
     let mut sampled_shape = float_write_shape();
     sampled_shape.writable = false;
     sampled_shape.storage_format = None;
-    let sampled = storage_shader(
-        fragment_texture_reflection(1, 33, sampled_shape, Some(ResourceAccess::Sampled)),
-        TextureRasterOrder::Unreadable,
-    );
-    assert_eq!(admit_fragment_storage_textures(&sampled, &[]), Ok(()));
+    let sampled = storage_shader(fragment_texture_reflection(
+        1,
+        33,
+        sampled_shape,
+        Some(ResourceAccess::Sampled),
+    ));
+    assert_eq!(admit_fragment_storage_textures(&sampled, &[], 1), Ok(()));
 }
 
 /// Write a single-level linear texture of `format` into task 1's object list at
@@ -8378,7 +8391,7 @@ fn a_fragment_storage_texture_resolves_to_its_colour_resident() {
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
     assert!(state.set_object_list(1, 0, 256));
-    let (tex_ref, w, h, bpr) = (199u32, 480u32, 64u32, 1920u32);
+    let (tex_ref, w, h, bpr) = (199u32, 2u32, 2u32, 12u32);
     let gva = put_linear_texture(
         &mut state,
         &mut host,
@@ -8386,6 +8399,8 @@ fn a_fragment_storage_texture_resolves_to_its_colour_resident() {
         (w, h, bpr),
         MTL_FORMAT_RGBA8_UNORM,
     );
+    let native = (0..24).collect::<Vec<u8>>();
+    write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &native);
     let reflection = fragment_texture_reflection(
         2,
         BINDING,
@@ -8439,7 +8454,10 @@ fn a_fragment_storage_texture_resolves_to_its_colour_resident() {
         ImageFormat::Rgba8Unorm,
         "the translator's R32f stand-in becomes the texture's own format"
     );
-    assert_eq!(bind.resource.content, StorageImageContent::Load);
+    assert_eq!(
+        bind.resource.content,
+        StorageImageContent::NativeSeed([&native[..8], &native[12..20]].concat().into())
+    );
     assert!(matches!(bind.store, FragmentStorageStore::Gva { .. }));
     assert_eq!(bind.color.target_gva, gva);
 

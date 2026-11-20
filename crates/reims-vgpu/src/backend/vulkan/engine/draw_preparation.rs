@@ -165,15 +165,14 @@ pub enum DrawPreparationDecline {
         format: u16,
         detail: &'static str,
     },
-    /// A fragment shader stores through a texture argument that declares
-    /// `[[raster_order_group(n)]]`, or whose raster order could not be read.
-    ///
-    /// The group orders overlapping fragments' accesses, which Vulkan spells as
-    /// a fragment-shader interlock; the translated module carries none, so it
-    /// would run the stores unordered. `index` is the Metal texture index, or
-    /// `u32::MAX` when the metadata was unreadable.
+    /// No ordered interlock feature was enabled for this translation.
     RasterOrderedTextureUnsupported {
         index: u32,
+    },
+    /// Sample-scope ordering is not pixel ordering on a multisampled target.
+    RasterOrderedTextureMultisample {
+        index: u32,
+        raster_samples: u32,
     },
     /// A valid reflected resource needs a runtime provisioning path this
     /// backend does not implement. Treating its index as an ordinary stream
@@ -343,6 +342,9 @@ impl Decline for DrawPreparationDecline {
             Self::StorageTextureUnbound { .. } => "draw_prepare_storage_texture_unbound",
             Self::StorageTextureUnresolved { .. } => "draw_prepare_storage_texture_unresolved",
             Self::StorageTextureFormat { .. } => "draw_prepare_storage_texture_format",
+            Self::RasterOrderedTextureMultisample { .. } => {
+                "draw_prepare_raster_ordered_texture_sample_interlock_multisample"
+            }
             Self::RasterOrderedTextureUnsupported { .. } => {
                 "draw_prepare_raster_ordered_texture_unsupported"
             }
@@ -603,6 +605,13 @@ impl Decline for DrawPreparationDecline {
                 ("texture_ref", texture_ref.to_string()),
                 ("format", format!("{format:#x}")),
                 ("detail", (*detail).to_string()),
+            ],
+            Self::RasterOrderedTextureMultisample {
+                index,
+                raster_samples,
+            } => vec![
+                ("index", index.to_string()),
+                ("raster_samples", raster_samples.to_string()),
             ],
             Self::RasterOrderedTextureUnsupported { index } => {
                 vec![("index", index.to_string())]
@@ -888,6 +897,10 @@ mod tests {
                 detail: "no_storage_selector",
             },
             DrawPreparationDecline::RasterOrderedTextureUnsupported { index: 2 },
+            DrawPreparationDecline::RasterOrderedTextureMultisample {
+                index: 2,
+                raster_samples: 4,
+            },
             DrawPreparationDecline::ReflectedResourceUnsupported {
                 stage: "fragment",
                 index: 2,
@@ -982,7 +995,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 40, "the draw-preparation reason census moved");
+        assert_eq!(before, 41, "the draw-preparation reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-preparation slug");
     }
 

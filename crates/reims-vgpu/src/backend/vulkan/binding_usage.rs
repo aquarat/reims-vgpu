@@ -336,6 +336,7 @@ mod tests {
             tessellation: None,
             imageblock_layouts: vec![],
             implicit_imageblock_attachments: vec![],
+            texture_raster_order_groups: vec![],
             fragment_imageblock: None,
             datalayout: None,
             descriptor_layout: Default::default(),

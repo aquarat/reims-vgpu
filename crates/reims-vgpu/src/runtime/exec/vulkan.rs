@@ -89,11 +89,13 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
+            None,
         ) & f_air.is_none_or(|f_air| {
             crate::runtime::m2v_cache::ensure_cached_async(
                 f_air,
                 metal2vulkan::passes::Stage::Fragment,
                 pipeline_ref,
+                crate::backend::vulkan::engine::fragment_interlock(),
             )
         });
         note_preflight_part(
@@ -163,12 +165,14 @@ fn publish_render_usage<M: HostMemory + HostOps>(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
+            None,
         ),
         match f_air {
             Some(f_air) => crate::runtime::m2v_cache::translate_cached_reflected(
                 f_air,
                 metal2vulkan::passes::Stage::Fragment,
                 pipeline_ref,
+                crate::backend::vulkan::engine::fragment_interlock(),
             ),
             None => Ok(crate::backend::vulkan::pipeline_resolve::null_fragment()),
         },

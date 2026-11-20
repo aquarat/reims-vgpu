@@ -297,6 +297,7 @@ pub(crate) fn retained_pipeline_with_desc_for_test(
             tessellation: None,
             imageblock_layouts: vec![],
             implicit_imageblock_attachments: vec![],
+            texture_raster_order_groups: vec![],
             fragment_imageblock: None,
             datalayout: None,
             runtime_sampler_specializations: vec![],
@@ -373,6 +374,7 @@ pub(crate) fn null_fragment() -> Arc<CachedShader> {
             tessellation: None,
             imageblock_layouts: vec![],
             implicit_imageblock_attachments: vec![],
+            texture_raster_order_groups: vec![],
             fragment_imageblock: None,
             datalayout: None,
             runtime_sampler_specializations: vec![],
@@ -747,6 +749,7 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
         v_air,
         metal2vulkan::passes::Stage::Vertex,
         pipeline_ref,
+        None,
     )
     .map_err(|reason| DrawPreparationDecline::VertexTranslate {
         pipeline_ref,
@@ -757,6 +760,7 @@ fn resolve_uncached_inner<M: HostMemory + HostOps>(
             f_air,
             metal2vulkan::passes::Stage::Fragment,
             pipeline_ref,
+            crate::backend::vulkan::engine::fragment_interlock(),
         )
         .map_err(|reason| DrawPreparationDecline::FragmentTranslate {
             pipeline_ref,

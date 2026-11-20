@@ -4522,6 +4522,74 @@ fn a_fragment_storage_write_lands_in_the_textures_resident_and_orders_after_the_
     assert_storage_center("second store", &identity, second);
 }
 
+/// 32 overlapping single-sample fragments increment the same half-float texel.
+/// A nonzero native seed tests the transfer into the interlock too: neither a
+/// clear nor a clamped eight-bit conversion can produce the expected value.
+#[test]
+fn overlapping_fragment_texture_updates_preserve_the_native_seed() {
+    let _guard = engine_test_session();
+    let Some(scope) = engine::fragment_interlock() else {
+        eprintln!("SKIP ordered fragment updates: no ordered interlock");
+        return;
+    };
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @f(ptr addrspace(1) %dst) {
+entry:
+  %r = call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %dst, <2 x i32> zeroinitializer, i32 0, i32 3)
+  %old = extractvalue { <4 x float>, i8 } %r, 0
+  %next = fadd <4 x float> %old, <float 0.0625, float 0.0625, float 0.0625, float 0.0625>
+  call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dst, <2 x i32> zeroinitializer, <4 x float> %next, i32 0, i32 2)
+  ret void
+}
+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.raster_order_group", i32 2, !"air.arg_type_name", !"texture2d<float, read_write>"}
+"#;
+    let tmp = std::env::temp_dir().join(format!("ordered-update-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let bytes = metal2vulkan::translate_sanitized_native_with_options(
+        ll,
+        Stage::Fragment,
+        &tmp,
+        metal2vulkan::passes::TransformOptions {
+            fragment_interlock: scope,
+            ..Default::default()
+        },
+    )
+    .expect("ordered shader");
+    std::fs::remove_dir_all(tmp).unwrap();
+    let mut words = bytes
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    use reims_vgpu::runtime::spirv_bind::{specialize_image_formats, ImageFormat};
+    specialize_image_formats(
+        &mut words,
+        &[(STORAGE_TEST_BINDING, ImageFormat::Rgba16Float)],
+    )
+    .unwrap();
+    let (v, _) = triangle_spirv();
+    let identity = host_only_storage_texture(1, 1);
+    // IEEE binary16 0xbe00 = -1.5. After 32 increments the result is +0.5,
+    // within the range of the colour readback that checks the result.
+    let seed = [0xbe00u16.to_le_bytes(); 4].concat();
+    let mut req = storage_request(
+        &v,
+        &words,
+        &identity,
+        ash::vk::Format::R16G16B16A16_SFLOAT,
+        engine::StorageImageContent::NativeSeed(seed.into()),
+    );
+    req.instance_count = Some(32);
+    engine::execute_draw_request(engine_device(), &req).expect("ordered update");
+    assert_storage_center("ordered RMW", &identity, [0.5; 4]);
+}
+
 /// An eight-bit storage image takes the same rail, through an `Rgba8` image
 /// type over an `R8G8B8A8_UNORM` resident.
 #[test]

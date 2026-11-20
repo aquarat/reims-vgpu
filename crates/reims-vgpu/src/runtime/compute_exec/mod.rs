@@ -2912,13 +2912,9 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
             read_linear_level(
                 state,
                 host,
-                task_id,
                 texture_ref,
                 &level_window(source, span),
-                source.gva,
-                source.row_stride,
                 level_tight,
-                span.height,
                 &mut bytes[span.offset..span.offset + span.len],
             )?;
         }
@@ -2988,23 +2984,16 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
 /// against a different `gva`, `row_stride` and extent, and a loop that inlined
 /// this would have been the place where level `n` was read with level 0's
 /// stride.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a level is its own window, gva, stride, extent and destination, and \
-              collapsing them into a struct here would hide which of them a caller varies"
-)]
-fn read_linear_level<M: HostMemory + HostOps>(
+pub(crate) fn read_linear_level<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    task_id: u32,
     texture_ref: u32,
     window: &crate::runtime::surface_cache::LinearWindow,
-    gva: u64,
-    row_stride: u64,
     tight: usize,
-    height: u32,
     dst: &mut [u8],
 ) -> Result<(), ComputeStatus> {
+    let (task_id, gva, row_stride, height) =
+        (window.task_id, window.gva, window.row_stride, window.height);
     if let Some(cached) = crate::runtime::surface_cache::get_linear_texture(state, window) {
         if cached.len() == dst.len() {
             dst.copy_from_slice(cached);

@@ -6738,7 +6738,7 @@ pub(super) fn color_target_identity<M: HostMemory + HostOps>(
 ///
 /// Asked of the whole module rather than per bind, because two of the answers
 /// are about the module: an unclassified texture, and a raster-order group the
-/// translated module does not honour. The other two — a shape no colour
+/// device cannot honour at this sample count. The other two — a shape no colour
 /// resident can stand for, and a statically used storage texture the draw left
 /// unbound — are per texture, and asked here so that no neutral sampled image
 /// can be put where a storage one belongs (the unbound-texture repair below
@@ -6746,6 +6746,7 @@ pub(super) fn color_target_identity<M: HostMemory + HostOps>(
 pub(super) fn admit_fragment_storage_textures(
     shader: &crate::runtime::m2v_cache::CachedShader,
     textures: &[TextureBind],
+    raster_samples: u32,
 ) -> Result<(), DrawPreparationDecline> {
     let reflection = &shader.reflection;
     if let Some((index, descriptor)) =
@@ -6763,26 +6764,19 @@ pub(super) fn admit_fragment_storage_textures(
             access: "unknown",
         });
     }
-    let mut storage = crate::runtime::spirv_bind::reflected_storage_textures(reflection).peekable();
-    if storage.peek().is_none() {
-        return Ok(());
-    }
-    // Any ordered texture refuses, not only a storage one: Metal admits the
-    // qualifier on a writable texture alone, so one on another texture is a
-    // reading this device did not expect and must not run past.
-    match &shader.raster_order {
-        crate::runtime::m2v_cache::TextureRasterOrder::None => {}
-        crate::runtime::m2v_cache::TextureRasterOrder::Ordered(indices) => {
-            return Err(DrawPreparationDecline::RasterOrderedTextureUnsupported {
-                index: indices.first().copied().unwrap_or(u32::MAX),
-            });
-        }
-        crate::runtime::m2v_cache::TextureRasterOrder::Unreadable => {
-            return Err(DrawPreparationDecline::RasterOrderedTextureUnsupported {
-                index: u32::MAX,
-            });
+    if let Some(&(index, _)) = reflection.texture_raster_order_groups.first() {
+        match shader.fragment_interlock {
+            None => return Err(DrawPreparationDecline::RasterOrderedTextureUnsupported { index }),
+            Some(metal2vulkan::passes::FragmentInterlock::Sample) if raster_samples != 1 => {
+                return Err(DrawPreparationDecline::RasterOrderedTextureMultisample {
+                    index,
+                    raster_samples,
+                });
+            }
+            Some(_) => {}
         }
     }
+    let storage = crate::runtime::spirv_bind::reflected_storage_textures(reflection);
     for (index, descriptor) in storage {
         let texture_ref = textures
             .iter()
@@ -6849,8 +6843,8 @@ pub(super) enum FragmentStorageStore {
 /// the draw stores into the same image a pass rendering into this texture
 /// writes and a later sample of it reads. A storage write keeps every texel the
 /// shader leaves alone, so the image is a load: a guest-backed resident must
-/// already hold the texture (the engine refuses one that does not), and a
-/// host-only one that holds nothing starts at zero.
+/// already hold the texture or be seeded from its native texels. A host-only
+/// resident that holds nothing starts at zero.
 ///
 /// The format is specialized as the compute rail specializes it — the
 /// translator names a stand-in (`R32f` for `texture2d<float, write>`), and the
@@ -6981,8 +6975,19 @@ pub(super) fn resolve_fragment_storage_texture<M: HostMemory + HostOps>(
             FragmentStorageStore::Surface,
         )
     } else {
+        let window = crate::runtime::surface_cache::LinearWindow {
+            task_id,
+            texture_ref,
+            gva: rt.target_gva,
+            pixel_format: rt.format,
+            width: rt.width,
+            height: rt.height,
+            row_stride: u64::from(rt.row_stride),
+        };
+        let content =
+            linear_storage_content(state, host, &window, &identity).map_err(unresolved)?;
         (
-            crate::backend::vulkan::engine::StorageImageContent::Load,
+            content,
             FragmentStorageStore::Gva {
                 pages: super::sync_store_target_pages(state, host, task_id, &color),
             },
@@ -7000,6 +7005,59 @@ pub(super) fn resolve_fragment_storage_texture<M: HostMemory + HostOps>(
         color,
         store,
     })
+}
+
+/// An ordered read/modify/write needs the *native* texels. A ready image is
+/// not evidence of currency: use the same guest-write witness/debt test as a
+/// GVA attachment LOAD. Otherwise read the resolved level's tight native rows.
+fn linear_storage_content<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    w: &crate::runtime::surface_cache::LinearWindow,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+) -> Result<crate::backend::vulkan::engine::StorageImageContent, &'static str> {
+    use crate::backend::vulkan::engine::StorageImageContent;
+    let span = GvaSpan {
+        texture_ref: w.texture_ref,
+        gva: w.gva,
+        row_stride: u32::try_from(w.row_stride).map_err(|_| "stride_overflow")?,
+        width: w.width,
+        height: w.height,
+        format: w.pixel_format,
+    };
+    if gva_resident_if_current(state, host, w.task_id, span)
+        .is_ok_and(|current| &current == identity)
+    {
+        return Ok(StorageImageContent::Load);
+    }
+    // If the newer bytes exist only in a GPU allocation, guest pages cannot seed it.
+    if crate::backend::vulkan::gva_window(identity).is_some_and(|window| {
+        crate::runtime::writeback_debt::gva_resident_authoritative(state, window)
+    }) || crate::runtime::surface_cache::linear_texture_resident_gen(state, w).is_some()
+    {
+        return Err("native_storage_seed_not_materialized");
+    }
+    let tight = pixel_format::tight_row_bytes(w.width, w.pixel_format)
+        .ok_or("native_storage_seed_format")? as usize;
+    let len = tight
+        .checked_mul(w.height as usize)
+        .filter(|n| *n <= isize::MAX as usize)
+        .ok_or("native_storage_seed_extent")?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| "native_storage_seed_allocation")?;
+    bytes.resize(len, 0);
+    crate::runtime::compute_exec::read_linear_level(
+        state,
+        host,
+        w.texture_ref,
+        w,
+        tight,
+        &mut bytes,
+    )
+    .map_err(|_| "native_storage_seed_read")?;
+    Ok(StorageImageContent::NativeSeed(bytes.into()))
 }
 
 /// Land what a draw stored into its fragment storage textures where the guest
@@ -7564,7 +7622,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         ));
     }
-    admit_fragment_storage_textures(&f_shader, &req.fragment_textures)
+    admit_fragment_storage_textures(&f_shader, &req.fragment_textures, pipeline_sample_count)
         .map_err(DrawError::DrawPreparation)?;
     for (stage, expected_stage, shader) in [
         (

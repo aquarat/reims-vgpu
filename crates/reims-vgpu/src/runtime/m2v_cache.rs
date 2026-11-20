@@ -7,7 +7,7 @@
 //! for `pmap_flush_tlbs` **IPI timeout** panics (WindowServer in
 //! `processExecIndirect` / `submitOnChannel`).
 //!
-//! The cache key is the AIR blob itself plus its stage — not the pipeline object
+//! The cache key is the AIR blob, stage and target specialization — not the pipeline object
 //! id, which recycles, and not a hash of the AIR, which can collide. A content
 //! hash narrows the bucket and `Slot::is` decides the hit; `ShaderId` carries
 //! the argument for why the digest is not allowed to.
@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use metal2vulkan::passes::Stage;
+use metal2vulkan::passes::{FragmentInterlock, Stage};
 use metal2vulkan::reflect::ShaderReflection;
 
 use crate::observe::Decline;
@@ -32,23 +32,6 @@ type StorageSpecializationKey = (
     Vec<(u32, crate::runtime::spirv_bind::ImageFormat)>,
 );
 
-/// What this device knows about `[[raster_order_group(n)]]` on a fragment
-/// shader's texture arguments — see
-/// [`crate::runtime::spirv_bind::raster_ordered_texture_indices`] for why the
-/// device reads it itself.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum TextureRasterOrder {
-    /// The Metal texture indices that declare a raster order group. Empty for
-    /// every shader the question was not asked of: one with no storage texture
-    /// cannot store through an ordered texture.
-    #[default]
-    None,
-    /// These texture indices declare one.
-    Ordered(Arc<[u32]>),
-    /// The metadata could not be read back, so the answer is unknown and a
-    /// storage draw with this shader is refused rather than run unordered.
-    Unreadable,
-}
 type M2vResult<T> = Result<T, M2vCacheDecline>;
 
 /// A specific failure while caching, translating, or post-processing AIR.
@@ -305,9 +288,9 @@ pub struct CachedShader {
     /// the module and those two flags, so each variant is computed once per
     /// shader lifetime instead of mutating a fresh copy per draw.
     frag_reloc: Mutex<FragmentRelocationCache>,
-    /// Raster-order groups on texture arguments, read for a fragment shader
-    /// that has a storage texture. See [`TextureRasterOrder`].
-    pub raster_order: TextureRasterOrder,
+    /// Device-enabled interlock target used for this translation. None is a
+    /// reflection-only result for ordered draws: it must never reach a pipeline.
+    pub fragment_interlock: Option<FragmentInterlock>,
     /// Fragment variants with storage-image formats specialized to the
     /// textures a draw bound. A handful per shader at most — one per distinct
     /// set of storage formats the guest binds it with — and each is the module
@@ -432,7 +415,7 @@ impl CachedShader {
             words: Arc::new(words),
             base: OnceLock::new(),
             frag_reloc: Mutex::new(HashMap::new()),
-            raster_order: TextureRasterOrder::None,
+            fragment_interlock: None,
             storage_specialized: Mutex::new(Vec::new()),
         }
     }
@@ -584,6 +567,7 @@ enum Entry {
 /// plus a relocated word copy per fragment variant, so one copy of the AIR that
 /// produced them is a fraction of the entry rather than a doubling of it.
 struct Slot {
+    interlock: Option<FragmentInterlock>,
     stage: u8,
     /// `Some` for a kernel, whose LocalSize is baked into the SPIR-V, so one
     /// AIR blob dispatched at two geometries is two shaders. `None` for a render
@@ -596,7 +580,10 @@ struct Slot {
 impl Slot {
     /// The full identity compare. This alone decides a hit.
     fn is(&self, id: ShaderId<'_>) -> bool {
-        self.stage == id.stage && self.local_size == id.local_size && *self.air == *id.air
+        self.interlock == id.interlock
+            && self.stage == id.stage
+            && self.local_size == id.local_size
+            && *self.air == *id.air
     }
 }
 
@@ -641,6 +628,7 @@ impl Slot {
 /// [`Cache::put`] takes ownership, once per distinct shader.
 #[derive(Clone, Copy)]
 struct ShaderId<'a> {
+    interlock: Option<FragmentInterlock>,
     digest: u64,
     stage: u8,
     local_size: Option<[u32; 3]>,
@@ -648,9 +636,10 @@ struct ShaderId<'a> {
 }
 
 impl<'a> ShaderId<'a> {
-    fn render(stage: Stage, air: &'a [u8]) -> Self {
+    fn render(stage: Stage, air: &'a [u8], interlock: Option<FragmentInterlock>) -> Self {
         Self {
-            digest: air_key(stage, air),
+            interlock,
+            digest: air_key(stage, air, interlock),
             stage: stage_tag(stage),
             local_size: None,
             air,
@@ -659,6 +648,7 @@ impl<'a> ShaderId<'a> {
 
     fn kernel(air: &'a [u8], local_size: [u32; 3]) -> Self {
         Self {
+            interlock: None,
             digest: air_key_kernel(air, local_size),
             stage: stage_tag(Stage::Kernel),
             local_size: Some(local_size),
@@ -690,6 +680,7 @@ impl Cache {
         match bucket.iter_mut().find(|s| s.is(id)) {
             Some(slot) => slot.entry = entry,
             None => bucket.push(Slot {
+                interlock: id.interlock,
                 stage: id.stage,
                 local_size: id.local_size,
                 air: Arc::clone(air),
@@ -722,6 +713,7 @@ impl Cache {
 }
 
 struct TranslationTask {
+    interlock: Option<FragmentInterlock>,
     stage: Stage,
     kernel_local_size: Option<[u32; 3]>,
     /// Shared with the [`Slot`] the admission filed, so the identity the worker
@@ -735,7 +727,7 @@ impl TranslationTask {
     fn id(&self) -> ShaderId<'_> {
         match self.kernel_local_size {
             Some(local_size) => ShaderId::kernel(&self.air, local_size),
-            None => ShaderId::render(self.stage, &self.air),
+            None => ShaderId::render(self.stage, &self.air, self.interlock),
         }
     }
 }
@@ -772,8 +764,13 @@ fn stage_tag(stage: Stage) -> u8 {
 /// The length is folded in as well, so two blobs of different lengths are not
 /// merely unlikely to share a bucket. That is a statement about walk length
 /// rather than about correctness.
-fn air_key(stage: Stage, air: &[u8]) -> u64 {
-    fold_air(u64::from(stage_tag(stage)), air, &[])
+fn air_key(stage: Stage, air: &[u8], interlock: Option<FragmentInterlock>) -> u64 {
+    let scope = match interlock {
+        None => 0,
+        Some(FragmentInterlock::Pixel) => 1,
+        Some(FragmentInterlock::Sample) => 2,
+    };
+    fold_air((scope << 8) | u64::from(stage_tag(stage)), air, &[])
 }
 
 /// The bucket digest for a kernel, which includes LocalSize because the SPIR-V
@@ -914,7 +911,11 @@ fn capture_air(air: &[u8], stage: Stage, spirv: &[u8]) {
     }
 }
 
-fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
+fn translate_air(
+    air: &[u8],
+    stage: Stage,
+    interlock: Option<FragmentInterlock>,
+) -> M2vResult<CachedShader> {
     // metal2vulkan's tool boundary uses fixed scratch names inside `tmp_dir`.
     // Serialize sync and background calls so their AIR/LLVM/SPIR-V files never
     // alias one another.
@@ -930,63 +931,27 @@ fn translate_air(air: &[u8], stage: Stage) -> M2vResult<CachedShader> {
     // Reflected translate: byte-identical SPIR-V PLUS the stage-interface facade.
     // `reflection.datalayout` carries the source `target datalayout` the sanitizer
     // strips, so the post-emit ABI reconciliation below no longer re-reads `k.ll`.
-    let (spirv, reflection) =
-        metal2vulkan::translate_reflected(path.to_str().unwrap_or(name), stage, &tmp).map_err(
-            |e| {
-                // A translation that failed produced no module: captured with
-                // a word count of zero, which is what a failure handover needs.
-                capture_air(air, stage, &[]);
-                translate_decline(stage, e.to_string())
-            },
-        )?;
+    let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
+        path.to_str().unwrap_or(name),
+        stage,
+        &tmp,
+        metal2vulkan::passes::TransformOptions {
+            // Even an unsupported target needs exact resource reflection for admission.
+            // Never produce an unordered substitute; the draw declines this case.
+            fragment_interlock: interlock.unwrap_or_default(),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| {
+        // A translation that failed produced no module: captured with
+        // a word count of zero, which is what a failure handover needs.
+        capture_air(air, stage, &[]);
+        translate_decline(stage, e.to_string())
+    })?;
     capture_air(air, stage, &spirv);
-    let raster_order = fragment_texture_raster_order(&path, &tmp, stage, &reflection);
     let mut shader = finish_translated(spirv, reflection, stage)?;
-    shader.raster_order = raster_order;
+    shader.fragment_interlock = interlock;
     Ok(shader)
-}
-
-/// Read `[[raster_order_group]]` off a fragment shader's texture arguments,
-/// when it has a storage texture that one could order.
-///
-/// A second disassembly of the AIR this call just translated, asked only of
-/// the shaders that store from the fragment stage — rare, and asked once per
-/// shader for the cache's life. The translator's reflection does not carry the
-/// qualifier for a texture, which is the whole reason this exists; see
-/// [`crate::runtime::spirv_bind::raster_ordered_texture_indices`].
-fn fragment_texture_raster_order(
-    path: &std::path::Path,
-    tmp: &std::path::Path,
-    stage: Stage,
-    reflection: &ShaderReflection,
-) -> TextureRasterOrder {
-    if !matches!(stage, Stage::Fragment)
-        || crate::runtime::spirv_bind::reflected_storage_textures(reflection)
-            .next()
-            .is_none()
-    {
-        return TextureRasterOrder::None;
-    }
-    let Some(src) = path.to_str() else {
-        return TextureRasterOrder::Unreadable;
-    };
-    match metal2vulkan::tools::air_to_sanitized_ll(src, tmp) {
-        Ok(ll) => {
-            let ordered = crate::runtime::spirv_bind::raster_ordered_texture_indices(&ll);
-            if ordered.is_empty() {
-                TextureRasterOrder::None
-            } else {
-                TextureRasterOrder::Ordered(ordered.into())
-            }
-        }
-        Err(detail) => {
-            crate::observe::fail(format!(
-                "m2v_raster_order reason=disassembly_failed detail={}",
-                log_token(&detail)
-            ));
-            TextureRasterOrder::Unreadable
-        }
-    }
 }
 
 fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedShader> {
@@ -1093,8 +1058,18 @@ fn repair_layout(
 /// sole FIFO scheduler. Returns true when the content is already resolved
 /// (success or deterministic failure), false while the background worker owns
 /// it. Callers keep the guest packet at the channel head and retry on poll.
-pub fn ensure_cached_async(air: &[u8], stage: Stage, pipeline_ref: u32) -> bool {
-    ensure_cached_async_keyed(ShaderId::render(stage, air), stage, None, pipeline_ref)
+pub fn ensure_cached_async(
+    air: &[u8],
+    stage: Stage,
+    pipeline_ref: u32,
+    interlock: Option<FragmentInterlock>,
+) -> bool {
+    ensure_cached_async_keyed(
+        ShaderId::render(stage, air, interlock),
+        stage,
+        None,
+        pipeline_ref,
+    )
 }
 
 /// Kernel counterpart to [`ensure_cached_async`]. LocalSize is part of both
@@ -1147,6 +1122,7 @@ fn ensure_cached_async_keyed(
         c.put(id, &air, Entry::Loading);
         c.misses = c.misses.saturating_add(1);
         c.async_queue.push_back(TranslationTask {
+            interlock: id.interlock,
             stage,
             kernel_local_size,
             air,
@@ -1205,7 +1181,7 @@ fn async_worker() {
         };
         let result = match task.kernel_local_size {
             Some(local_size) => translate_kernel_air(&task.air, local_size),
-            None => translate_air(&task.air, task.stage),
+            None => translate_air(&task.air, task.stage, task.interlock),
         };
         let (hits, misses, detail, failure) = {
             let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1323,8 +1299,9 @@ pub fn translate_cached_reflected(
     air: &[u8],
     stage: Stage,
     pipeline_ref: u32,
+    interlock: Option<FragmentInterlock>,
 ) -> M2vResult<Arc<CachedShader>> {
-    let id = ShaderId::render(stage, air);
+    let id = ShaderId::render(stage, air, interlock);
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         match c.find(id).cloned() {
@@ -1359,7 +1336,7 @@ pub fn translate_cached_reflected(
         }
     }
 
-    let shader = Arc::new(translate_air(air, stage)?);
+    let shader = Arc::new(translate_air(air, stage, id.interlock)?);
 
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1468,6 +1445,23 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[test]
+    fn ordered_scopes_are_distinct_even_on_a_digest_collision() {
+        let air: Arc<[u8]> = Arc::from(&b"fragment"[..]);
+        let mut cache = Cache::default();
+        for scope in [
+            None,
+            Some(FragmentInterlock::Sample),
+            Some(FragmentInterlock::Pixel),
+        ] {
+            let mut id = ShaderId::render(Stage::Fragment, &air, scope);
+            id.digest = 0;
+            assert!(cache.find(id).is_none());
+            cache.put(id, &air, Entry::Loading);
+        }
+        assert_eq!(cache.len(), 3);
+    }
+
     /// The detector fires when one ref is translated under two identities, and
     /// stays silent when the same one is asked for twice.
     ///
@@ -1487,8 +1481,8 @@ mod tests {
         // A ref no other test in this process uses, so the map's own state is
         // this test's.
         const REF: u32 = 0xD1FF_0001;
-        let a = ShaderId::render(Stage::Fragment, b"air-one");
-        let b = ShaderId::render(Stage::Fragment, b"air-two-longer");
+        let a = ShaderId::render(Stage::Fragment, b"air-one", None);
+        let b = ShaderId::render(Stage::Fragment, b"air-two-longer", None);
         assert_ne!(a.digest, b.digest, "the fixture needs two identities");
 
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
@@ -1637,6 +1631,7 @@ mod tests {
                 tessellation: None,
                 imageblock_layouts: vec![],
                 implicit_imageblock_attachments: vec![],
+                texture_raster_order_groups: vec![],
                 fragment_imageblock: None,
                 datalayout: None,
                 descriptor_layout: DescriptorLayout::default(),
@@ -1707,6 +1702,7 @@ mod tests {
                 tessellation: None,
                 imageblock_layouts: vec![],
                 implicit_imageblock_attachments: vec![],
+                texture_raster_order_groups: vec![],
                 fragment_imageblock: None,
                 datalayout: None,
                 descriptor_layout: DescriptorLayout::default(),
@@ -1835,9 +1831,18 @@ mod tests {
     #[test]
     fn air_key_differs_by_stage_and_bytes() {
         let a = b"same-air-bytes";
-        assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Fragment, a));
-        assert_ne!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, b"other"));
-        assert_eq!(air_key(Stage::Vertex, a), air_key(Stage::Vertex, a));
+        assert_ne!(
+            air_key(Stage::Vertex, a, None),
+            air_key(Stage::Fragment, a, None)
+        );
+        assert_ne!(
+            air_key(Stage::Vertex, a, None),
+            air_key(Stage::Vertex, b"other", None)
+        );
+        assert_eq!(
+            air_key(Stage::Vertex, a, None),
+            air_key(Stage::Vertex, a, None)
+        );
         assert_ne!(air_key_kernel(a, [16, 16, 1]), air_key_kernel(a, [8, 8, 1]));
     }
 
@@ -1911,7 +1916,7 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"air-whose-scratch-write-failed";
-        let id = ShaderId::render(Stage::Vertex, air);
+        let id = ShaderId::render(Stage::Vertex, air, None);
         let stored = M2vCacheDecline::VertexScratchWrite {
             detail: "No space left on device".to_string(),
         };
@@ -1923,12 +1928,12 @@ mod tests {
         // The admission still resolves, so the guest packet advances rather
         // than re-polling a translation that keeps failing.
         assert!(
-            ensure_cached_async(air, Stage::Vertex, 7),
+            ensure_cached_async(air, Stage::Vertex, 7, None),
             "a stored failure must resolve the ask, or the packet never advances"
         );
 
         // This draw gets the real reason, unchanged.
-        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7, None) else {
             panic!("a stored failure still fails its draw");
         };
         assert_eq!(err, stored);
@@ -1961,15 +1966,15 @@ mod tests {
 
         let first = b"the-air-that-got-there-first";
         let second = b"a-different-shader-entirely";
-        let id = ShaderId::render(Stage::Vertex, first);
+        let id = ShaderId::render(Stage::Vertex, first, None);
         // The second identity, forced into the first one's bucket. Everything
         // but `digest` is the second shader's own.
         let collided = ShaderId {
             digest: id.digest,
-            ..ShaderId::render(Stage::Vertex, second)
+            ..ShaderId::render(Stage::Vertex, second, None)
         };
         assert_ne!(
-            ShaderId::render(Stage::Vertex, second).digest,
+            ShaderId::render(Stage::Vertex, second, None).digest,
             id.digest,
             "the two blobs do not collide naturally; the bucket below is forced"
         );
@@ -2022,7 +2027,7 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"air-that-cannot-be-translated";
-        let id = ShaderId::render(Stage::Vertex, air);
+        let id = ShaderId::render(Stage::Vertex, air, None);
         let stored = M2vCacheDecline::VertexTranslate {
             detail: "unsupported instruction".to_string(),
         };
@@ -2031,7 +2036,7 @@ mod tests {
             .unwrap()
             .put(id, &Arc::from(&air[..]), Entry::Failed(stored.clone()));
 
-        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7) else {
+        let Err(err) = translate_cached_reflected(air, Stage::Vertex, 7, None) else {
             panic!("an untranslatable module still fails its draw");
         };
         assert_eq!(err, stored);
@@ -2081,13 +2086,13 @@ mod tests {
             let mut c = global().lock().unwrap();
             // fake SPIR-V magic-ish
             c.put(
-                ShaderId::render(Stage::Vertex, air),
+                ShaderId::render(Stage::Vertex, air, None),
                 &Arc::from(&air[..]),
                 Entry::Ready(synth_shader(Stage::Vertex, vec![0x03, 0x02, 0x23, 0x07])),
             );
         }
         // One hit total, carrying the bytes plus the (empty) reflection.
-        let shader = translate_cached_reflected(air, Stage::Vertex, 99).expect("hit");
+        let shader = translate_cached_reflected(air, Stage::Vertex, 99, None).expect("hit");
         assert_eq!(shader.spirv, vec![0x03, 0x02, 0x23, 0x07]);
         assert!(shader.reflection.vertex_builtins.is_none());
         let (hits, misses, n) = stats();
@@ -2116,12 +2121,12 @@ mod tests {
         let _guard = test_lock();
         reset_for_test();
         let air = b"synthetic-async-cache-state";
-        let id = ShaderId::render(Stage::Fragment, air);
+        let id = ShaderId::render(Stage::Fragment, air, None);
         {
             let mut c = global().lock().unwrap();
             c.put(id, &Arc::from(&air[..]), Entry::Loading);
         }
-        assert!(!ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(!ensure_cached_async(air, Stage::Fragment, 7, None));
         assert!(global().lock().unwrap().async_queue.is_empty());
 
         global().lock().unwrap().put(
@@ -2131,11 +2136,11 @@ mod tests {
                 detail: "synthetic failure".into(),
             }),
         );
-        assert!(ensure_cached_async(air, Stage::Fragment, 7));
+        assert!(ensure_cached_async(air, Stage::Fragment, 7, None));
         assert_eq!(
             // `.err()` rather than `unwrap_err()`: the success arm is an
             // `Arc<CachedShader>`, which carries no `Debug`.
-            translate_cached_reflected(air, Stage::Fragment, 7)
+            translate_cached_reflected(air, Stage::Fragment, 7, None)
                 .err()
                 .expect("a Failed entry translates to its decline"),
             M2vCacheDecline::FragmentTranslate {
@@ -2159,7 +2164,7 @@ mod tests {
         {
             let mut c = global().lock().unwrap();
             c.put(
-                ShaderId::render(Stage::Fragment, &hot),
+                ShaderId::render(Stage::Fragment, &hot, None),
                 &Arc::from(&hot[..]),
                 Entry::Ready(synth_shader(Stage::Fragment, vec![1, 2, 3, 4])),
             );
@@ -2170,13 +2175,13 @@ mod tests {
             let air = format!("cold-shader-{i}").into_bytes();
             let mut c = global().lock().unwrap();
             c.put(
-                ShaderId::render(Stage::Fragment, &air),
+                ShaderId::render(Stage::Fragment, &air, None),
                 &Arc::from(&air[..]),
                 Entry::Ready(synth_shader(Stage::Fragment, vec![0, 0, 0, 0])),
             );
         }
         assert!(
-            ensure_cached_async(&hot, Stage::Fragment, 1),
+            ensure_cached_async(&hot, Stage::Fragment, 1, None),
             "the first-compiled shader is still resolved after 1024 later ones"
         );
         assert_eq!(

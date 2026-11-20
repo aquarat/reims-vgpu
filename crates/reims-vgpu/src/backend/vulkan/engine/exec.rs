@@ -2067,6 +2067,25 @@ fn validate_storage_images(req: &DrawRequest) -> Result<(), DrawError> {
                 DrawValidationDecline::StorageImageZeroGeometry { binding },
             ));
         }
+        if let super::types::StorageImageContent::NativeSeed(bytes) = &image.content {
+            let expected = crate::backend::vulkan::translate::pixel::bytes_per_texel(image.format)
+                .and_then(|bpp| {
+                    reims_vgpu_protocol::extent::tight_image_bytes(
+                        image.identity.width(),
+                        image.identity.height(),
+                        bpp as usize,
+                    )
+                });
+            if expected != Some(bytes.len()) {
+                return Err(DrawError::DrawValidation(
+                    DrawValidationDecline::StorageImageSeedSize {
+                        binding,
+                        actual: bytes.len(),
+                        expected,
+                    },
+                ));
+            }
+        }
         if descriptor_binding_claimed(
             req,
             (binding, 0),
@@ -4803,10 +4822,9 @@ pub(crate) unsafe fn execute_draw_inner(
         let (src_stage, src_access) = image.access.source_scope();
         let shader_stage = vk::PipelineStageFlags::FRAGMENT_SHADER;
         let shader_access = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
-        if image.clear {
-            // Nothing in the resident is this identity's, so the transition
-            // discards (`UNDEFINED`); the source scope still orders the clear
-            // after whatever last used the image.
+        if !matches!(image.init, StorageInit::Load) {
+            // Both initializers replace the whole image, including when a guest
+            // write superseded a ready resident. Still order after its last use.
             let to_clear = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(src_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -4823,13 +4841,32 @@ pub(crate) unsafe fn execute_draw_inner(
                 &[],
                 &to_clear,
             );
-            ctx.device.cmd_clear_color_image(
-                cb,
-                image.image,
-                STORAGE_IMAGE_LAYOUT,
-                &vk::ClearColorValue::default(),
-                &[super::color_subresource_range()],
-            );
+            match image.init {
+                StorageInit::Seed(buffer) => {
+                    let copy = [vk::BufferImageCopy::default()
+                        .image_subresource(super::color_subresource_layers())
+                        .image_extent(vk::Extent3D {
+                            width: image.identity.width(),
+                            height: image.identity.height(),
+                            depth: 1,
+                        })];
+                    ctx.device.cmd_copy_buffer_to_image(
+                        cb,
+                        buffer,
+                        image.image,
+                        STORAGE_IMAGE_LAYOUT,
+                        &copy,
+                    );
+                }
+                StorageInit::Clear => ctx.device.cmd_clear_color_image(
+                    cb,
+                    image.image,
+                    STORAGE_IMAGE_LAYOUT,
+                    &vk::ClearColorValue::default(),
+                    &[super::color_subresource_range()],
+                ),
+                StorageInit::Load => unreachable!("load does not initialize"),
+            }
             let to_shader = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(shader_access)
@@ -6440,9 +6477,14 @@ struct PreparedStorage {
     /// What last touched the resident, read after it was ensured — the source
     /// scope of the barrier into the shader's access.
     access: super::pools::ResidentAccess,
-    /// A host-only resident that holds nothing yet: cleared to zero before the
-    /// shader runs. See [`super::types::StorageImageContent::LoadOrClear`].
-    clear: bool,
+    /// Initialization owed before the shader can load this image.
+    init: StorageInit,
+}
+
+enum StorageInit {
+    Load,
+    Clear,
+    Seed(vk::Buffer),
 }
 
 /// Resolve every storage image of `req` to its resident, refusing — before
@@ -6513,9 +6555,14 @@ unsafe fn prepare_storage_images(
                 },
             ));
         }
-        let clear = match (ready, resource.content) {
-            (true, _) => false,
-            (false, super::types::StorageImageContent::LoadOrClear) => true,
+        let init = match (ready, &resource.content) {
+            (_, super::types::StorageImageContent::NativeSeed(bytes)) => {
+                let slot = pools.acquire_staging(ctx, bytes.len() as u64, counters)?;
+                pools.write_staging(ctx, &slot, bytes)?;
+                StorageInit::Seed(slot.buffer)
+            }
+            (true, _) => StorageInit::Load,
+            (false, super::types::StorageImageContent::LoadOrClear) => StorageInit::Clear,
             (false, super::types::StorageImageContent::Load) => {
                 return Err(DrawError::DrawExecution(
                     DrawExecutionDecline::StorageImageContentNotReady {
@@ -6534,7 +6581,7 @@ unsafe fn prepare_storage_images(
             image,
             view,
             access,
-            clear,
+            init,
         });
     }
     Ok(storage)
@@ -8170,6 +8217,25 @@ mod tests {
             Ok(()) => None,
             Err(other) => panic!("a storage-image check refuses as validation: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_storage_seed_is_sized_in_the_images_native_texels() {
+        let mut req = validatable_request();
+        let mut image = storage_image_at(600, storage_texture(7));
+        // Four-channel float16 needs eight bytes per texel, even if the host
+        // could convert this texture to four-channel unorm8 for display.
+        image.content =
+            super::super::types::StorageImageContent::NativeSeed(vec![0; 16 * 16 * 4].into());
+        req.storage_images = vec![image];
+        assert_eq!(
+            storage_refusal(&req),
+            Some(DrawValidationDecline::StorageImageSeedSize {
+                binding: 600,
+                actual: 16 * 16 * 4,
+                expected: Some(16 * 16 * 8),
+            })
+        );
     }
 
     /// A fragment storage image owns its binding against every other descriptor

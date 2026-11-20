@@ -252,6 +252,8 @@ pub const VULKAN_MIN_COMPUTE_SHARED_MEMORY_BYTES: u32 = 16384;
 /// tests without a GPU, and consumed by the two spots that need ash types.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceFeatures {
+    /// Strongest ordered scope enabled on this device.
+    pub fragment_interlock: Option<metal2vulkan::passes::FragmentInterlock>,
     /// Defined bounds-clamped behaviour for out-of-range shader buffer access.
     /// The one feature the spec requires every implementation to support.
     pub robust_buffer_access: bool,
@@ -767,6 +769,15 @@ impl DeviceFeatures {
         self.dynamic_polygon_mode || self.dynamic_depth_clamp
     }
 
+    pub fn enabled_fragment_interlock(
+        &self,
+    ) -> vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT<'static> {
+        use metal2vulkan::passes::FragmentInterlock::*;
+        vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default()
+            .fragment_shader_pixel_interlock(self.fragment_interlock == Some(Pixel))
+            .fragment_shader_sample_interlock(self.fragment_interlock == Some(Sample))
+    }
+
     /// 16-bit storage-buffer access, for shaders that pack half-precision data.
     pub fn enabled_16bit_storage(&self) -> vk::PhysicalDevice16BitStorageFeatures<'static> {
         vk::PhysicalDevice16BitStorageFeatures::default()
@@ -790,6 +801,7 @@ impl DeviceFeatures {
     /// bitfield per layout would be denser and unreadable in a bug report.
     pub fn report_line(&self) -> String {
         let Self {
+            fragment_interlock,
             robust_buffer_access,
             sampler_anisotropy,
             max_sampler_anisotropy,
@@ -854,7 +866,7 @@ impl DeviceFeatures {
             }
         };
         format!(
-            "vk_features robust_buffer_access={robust_buffer_access} \
+            "vk_features fragment_interlock={fragment_interlock:?} robust_buffer_access={robust_buffer_access} \
              image_robustness={image_robustness:?} \
              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
              image_drm_format_modifier={image_drm_format_modifier} \
@@ -909,6 +921,9 @@ impl DeviceFeatures {
         }
         if self.image_robustness == ImageRobustness::ExtImageRobustness {
             out.push(vk::EXT_IMAGE_ROBUSTNESS_NAME.as_ptr());
+        }
+        if self.fragment_interlock.is_some() {
+            out.push(vk::EXT_FRAGMENT_SHADER_INTERLOCK_NAME.as_ptr());
         }
         if self.attachment_feedback_loop_layout {
             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
@@ -1087,6 +1102,20 @@ pub unsafe fn query(
         } else {
             false
         };
+    let fragment_interlock = if has_extension(vk::EXT_FRAGMENT_SHADER_INTERLOCK_NAME) {
+        let mut interlock = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default();
+        let mut chained = vk::PhysicalDeviceFeatures2::default().push_next(&mut interlock);
+        unsafe { instance.get_physical_device_features2(pd, &mut chained) };
+        if interlock.fragment_shader_pixel_interlock == vk::TRUE {
+            Some(metal2vulkan::passes::FragmentInterlock::Pixel)
+        } else if interlock.fragment_shader_sample_interlock == vk::TRUE {
+            Some(metal2vulkan::passes::FragmentInterlock::Sample)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let image_drm_format_modifier = has_extension(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME);
 
     // The same rule as `attachment_feedback_loop_layout` above: a structure
@@ -1131,6 +1160,7 @@ pub unsafe fn query(
         };
 
     DeviceFeatures {
+        fragment_interlock,
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
         attachment_feedback_loop_layout,
@@ -1216,6 +1246,7 @@ mod tests {
 
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
+            fragment_interlock: Some(metal2vulkan::passes::FragmentInterlock::Pixel),
             occlusion_query_precise: true,
             extended_dynamic_state: true,
             dynamic_polygon_mode: true,
@@ -1269,6 +1300,31 @@ mod tests {
             depth_clamp: true,
             multi_viewport: true,
             max_viewports: 16,
+        }
+    }
+
+    #[test]
+    fn ordered_scope_pairs_the_extension_and_exact_enabled_bit() {
+        use metal2vulkan::passes::FragmentInterlock::*;
+        for scope in [None, Some(Pixel), Some(Sample)] {
+            let caps = DeviceFeatures {
+                fragment_interlock: scope,
+                ..Default::default()
+            };
+            let bits = caps.enabled_fragment_interlock();
+            assert_eq!(
+                bits.fragment_shader_pixel_interlock == vk::TRUE,
+                scope == Some(Pixel)
+            );
+            assert_eq!(
+                bits.fragment_shader_sample_interlock == vk::TRUE,
+                scope == Some(Sample)
+            );
+            assert_eq!(
+                caps.required_extensions()
+                    .contains(&vk::EXT_FRAGMENT_SHADER_INTERLOCK_NAME.as_ptr()),
+                scope.is_some()
+            );
         }
     }
 

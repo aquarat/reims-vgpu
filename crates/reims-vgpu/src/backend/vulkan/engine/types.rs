@@ -1241,8 +1241,10 @@ pub struct StorageImageResource {
 /// A storage write leaves every texel the shader does not write as it was, so
 /// this is a load in every case: the only question is what a resident that
 /// holds nothing yet stands for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StorageImageContent {
+    /// Current, tightly packed texels at the allocation format. Supersedes any stale resident.
+    NativeSeed(std::sync::Arc<[u8]>),
     /// The texture has guest storage, and its pixels are only in the resident
     /// when a pass already put them there. A resident that is not ready refuses
     /// the draw (`vk_draw_exec_storage_image_content_not_ready`) rather than

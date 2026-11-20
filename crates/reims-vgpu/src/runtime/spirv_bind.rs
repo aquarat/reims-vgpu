@@ -2480,43 +2480,6 @@ pub fn storage_texture_unsupported_shape(
     }
 }
 
-/// The Metal texture indices whose entry-point argument declares
-/// `[[raster_order_group(n)]]`, read from AIR's disassembled metadata.
-///
-/// A raster order group orders the fragment invocations that touch one pixel
-/// through that texture, which Vulkan spells as a fragment-shader interlock.
-/// The translator this device pins parses the qualifier on imageblock members
-/// only and drops it from a texture argument without a trace, so a module
-/// translated from such a shader runs its stores *unordered*. This is the
-/// device's own reading of the one fact it needs to refuse that rather than
-/// guess: the argument node in AIR's metadata, `!{i32 <param>, !"air.texture",
-/// !"air.location_index", i32 <index>, ..., !"air.raster_order_group", i32 <g>,
-/// ...}`.
-///
-/// Every texture argument node in the module is read, not only the entry
-/// point's: a false positive refuses a draw with a name, while a missed one
-/// renders it racy with none.
-pub fn raster_ordered_texture_indices(ll: &str) -> Vec<u32> {
-    let mut indices: Vec<u32> = ll
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            if !line.starts_with('!')
-                || !line.contains("!\"air.texture\"")
-                || !line.contains("!\"air.raster_order_group\"")
-            {
-                return None;
-            }
-            let (_, after) = line.split_once("!\"air.location_index\", i32 ")?;
-            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse().ok()
-        })
-        .collect();
-    indices.sort_unstable();
-    indices.dedup();
-    indices
-}
-
 /// First texture descriptor whose access reflection could not classify as
 /// either sampled or storage — the one texture neither render rail can bind.
 pub fn first_unclassified_texture_descriptor(
@@ -3994,6 +3957,7 @@ mod more_tests {
             tessellation: None,
             imageblock_layouts: vec![],
             implicit_imageblock_attachments: vec![],
+            texture_raster_order_groups: vec![],
             fragment_imageblock: None,
             datalayout: None,
             descriptor_layout: DescriptorLayout::default(),
@@ -4592,23 +4556,6 @@ mod more_tests {
             ),
             Some("descriptor_array")
         );
-    }
-
-    /// The raster-order reading finds the qualifier on a texture argument node
-    /// wherever it sits in the node, names the argument's Metal index, and
-    /// ignores the same qualifier on an imageblock member or a buffer.
-    #[test]
-    fn raster_order_groups_are_read_from_texture_argument_metadata() {
-        let ll = r#"
-!10 = !{i32 0, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.raster_order_group", i32 0, !"air.arg_type_name", !"texture2d<half, read_write>", !"air.arg_name", !"dst"}
-!11 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float>", !"air.arg_name", !"src"}
-!12 = !{i32 2, !"air.texture", !"air.raster_order_group", i32 1, !"air.location_index", i32 12, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>"}
-!13 = !{i32 0, i32 2, i32 0, !"half", !"user(other)", !"air.raster_order_group", i32 1}
-!14 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.raster_order_group", i32 0, !"air.address_space", i32 1}
-!15 = !{i32 0, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.raster_order_group", i32 2}
-"#;
-        assert_eq!(raster_ordered_texture_indices(ll), vec![3, 12]);
-        assert!(raster_ordered_texture_indices("define void @f() {\n}\n").is_empty());
     }
 
     /// A reflected static sampler. `binding` is the translator's number, because

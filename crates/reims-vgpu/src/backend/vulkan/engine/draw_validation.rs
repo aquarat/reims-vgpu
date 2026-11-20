@@ -131,6 +131,11 @@ pub enum DrawValidationDecline {
     DuplicateSamplerDescriptorBinding {
         binding: u32,
     },
+    StorageImageSeedSize {
+        binding: u32,
+        actual: usize,
+        expected: Option<usize>,
+    },
     /// A storage image claims a descriptor binding another descriptor of this
     /// draw — buffer, sampled image, sampler or storage image — already holds.
     DuplicateStorageImageDescriptorBinding {
@@ -317,6 +322,7 @@ impl Decline for DrawValidationDecline {
             Self::SampledNoLinearTexelFootprint { .. } => {
                 "vk_draw_validate_sampled_no_linear_texel_footprint"
             }
+            Self::StorageImageSeedSize { .. } => "vk_draw_validate_storage_image_seed_size",
             Self::SampledBytesLength { .. } => "vk_draw_validate_sampled_bytes_length",
             Self::UnrepresentableImageBytes { .. } => {
                 "vk_draw_validate_unrepresentable_image_bytes"
@@ -481,6 +487,15 @@ impl Decline for DrawValidationDecline {
             Self::SampledNoLinearTexelFootprint { binding, format } => vec![
                 ("binding", binding.to_string()),
                 ("format", format!("{format:?}")),
+            ],
+            Self::StorageImageSeedSize {
+                binding,
+                actual,
+                expected,
+            } => vec![
+                ("binding", binding.to_string()),
+                ("actual", actual.to_string()),
+                ("expected", format!("{expected:?}")),
             ],
             Self::SampledBytesLength {
                 binding,
@@ -700,6 +715,11 @@ mod tests {
                     crate::protocol::pixel_format::TexelLayout::Bgra8,
                 ),
             },
+            DrawValidationDecline::StorageImageSeedSize {
+                binding: 1,
+                actual: 3,
+                expected: Some(4),
+            },
             DrawValidationDecline::SampledBytesLength {
                 binding: 32,
                 actual: 3,
@@ -756,7 +776,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 55, "the validator's reason census moved");
+        assert_eq!(before, 56, "the validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-validation slug");
     }
 

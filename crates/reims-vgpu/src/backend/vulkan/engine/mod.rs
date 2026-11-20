@@ -2735,6 +2735,7 @@ enum EngineProbe {
     StorageWriteWithoutFormat,
     SampledLayoutLinearFilter,
     StorageViewCaps,
+    FragmentInterlock,
 }
 
 impl EngineProbe {
@@ -2743,6 +2744,7 @@ impl EngineProbe {
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::SampledLayoutLinearFilter => "sampled_layout_linear_filter",
             Self::StorageViewCaps => "storage_view_caps",
+            Self::FragmentInterlock => "fragment_interlock",
         }
     }
 
@@ -2753,6 +2755,7 @@ impl EngineProbe {
             Self::StorageWriteWithoutFormat => 7,
             Self::SampledLayoutLinearFilter => 9,
             Self::StorageViewCaps => 10,
+            Self::FragmentInterlock => 11,
         }
     }
 }
@@ -2875,6 +2878,24 @@ pub fn supports_storage_image_write_without_format() -> bool {
             engine_probe_decline(EngineProbe::StorageWriteWithoutFormat, &error)
                 .fail_once(EngineProbe::StorageWriteWithoutFormat.discriminant());
             false
+        }
+    }
+}
+
+/// Translation and draw admission both target the feature actually enabled at device creation.
+pub fn fragment_interlock() -> Option<metal2vulkan::passes::FragmentInterlock> {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => ctx.features.fragment_interlock,
+        Err(error) => {
+            engine_probe_decline(EngineProbe::FragmentInterlock, &error)
+                .fail_once(EngineProbe::FragmentInterlock.discriminant());
+            None
         }
     }
 }
@@ -6843,6 +6864,7 @@ mod probe_visibility_tests {
             EngineProbe::StorageWriteWithoutFormat,
             EngineProbe::SampledLayoutLinearFilter,
             EngineProbe::StorageViewCaps,
+            EngineProbe::FragmentInterlock,
         ] {
             let line = engine_probe_decline(probe, &error).render();
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));
