@@ -1108,7 +1108,7 @@ mod tests {
                 offset: 0,
                 widened_from: None,
             }],
-            topology: topology::TopologyKey::Exact(PrimitiveType::Triangle),
+            topology: topology::key(PrimitiveType::Triangle, Default::default()),
             raster: raster_state(),
             multisample: MultisamplePlan::default(),
             depth_stencil: None,
@@ -1491,7 +1491,7 @@ mod tests {
             (
                 "topology",
                 GraphicsKey {
-                    topology: topology::TopologyKey::Any,
+                    topology: topology::key(PrimitiveType::Triangle, topology::fixture::FREE),
                     ..base.clone()
                 },
             ),
@@ -1675,26 +1675,33 @@ mod tests {
     /// and one built for any topology declares the triangle list.
     #[test]
     fn a_class_pipeline_declares_a_topology_its_key_admits() {
-        use reims_vgpu_core::topology::TopologyClass;
+        use topology::fixture::{CLASSED, STATIC};
         for (key_topology, expected) in [
             (
-                topology::TopologyKey::Exact(PrimitiveType::LineStrip),
+                topology::indexed_key(
+                    PrimitiveType::LineStrip,
+                    STATIC,
+                    reims_vgpu_core::render::IndexType::Uint16,
+                    Default::default(),
+                    false,
+                )
+                .unwrap(),
                 vk::PrimitiveTopology::LINE_STRIP,
             ),
             (
-                topology::TopologyKey::Class(TopologyClass::Line),
+                topology::key(PrimitiveType::Line, CLASSED),
                 vk::PrimitiveTopology::LINE_LIST,
             ),
             (
-                topology::TopologyKey::Class(TopologyClass::Point),
+                topology::key(PrimitiveType::Point, CLASSED),
                 vk::PrimitiveTopology::POINT_LIST,
             ),
             (
-                topology::TopologyKey::Class(TopologyClass::Triangle),
+                topology::key(PrimitiveType::Triangle, CLASSED),
                 vk::PrimitiveTopology::TRIANGLE_LIST,
             ),
             (
-                topology::TopologyKey::Any,
+                topology::key(PrimitiveType::Triangle, topology::fixture::FREE),
                 vk::PrimitiveTopology::TRIANGLE_LIST,
             ),
         ] {
@@ -1708,12 +1715,9 @@ mod tests {
                 expected,
                 "{key_topology:?}"
             );
-            // Never restarting: Metal has no primitive-restart index and a
-            // guest's largest index would silently cut its strip.
             assert_eq!(
                 build.input_assembly().primitive_restart_enable,
-                vk::FALSE,
-                "{key_topology:?}"
+                u32::from(expected == vk::PrimitiveTopology::LINE_STRIP)
             );
             // And the declaration is only half the answer. A key that serves
             // more than one primitive type declares a stand-in, so the
@@ -1724,7 +1728,7 @@ mod tests {
                 build
                     .dynamic_states()
                     .contains(&vk::DynamicState::PRIMITIVE_TOPOLOGY),
-                !matches!(key_topology, topology::TopologyKey::Exact(_)),
+                expected != vk::PrimitiveTopology::LINE_STRIP,
                 "{key_topology:?}"
             );
         }
@@ -1734,11 +1738,11 @@ mod tests {
     /// topology and leave the state that explains it undeclared.
     #[test]
     fn the_declared_topology_and_its_dynamic_state_are_one_decision() {
-        use reims_vgpu_core::topology::TopologyClass;
+        use topology::fixture::{CLASSED, STATIC};
         for key_topology in [
-            topology::TopologyKey::Exact(PrimitiveType::TriangleStrip),
-            topology::TopologyKey::Class(TopologyClass::Triangle),
-            topology::TopologyKey::Any,
+            topology::key(PrimitiveType::TriangleStrip, STATIC),
+            topology::key(PrimitiveType::Triangle, CLASSED),
+            topology::key(PrimitiveType::Triangle, topology::fixture::FREE),
         ] {
             let build = build(GraphicsKey {
                 topology: key_topology,
@@ -1810,7 +1814,7 @@ mod store_tests {
             layout: vk::PipelineLayout::from_raw(1),
             bindings: Vec::new(),
             attributes: Vec::new(),
-            topology: topology::TopologyKey::Exact(PrimitiveType::Triangle),
+            topology: topology::key(PrimitiveType::Triangle, Default::default()),
             raster: raster::plan(
                 raster::GuestRasterState::DEFAULT,
                 raster::RasterCell::default(),

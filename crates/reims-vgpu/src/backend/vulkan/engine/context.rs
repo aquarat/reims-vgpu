@@ -1270,6 +1270,9 @@ impl DeviceContext {
         let mut en_image_robustness = features.enabled_image_robustness();
         let mut en_interlock = features.enabled_fragment_interlock();
         let mut en_attachment_feedback = features.enabled_attachment_feedback_loop_layout();
+        let mut en_list_restart =
+            vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default()
+                .primitive_topology_list_restart(features.primitive_topology_list_restart);
         let mut en_extended_dynamic_state = features.enabled_extended_dynamic_state();
         let mut en_extended_dynamic_state3 = features.enabled_extended_dynamic_state3();
         let mut dci = vk::DeviceCreateInfo::default()
@@ -1291,6 +1294,9 @@ impl DeviceContext {
         }
         if features.attachment_feedback_loop_layout {
             dci = dci.push_next(&mut en_attachment_feedback);
+        }
+        if features.primitive_topology_list_restart {
+            dci = dci.push_next(&mut en_list_restart);
         }
         if features.extended_dynamic_state {
             dci = dci.push_next(&mut en_extended_dynamic_state);

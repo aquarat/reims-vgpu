@@ -198,6 +198,26 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // `chain_phase`'s doc on early returns.
     let _phase = chain_phase::ChainTimer::start();
     chain_phase::enter(chain_phase::Phase::Prep);
+    // The public Metal encoder supplies the indexed-draw default but has no
+    // setter for a different comparator. Do not execute with stale state.
+    if let Some(info) = &req.indexed {
+        use reims_vgpu_core::topology::{PrimitiveRestart, PrimitiveType};
+        if let (Some(topology), Some(width)) = (
+            PrimitiveType::parse(req.primitive_type),
+            u16::try_from(info.index_type)
+                .ok()
+                .and_then(reims_vgpu_core::render::IndexType::parse),
+        ) {
+            if req.primitive_restart.index(topology, width)
+                != PrimitiveRestart::MetalDefault.index(topology, width)
+            {
+                return (
+                    EncodeStatus::MetalFailed("metal_primitive_restart_override_unsupported"),
+                    None,
+                );
+            }
+        }
+    }
     if req.colors.is_empty() {
         return (EncodeStatus::BadArgs("draw_mtl_no_color_target"), None);
     }

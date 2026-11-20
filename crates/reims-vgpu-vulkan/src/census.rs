@@ -1534,8 +1534,8 @@ mod tests {
     /// the case a version check would have got wrong.
     #[test]
     fn the_topology_cell_has_three_rungs_and_the_property_never_arrives_by_version() {
-        use crate::topology::{key, TopologyKey};
-        use reims_vgpu_core::topology::{PrimitiveType, TopologyClass};
+        use crate::topology::{fixture, key};
+        use reims_vgpu_core::topology::PrimitiveType;
 
         let memory = mem::intel_igpu();
         let families = integrated_families();
@@ -1547,7 +1547,7 @@ mod tests {
         assert!(!bare.topology().unrestricted);
         assert_eq!(
             key(PrimitiveType::LineStrip, bare.topology()),
-            TopologyKey::Exact(PrimitiveType::LineStrip)
+            key(PrimitiveType::LineStrip, fixture::STATIC)
         );
 
         // 1.2 with the extension and its feature: dynamic within a class.
@@ -1559,7 +1559,7 @@ mod tests {
         assert!(!classed.topology().unrestricted);
         assert_eq!(
             key(PrimitiveType::LineStrip, classed.topology()),
-            TopologyKey::Class(TopologyClass::Line)
+            key(PrimitiveType::Line, fixture::CLASSED)
         );
         // The extension is asked for by name, because 1.2 is below the
         // promotion.
@@ -1597,7 +1597,10 @@ mod tests {
         let free = Census::take(r).expect("admitted");
         assert!(free.topology().dynamic);
         assert!(free.topology().unrestricted);
-        assert_eq!(key(PrimitiveType::Point, free.topology()), TopologyKey::Any);
+        assert_eq!(
+            key(PrimitiveType::Point, free.topology()),
+            key(PrimitiveType::Triangle, fixture::FREE)
+        );
         // And the extension is never requested, because only its property was
         // read.
         assert!(!free

@@ -1185,11 +1185,26 @@ static NSArray *encoderCases(id ser) {
                        enc, sel_getUid("setTessellationFactorScale:"), 1.25f);
                  });
 
-  addEncoderCase(cases, ser, stream, @"render_set_primitive_restart_enabled",
-                 @"setPrimitiveRestartEnabled:", @{@"enabled" : @1}, ^(id enc) {
-                   ((void (*)(id, SEL, char))objc_msgSend)(
-                       enc, sel_getUid("setPrimitiveRestartEnabled:"), 1);
-                 });
+  // OpenGL-compatibility render state is gated by deserializer version,
+  // not by a writable supportsX: flag. Keep the other cases at baseline.
+  id gl = ((id (*)(id, SEL, id, id, unsigned))objc_msgSend)(
+      [objc_getClass("PGSerializer") alloc],
+      sel_getUid("initWithDevice:objectRefAllocator:deserializerVersion:"),
+      gDevice, [[RefAllocator alloc] init], 8);
+  for (NSNumber *enabled in @[@NO, @YES]) {
+    addEncoderCase(cases, gl, stream,
+                   [@"render_set_primitive_restart_" stringByAppendingString:enabled.stringValue],
+                   @"setPrimitiveRestartEnabled:", @{@"enabled" : enabled}, ^(id enc) {
+      ((void (*)(id, SEL, BOOL))objc_msgSend)(enc, sel_getUid("setPrimitiveRestartEnabled:"), enabled.boolValue);
+    });
+    for (NSNumber *index in @[@0x11223344, @0x89abcdef]) {
+      addEncoderCase(cases, gl, stream,
+                     [NSString stringWithFormat:@"render_restart_%@_%@", enabled, index],
+                     @"setPrimitiveRestartEnabled:index:", @{@"enabled" : enabled, @"index" : index}, ^(id enc) {
+        ((void (*)(id, SEL, BOOL, NSUInteger))objc_msgSend)(enc, sel_getUid("setPrimitiveRestartEnabled:index:"), enabled.boolValue, index.unsignedIntegerValue);
+      });
+    }
+  }
 
   addEncoderCase(cases, ser, stream, @"render_set_viewport_transform_enabled",
                  @"setViewportTransformEnabled:", @{@"enabled" : @1}, ^(id enc) {
@@ -2601,16 +2616,6 @@ static NSArray *encoderCases(id ser) {
                    ((void (*)(id, SEL, id, unsigned long, unsigned long))objc_msgSend)(
                        enc, sel_getUid("setTessellationFactorBuffer:offset:instanceStride:"),
                        vbuf, 0x3456, 0x4567);
-                 });
-
-  // `setPrimitiveRestartEnabled:` (no index) is already covered; this is the
-  // two-argument form, whose `BOOL` sits before a `Q` at an offset the packing
-  // makes 20 rather than 24.
-  addEncoderCase(cases, ser, stream, @"render_set_primitive_restart_enabled_index",
-                 @"setPrimitiveRestartEnabled:index:",
-                 @{@"enabled" : @1, @"index" : @0x5678}, ^(id enc) {
-                   ((void (*)(id, SEL, char, unsigned long))objc_msgSend)(
-                       enc, sel_getUid("setPrimitiveRestartEnabled:index:"), 1, 0x5678);
                  });
 
   // Driven at both `MTLDepthClipMode` values, because one of them is the state

@@ -190,6 +190,7 @@ pub enum DrawReason {
     /// to keep at the near and far planes. Delegates its slug, like the
     /// sampler and blend pairs.
     Raster(reims_vgpu_vulkan::raster::Refusal),
+    PrimitiveRestart(reims_vgpu_vulkan::topology::RestartRefusal),
     /// The primary colour attachment has no faithful Vulkan format on this
     /// backend. Carries the translation reason so the refusal keeps one name.
     ColorAttachmentFormat(TranslateReason),
@@ -385,6 +386,7 @@ impl crate::observe::Decline for DrawReason {
             Self::BlendDeclaration(refusal) => Decline::slug(refusal),
             Self::BlendDevice(refusal) => refusal.slug(),
             Self::Raster(refusal) => refusal.slug(),
+            Self::PrimitiveRestart(refusal) => refusal.slug(),
             // Deliberately delegates: the translation layer already named the
             // exact format problem, and inventing a second slug here would make
             // the two log lines disagree about one event.
@@ -550,6 +552,7 @@ impl std::fmt::Display for DrawReason {
             Self::BlendDevice(refusal) => write!(f, " {refusal}"),
             Self::VertexStep(refusal) => write!(f, " {refusal}"),
             Self::Raster(refusal) => write!(f, " {refusal}"),
+            Self::PrimitiveRestart(refusal) => write!(f, " {refusal:?}"),
             // Same: the surface's answer is only actionable with what it
             // offered, which the rail's refusal spells.
             Self::SwapchainSurface(refusal) => write!(f, " {refusal}"),
@@ -800,6 +803,13 @@ mod tests {
         }),
         DrawReason::BlendDevice(reims_vgpu_vulkan::blend::Refusal::NoIndependentBlend { slots: 2 }),
         DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoNonSolidFill),
+        DrawReason::PrimitiveRestart(reims_vgpu_vulkan::topology::RestartRefusal::CustomIndex {
+            index: 7,
+            width: reims_vgpu_core::render::IndexType::Uint16,
+        }),
+        DrawReason::PrimitiveRestart(reims_vgpu_vulkan::topology::RestartRefusal::ListRestart {
+            topology: reims_vgpu_core::topology::PrimitiveType::Line,
+        }),
         DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::NoDepthClamp),
         DrawReason::Raster(reims_vgpu_vulkan::raster::Refusal::UnknownOrdinal {
             state: "cull_mode",

@@ -65,6 +65,7 @@ use std::sync::Arc;
 /// Pending render-pass ICB execute (range form or indirect range buffer).
 #[derive(Clone, Debug, Default)]
 struct RenderIcbExecute {
+    primitive_restart: reims_vgpu_core::topology::PrimitiveRestart,
     icb_ref: u32,
     is_range: bool,
     range_location: u64,
@@ -81,6 +82,7 @@ struct RenderIcbExecute {
 /// same stream (journal: logo RG8 168×206 + pill → one mapper-ref-texture FB).
 #[derive(Clone, Debug, Default)]
 struct PendingDraw {
+    primitive_restart: reims_vgpu_core::topology::PrimitiveRestart,
     pipeline_ref: u32,
     draw: DrawArgs,
     indexed: Option<IndexedDrawInfo>,
@@ -121,6 +123,7 @@ struct PendingDraw {
 
 #[derive(Clone, Debug, Default)]
 struct StreamAccum {
+    primitive_restart: reims_vgpu_core::topology::PrimitiveRestart,
     pipeline_ref: u32,
     /// Every colour attachment whose `load_action` is `Clear`, in stream order.
     ///
@@ -281,6 +284,7 @@ impl StreamAccum {
             fill_mode: self.fill_mode,
             depth_clip_mode: self.depth_clip_mode,
             line_width: self.line_width,
+            primitive_restart: self.primitive_restart,
             depth_bias: self.depth_bias,
             depth_stencil_ref: self.depth_stencil_ref,
             stencil_ref: self.stencil_ref,
@@ -1564,7 +1568,10 @@ struct StreamSink<'a, M: HostMemory + HostOps> {
 
 impl<'a, M: HostMemory + HostOps> StreamSink<'a, M> {
     /// A segment of `kind` is about to deliver its records.
-    fn begin_segment(&mut self, kind: SegmentKind) {
+    fn begin_segment(&mut self, kind: SegmentKind, lifetime: SegmentLifetime) {
+        if kind == SegmentKind::Render && !lifetime.continues_previous {
+            self.acc.primitive_restart = Default::default();
+        }
         if self.compute.is_some() {
             // The previous segment's encoder was never committed. Committing it
             // here is the only reading that does not drop the work the guest
@@ -1743,7 +1750,7 @@ fn walk_stream<M: HostMemory + HostOps>(
         // on that rail and the reading was a rail-dependent multiple of the
         // truth.
         crate::runtime::drain::note_store_route(segment_chain_route(framed.lifetime));
-        sink.begin_segment(kind);
+        sink.begin_segment(kind, framed.lifetime);
         walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
             // Stepped for every record this walk reaches, whether or not the
             // arm below has anything to do with the answer: the two walks stay
@@ -2980,6 +2987,7 @@ const fn is_render_stream_state(kind: ProtoRenderKind) -> bool {
         | K::SetTriangleFillMode
         | K::SetDepthBias
         | K::SetLineWidth
+        | K::SetPrimitiveRestart
         | K::SetViewport
         | K::SetViewports
         | K::SetScissorRect
@@ -3088,6 +3096,7 @@ fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: 
         // selectors deserve: one is state a rail may be able to carry, the other
         // has no carrier on either.
         RenderRecord::SetLineWidth(r) => acc.line_width = Some(f32::from_bits(r.width_bits)),
+        RenderRecord::SetPrimitiveRestart(r) => acc.primitive_restart = r,
         RenderRecord::SetViewports(ports) => {
             // A plural record of count zero. The singular form is this slice at
             // length one, so an empty one can only be the plural, and it is the
@@ -3196,6 +3205,7 @@ const fn is_render_bind(kind: ProtoRenderKind) -> bool {
         | K::SetTriangleFillMode
         | K::SetDepthBias
         | K::SetLineWidth
+        | K::SetPrimitiveRestart
         | K::SetViewport
         | K::SetViewports
         | K::SetScissorRect
@@ -3513,6 +3523,7 @@ const fn is_render_pass_state(kind: ProtoRenderKind) -> bool {
         | K::SetTriangleFillMode
         | K::SetDepthBias
         | K::SetLineWidth
+        | K::SetPrimitiveRestart
         | K::SetViewport
         | K::SetViewports
         | K::SetScissorRect
@@ -4136,6 +4147,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 return;
             }
             acc.execute_icb.push(RenderIcbExecute {
+                primitive_restart: acc.primitive_restart,
                 icb_ref: cmd.indirect_command_buffer_ref,
                 is_range: cmd.icb_is_range,
                 range_location: cmd.icb_range_location,
@@ -5079,6 +5091,7 @@ fn finish_stream<M: HostMemory + HostOps>(
                 } else {
                     fill_draw_binds_from_pending(&mut req, &snapshot);
                 }
+                req.primitive_restart = exec.primitive_restart;
                 let (loc, len) = if exec.is_range {
                     (exec.range_location, exec.range_length)
                 } else {
@@ -5865,6 +5878,7 @@ fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingD
     req.fill_mode = pd.fill_mode;
     req.depth_clip_mode = pd.depth_clip_mode;
     req.line_width = pd.line_width;
+    req.primitive_restart = pd.primitive_restart;
     req.depth_bias = pd.depth_bias;
     req.depth_stencil_ref = pd.depth_stencil_ref;
     req.stencil_ref = pd.stencil_ref;

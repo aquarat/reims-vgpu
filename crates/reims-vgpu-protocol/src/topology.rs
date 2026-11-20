@@ -22,6 +22,32 @@ pub const MTL_PRIMITIVE_TYPE_LINE_STRIP: u32 = 2;
 pub const MTL_PRIMITIVE_TYPE_TRIANGLE: u32 = 3;
 pub const MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP: u32 = 4;
 
+/// Per-render-encoder restart state. Without a setter, Metal indexed strips
+/// cut at the index type's maximum. An explicit setter carries a 32-bit
+/// comparison value independent of the index buffer bound by the next draw.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PrimitiveRestart {
+    #[default]
+    MetalDefault,
+    Disabled,
+    Enabled(u32),
+}
+
+impl PrimitiveRestart {
+    /// The comparator for this indexed draw, before applying base vertex.
+    pub const fn index(
+        self,
+        primitive: PrimitiveType,
+        width: crate::render::IndexType,
+    ) -> Option<u32> {
+        match self {
+            Self::MetalDefault if primitive.is_strip() => Some(width.maximum()),
+            Self::MetalDefault | Self::Disabled => None,
+            Self::Enabled(index) => Some(index),
+        }
+    }
+}
+
 /// How a draw reads its vertices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrimitiveType {
@@ -114,8 +140,7 @@ impl PrimitiveType {
 
     /// Whether consecutive primitives share vertices.
     ///
-    /// The distinction a restart index would act on, and the reason its
-    /// absence matters — see the executors.
+    /// Metal's default indexed-draw restart applies to these topologies.
     #[must_use]
     pub const fn is_strip(self) -> bool {
         matches!(self, Self::LineStrip | Self::TriangleStrip)

@@ -127,11 +127,9 @@ and every one of the twelve has a fixture. Beside those are six state records
 Beside those are the render state records: scissor, viewport, blend colour, and
 the four one-`NSUInteger` and two one-`float` records that share a shape.
 
-Seven render selectors are `Excluded` because Apple's serializer *refuses* them
-— `setPointSize:`, `setPrimitiveRestartEnabled:` and five more each fail an
-assertion inside the encoder rather than emitting anything. The oracle drives
-them every run and records what refused, so those exclusions are measured on
-each capture rather than remembered.
+Several render selectors, including `setPointSize:`, assert at the baseline
+capability state. Both primitive-restart setters are driven at deserializer
+version 8, where the OpenGL-compatibility gate is open and both emit `0x91`.
 
 The current coverage line, printed by the test suite:
 

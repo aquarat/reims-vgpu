@@ -579,6 +579,7 @@ pub type BindTable<T> = std::sync::Arc<Vec<T>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct DrawEncodeRequest {
+    pub primitive_restart: reims_vgpu_core::topology::PrimitiveRestart,
     pub task_id: u32,
     pub pipeline_ref: u32,
     pub vertex_count: u32,

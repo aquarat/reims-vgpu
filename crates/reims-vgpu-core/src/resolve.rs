@@ -1120,6 +1120,7 @@ pub fn render(
             slope_scale: FloatBits(slope_scale_bits),
             clamp: FloatBits(clamp_bits),
         },
+        RenderRecord::SetPrimitiveRestart(state) => RenderOp::SetPrimitiveRestart(state),
         RenderRecord::SetLineWidth(protocol_render::SetLineWidth { width_bits }) => {
             RenderOp::SetLineWidth(FloatBits(width_bits))
         }
@@ -2174,10 +2175,8 @@ mod tests {
             ) {
                 continue;
             }
-            // One record's length is exact rather than a minimum: the
-            // compressed-reinterpretation flush's selector takes no argument,
-            // so a payload means the bytes are not that record. Every other
-            // body is a fixed shape a longer buffer merely contains.
+            // The compressed-reinterpretation flush takes no argument. Every
+            // other body is a fixed shape a longer buffer merely contains.
             let body: &[u8] = if opcode
                 == reims_vgpu_protocol::resource_state::OPCODE_COMPRESSED_REINTERPRETATION_FLUSH
                 && row.rail == Rail::Compute
@@ -2218,22 +2217,22 @@ mod tests {
                 row.rail
             );
         }
-        // The census the vocabulary prints is 105 stream operations. Six of
+        // The census the vocabulary prints is 106 stream operations. Six of
         // them carry no opcode at all — the four `beginSegment:` boundaries,
         // and the blit `withCommand:` selectors that write their command
         // argument into the record's opcode field, so they *are* whichever
         // opcode they emitted. Neither shape is dispatched by opcode, so
-        // neither reaches this path, and 99 is what remains.
+        // neither reaches this path, and 100 is what remains.
         //
         // This total grows as the ledger closes rows: an unresolved row is not
         // a judged operation and reaches neither counter, so a row settling
         // either way moves it. That is the intent — it is the number of
         // operations the model claims a path for.
         //
-        // Five of the 99 are settled refusals, counted apart rather than folded
+        // Five of the 100 are settled refusals, counted apart rather than folded
         // into either total: a refusal that reads as an unwritten path would
         // send someone to write it.
-        assert_eq!(seen + refused, 99);
+        assert_eq!(seen + refused, 100);
         assert_eq!(refused, 5);
     }
 

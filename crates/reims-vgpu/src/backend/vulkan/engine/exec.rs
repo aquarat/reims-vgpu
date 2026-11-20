@@ -210,7 +210,7 @@ fn buffer_gather_role(req: &DrawRequest, key: (usize, u64, u64)) -> Option<Buffe
     }
     if let Some(indexed) = &req.indexed {
         if CbBind::key_of(&indexed.content) == key {
-            role.index_alignment = Some(indexed.index_type.byte_size() as u64);
+            role.index_alignment = Some(indexed.index_type.bytes());
             bound = true;
         }
     }
@@ -1629,7 +1629,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
     let no_vertex_fetch = draw_has_no_invocations(req);
     let last_record: u32 = match &req.indexed {
         Some(indexed) => {
-            let need = indexed.index_count as usize * indexed.index_type.byte_size();
+            let need = indexed.index_count as usize * indexed.index_type.bytes() as usize;
             if indexed.content.len() < need {
                 return Err(DrawError::DrawValidation(
                     DrawValidationDecline::IndexBytesShort {
@@ -3392,7 +3392,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // as the question the depth-stencil plan is asked. Two calls would be two
     // copies of one value, and the second could drift from the first.
     let pass_compatibility = pass_key.compatibility();
-    let topology_key = reims_vgpu_vulkan::topology::key(req.primitive_topology.0, topology_cell);
+    let topology_key = match &req.indexed {
+        Some(index) => reims_vgpu_vulkan::topology::indexed_key(
+            req.primitive_topology.0,
+            topology_cell,
+            index.index_type,
+            req.primitive_restart,
+            ctx.features.primitive_topology_list_restart,
+        )
+        .map_err(|r| DrawError::Unsupported(super::reason::DrawReason::PrimitiveRestart(r)))?,
+        None => reims_vgpu_vulkan::topology::key(req.primitive_topology.0, topology_cell),
+    };
     // The guest's whole `MTLDepthStencilState`, under the same split. It is
     // encoder state on Metal — `setDepthStencilState:` binds it between draws
     // of one pipeline — and `extendedDynamicState` is what lets it stay that
@@ -5631,8 +5641,12 @@ pub(crate) unsafe fn execute_draw_inner(
     unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
-            ctx.device
-                .cmd_bind_index_buffer(cb, ibuf.buffer, ibuf.offset, indexed.index_type.vk());
+            ctx.device.cmd_bind_index_buffer(
+                cb,
+                ibuf.buffer,
+                ibuf.offset,
+                crate::backend::vulkan::translate::raster::vk_index_type(indexed.index_type),
+            );
             ctx.device.cmd_draw_indexed(
                 cb,
                 indexed.index_count,
@@ -7411,7 +7425,7 @@ mod tests {
                 },
             ],
             indexed: Some(IndexedDrawResource {
-                index_type: IndexType::U16,
+                index_type: IndexType::Uint16,
                 index_count: 8,
                 vertex_offset: 0,
                 content: index_only,
@@ -8834,7 +8848,7 @@ mod tests {
             vert_spirv: std::sync::Arc::new(vec![0]),
             frag_spirv: std::sync::Arc::new(vec![0]),
             indexed: Some(super::super::types::IndexedDrawResource {
-                index_type: super::super::types::IndexType::U16,
+                index_type: super::super::types::IndexType::Uint16,
                 index_count: 3,
                 vertex_offset: 0,
                 content,

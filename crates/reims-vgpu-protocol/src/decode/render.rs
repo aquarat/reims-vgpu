@@ -304,6 +304,7 @@ pub enum RenderRecord<'a> {
     SetTriangleFillMode(SetTriangleFillMode),
     SetDepthBias(SetDepthBias),
     SetLineWidth(SetLineWidth),
+    SetPrimitiveRestart(crate::topology::PrimitiveRestart),
     SetBlendColor(SetBlendColor),
     SetStencilReference(SetStencilReference),
     SetStoreAction(SetStoreAction),
@@ -491,6 +492,23 @@ fn state<'a>(kind: RenderKind, op: &Op<'a>) -> Result<RenderRecord<'a>, DecodeRe
                 bias_bits: r.bias.get().to_bits(),
                 slope_scale_bits: r.slope_scale.get().to_bits(),
                 clamp_bits: r.clamp.get().to_bits(),
+            })
+        }
+        RenderKind::SetPrimitiveRestart => {
+            let r = wire::primitive_restart(op)
+                .map_err(|_| fail(core::mem::size_of::<wire::PrimitiveRestart>()))?;
+            use crate::topology::PrimitiveRestart;
+            RenderRecord::SetPrimitiveRestart(match r.enabled.get() {
+                0 => PrimitiveRestart::Disabled,
+                1 => PrimitiveRestart::Enabled(r.index.get()),
+                value => {
+                    return Err(DecodeRefusal::UndefinedOrdinal {
+                        rail: Rail::Render,
+                        opcode,
+                        field: "primitive_restart_enabled",
+                        value,
+                    })
+                }
             })
         }
         RenderKind::SetLineWidth => {
@@ -844,6 +862,31 @@ mod tests {
 
     fn lift(bytes: &[u8]) -> Result<RenderRecord<'_>, DecodeRefusal> {
         decode(&op(bytes, 0).expect("framed"))
+    }
+
+    #[test]
+    fn restart_lifts_only_a_complete_record_with_a_boolean_enable() {
+        use crate::topology::PrimitiveRestart::*;
+        let opcode = wire::OPCODE_SET_PRIMITIVE_RESTART;
+        for (enabled, index, state) in [
+            (0u32, 17u32, Disabled),
+            (1, 42, Enabled(42)),
+            (1, u32::MAX, Enabled(u32::MAX)),
+        ] {
+            let bytes = record(
+                opcode,
+                &[enabled.to_le_bytes(), index.to_le_bytes()].concat(),
+            );
+            assert_eq!(lift(&bytes), Ok(RenderRecord::SetPrimitiveRestart(state)));
+        }
+        assert!(matches!(
+            lift(&record(opcode, &[0; 4])),
+            Err(DecodeRefusal::Short { .. })
+        ));
+        assert!(matches!(
+            lift(&record(opcode, &[2, 0, 0, 0, 0, 0, 0, 0])),
+            Err(DecodeRefusal::UndefinedOrdinal { value: 2, .. })
+        ));
     }
 
     /// The compact and wide encodings of one draw shape lift to the same

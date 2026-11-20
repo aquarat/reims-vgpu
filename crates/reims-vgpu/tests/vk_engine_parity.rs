@@ -1340,7 +1340,7 @@ fn indexed_u16_known_color() {
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 16, 16);
     req.indexed = Some(IndexedDrawResource {
-        index_type: IndexType::U16,
+        index_type: IndexType::Uint16,
         index_count: 3,
         vertex_offset: 0,
         content: BufferContent::Bytes(std::sync::Arc::new({

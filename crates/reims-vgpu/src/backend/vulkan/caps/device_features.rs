@@ -431,6 +431,8 @@ pub struct DeviceFeatures {
     /// attachment self-sampling contract; hosts without it keep the snapshot
     /// copy rail.
     pub attachment_feedback_loop_layout: bool,
+    /// `VK_EXT_primitive_topology_list_restart` and its list feature bit.
+    pub primitive_topology_list_restart: bool,
     /// `VK_EXT_image_drm_format_modifier`, used only for the explicit linear
     /// plane layout that gives a shared guest target its declared row pitch.
     /// This is an extension capability rather than a device feature bit: when
@@ -838,6 +840,7 @@ impl DeviceFeatures {
             mirror_clamp_to_edge,
             image_robustness,
             attachment_feedback_loop_layout,
+            primitive_topology_list_restart,
             image_drm_format_modifier,
             dual_src_blend,
             independent_blend,
@@ -869,6 +872,7 @@ impl DeviceFeatures {
             "vk_features fragment_interlock={fragment_interlock:?} robust_buffer_access={robust_buffer_access} \
              image_robustness={image_robustness:?} \
              attachment_feedback_loop_layout={attachment_feedback_loop_layout} \
+             primitive_topology_list_restart={primitive_topology_list_restart} \
              image_drm_format_modifier={image_drm_format_modifier} \
              sampler_anisotropy={sampler_anisotropy} max_sampler_anisotropy={max_sampler_anisotropy} \
              max_image_dimension_2d={max_image_dimension_2d} \
@@ -927,6 +931,9 @@ impl DeviceFeatures {
         }
         if self.attachment_feedback_loop_layout {
             out.push(vk::EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_NAME.as_ptr());
+        }
+        if self.primitive_topology_list_restart {
+            out.push(vk::EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_NAME.as_ptr());
         }
         if self.image_drm_format_modifier {
             out.push(vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME.as_ptr());
@@ -1102,6 +1109,15 @@ pub unsafe fn query(
         } else {
             false
         };
+    let primitive_topology_list_restart =
+        if has_extension(vk::EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_NAME) {
+            let mut list = vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT::default();
+            let mut chained = vk::PhysicalDeviceFeatures2::default().push_next(&mut list);
+            unsafe { instance.get_physical_device_features2(pd, &mut chained) };
+            list.primitive_topology_list_restart == vk::TRUE
+        } else {
+            false
+        };
     let fragment_interlock = if has_extension(vk::EXT_FRAGMENT_SHADER_INTERLOCK_NAME) {
         let mut interlock = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default();
         let mut chained = vk::PhysicalDeviceFeatures2::default().push_next(&mut interlock);
@@ -1164,6 +1180,7 @@ pub unsafe fn query(
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         image_robustness,
         attachment_feedback_loop_layout,
+        primitive_topology_list_restart,
         image_drm_format_modifier,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         dual_src_blend: supported.dual_src_blend == vk::TRUE,
@@ -1247,6 +1264,7 @@ mod tests {
     fn all_supported() -> DeviceFeatures {
         DeviceFeatures {
             fragment_interlock: Some(metal2vulkan::passes::FragmentInterlock::Pixel),
+            primitive_topology_list_restart: true,
             occlusion_query_precise: true,
             extended_dynamic_state: true,
             dynamic_polygon_mode: true,

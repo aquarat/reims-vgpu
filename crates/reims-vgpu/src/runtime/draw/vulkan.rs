@@ -9443,6 +9443,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // place that knows whether this draw rasterizes any lines for the
             // width to apply to, which is what the answer depends on.
             line_width: req.line_width,
+            primitive_restart: req.primitive_restart,
             first_vertex: req.first_vertex,
             // Passed through. `decode::render`'s `wire_instance_count` is where
             // a zero instance count is decided, and it is decided once — a

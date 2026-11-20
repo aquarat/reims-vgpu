@@ -860,11 +860,12 @@ pub(crate) struct PipelineKey {
     /// concerned — the guest's exact type on a host that bakes it, its
     /// topology class where `vkCmdSetPrimitiveTopology` may move within a
     /// class, and one key for everything where the device also reports
-    /// `dynamicPrimitiveTopologyUnrestricted`.
+    /// `dynamicPrimitiveTopologyUnrestricted`. Each scope is partitioned by
+    /// the effective indexed-draw restart enable, which is baked on all rungs.
     ///
     /// Not the guest's type, for the reason [`Self::raster`] is not the
     /// guest's ordinals: on a dynamic host a triangle list and a triangle
-    /// strip are one pipeline, and a key holding the type could not say so.
+    /// strip can share a pipeline when their restart enables agree.
     /// `reims_vgpu_vulkan::topology::key` is the only place that decides which
     /// of the three rungs this device is on, and
     /// `TopologyKey::input_assembly` derives the declared topology back out of

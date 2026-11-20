@@ -112,6 +112,13 @@ pub enum IndexType {
 }
 
 impl IndexType {
+    pub const fn maximum(self) -> u32 {
+        match self {
+            Self::Uint16 => u16::MAX as u32,
+            Self::Uint32 => u32::MAX,
+        }
+    }
+
     /// Parse the record's ordinal.
     #[must_use]
     pub const fn parse(raw: u16) -> Option<IndexType> {
@@ -186,6 +193,7 @@ pub enum RenderKind {
     SetDepthBias,
     SetDepthClipMode,
     SetLineWidth,
+    SetPrimitiveRestart,
     SetFragmentBuffers,
     SetFragmentBufferOffset,
     SetFragmentSamplers,
@@ -235,6 +243,7 @@ impl RenderKind {
         RenderKind::SetDepthBias,
         RenderKind::SetDepthClipMode,
         RenderKind::SetLineWidth,
+        RenderKind::SetPrimitiveRestart,
         RenderKind::SetFragmentBuffers,
         RenderKind::SetFragmentBufferOffset,
         RenderKind::SetFragmentSamplers,
@@ -285,6 +294,7 @@ impl RenderKind {
             Self::SetDepthBias => wire::OPCODE_SET_DEPTH_BIAS,
             Self::SetDepthClipMode => wire::OPCODE_SET_DEPTH_CLIP_MODE,
             Self::SetLineWidth => wire::OPCODE_SET_LINE_WIDTH,
+            Self::SetPrimitiveRestart => wire::OPCODE_SET_PRIMITIVE_RESTART,
             Self::SetFragmentBuffers => wire::OPCODE_SET_FRAGMENT_BUFFER,
             Self::SetFragmentBufferOffset => wire::OPCODE_SET_FRAGMENT_BUFFER_OFFSET,
             Self::SetFragmentSamplers => wire::OPCODE_SET_FRAGMENT_SAMPLER,

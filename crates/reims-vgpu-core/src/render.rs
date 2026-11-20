@@ -314,6 +314,7 @@ pub enum RenderOp {
     /// state everywhere. Whether a draw uses it at all is a joint fact of the
     /// fill mode and the topology, which only the executor holds.
     SetLineWidth(FloatBits),
+    SetPrimitiveRestart(crate::topology::PrimitiveRestart),
     SetBlendColor {
         red: FloatBits,
         green: FloatBits,

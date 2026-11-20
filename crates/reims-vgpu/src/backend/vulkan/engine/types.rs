@@ -444,6 +444,7 @@ impl ColorAttachmentState {
 /// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
+    pub primitive_restart: reims_vgpu_core::topology::PrimitiveRestart,
     /// The retained guest pipeline object this draw resolved, when the retained
     /// lifecycle is enabled. Vulkan still compares the complete variant key;
     /// this identity only chooses the object's exact front entry.
@@ -921,24 +922,7 @@ impl Default for PrimitiveTopology {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum IndexType {
-    U16,
-    U32,
-}
-
-impl IndexType {
-    pub(crate) fn vk(self) -> vk::IndexType {
-        translate::raster::vk_index_type(self)
-    }
-
-    pub fn byte_size(self) -> usize {
-        match self {
-            Self::U16 => 2,
-            Self::U32 => 4,
-        }
-    }
-}
+pub use reims_vgpu_core::render::IndexType;
 
 #[derive(Debug)]
 pub struct IndexedDrawResource {
@@ -2652,8 +2636,8 @@ mod tests {
 
     #[test]
     fn indexed_draw_widths_are_the_fixed_function_element_widths() {
-        assert_eq!(IndexType::U16.byte_size(), 2);
-        assert_eq!(IndexType::U32.byte_size(), 4);
+        assert_eq!(IndexType::Uint16.bytes(), 2);
+        assert_eq!(IndexType::Uint32.bytes(), 4);
     }
 
     #[test]

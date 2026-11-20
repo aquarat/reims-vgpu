@@ -64,20 +64,16 @@ pub fn stencil_operation(mtl: u32) -> Result<StencilOp, TranslateReason> {
 /// Vulkan consume it; `None` therefore remains a classification here, and the
 /// caller turns it into `IndexLoadReason::TypeUnsupported`.
 pub fn index_type(mtl: u32) -> Option<IndexType> {
-    use crate::protocol::render::IndexType as Contract;
     // The contract carries the ordinal at the width the wire does; a value that
     // does not fit is not an index type by that fact alone, and narrowing it
     // silently would let `0x1_0000` read as `Uint16`.
-    Some(match Contract::parse(u16::try_from(mtl).ok()?)? {
-        Contract::Uint16 => IndexType::U16,
-        Contract::Uint32 => IndexType::U32,
-    })
+    IndexType::parse(u16::try_from(mtl).ok()?)
 }
 
 pub fn vk_index_type(index: IndexType) -> vk::IndexType {
     match index {
-        IndexType::U16 => vk::IndexType::UINT16,
-        IndexType::U32 => vk::IndexType::UINT32,
+        IndexType::Uint16 => vk::IndexType::UINT16,
+        IndexType::Uint32 => vk::IndexType::UINT32,
     }
 }
 
@@ -281,10 +277,10 @@ mod tests {
 
     #[test]
     fn index_types_map_by_width() {
-        assert_eq!(index_type(0), Some(IndexType::U16));
-        assert_eq!(index_type(1), Some(IndexType::U32));
+        assert_eq!(index_type(0), Some(IndexType::Uint16));
+        assert_eq!(index_type(1), Some(IndexType::Uint32));
         assert_eq!(index_type(2), None);
-        assert_eq!(vk_index_type(IndexType::U16), vk::IndexType::UINT16);
-        assert_eq!(vk_index_type(IndexType::U32), vk::IndexType::UINT32);
+        assert_eq!(vk_index_type(IndexType::Uint16), vk::IndexType::UINT16);
+        assert_eq!(vk_index_type(IndexType::Uint32), vk::IndexType::UINT32);
     }
 }

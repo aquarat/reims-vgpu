@@ -638,6 +638,7 @@ impl RenderEncoderState {
             | RenderOp::SetTriangleFillMode(_)
             | RenderOp::SetDepthBias { .. }
             | RenderOp::SetLineWidth(_)
+            | RenderOp::SetPrimitiveRestart(_)
             | RenderOp::SetBlendColor { .. }
             | RenderOp::SetStencilReference { .. }
             | RenderOp::SetStoreAction { .. } => {}

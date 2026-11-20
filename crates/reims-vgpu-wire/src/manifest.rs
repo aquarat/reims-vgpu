@@ -172,9 +172,9 @@ pub const INVENTORY: &[ClassInventory] = &[
 /// doc now states — the manifest cannot see a selector, and its rule is that
 /// absent means non-existent.
 ///
-/// They stay `Excluded` here rather than being promoted on that reading: this
-/// crate's rule is that a row's opcode comes from a capture, and no capture has
-/// run with that gate on. What the reading does establish is that the *reason*
+/// Both restart selectors are captured against a versioned serializer and
+/// covered by `ops::render`. The others stay `Excluded`: this crate's rule
+/// is that a row's opcode comes from a capture. What the reading establishes is that the *reason*
 /// is wrong — these are gated, not refused — so
 /// `every_capability_gated_selector_names_the_flag_that_unlocks_it` cannot see
 /// them.
@@ -182,10 +182,9 @@ pub const INVENTORY: &[ClassInventory] = &[
 /// **The gate is on.** The flag is the serializer's feature version, which the
 /// device publishes as `reims_vgpu::model::DEVICE_INFO_KEY_SERIALIZER_VERSION`
 /// and which unlocks OpenGL at rung 6; this device sends 8. So these fifteen are
-/// records a guest on an OpenGL-compatibility path *will* send and this device
-/// does not decode. Four of them change what a draw produces — primitive
-/// restart, two-sided fill mode, and the two sampler binds that carry an LOD
-/// bias — and three more name multisample resolve targets. They reach
+/// records a guest on an OpenGL-compatibility path can send. Of the remaining
+/// gaps, two-sided fill and the two sampler binds with LOD bias change what a
+/// draw produces, and three more name multisample resolve targets. They reach
 /// `runtime::exec`'s unimplemented-opcode report rather than vanish, which is
 /// the one part of this that is already right.
 pub const REFUSED_BY_SERIALIZER: &str =
@@ -749,9 +748,9 @@ pub const MANIFEST: &[Entry] = &[
     Entry {
         class: "PGSerializerRenderCommandEncoder",
         selector: "setPrimitiveRestartEnabled:",
-        opcodes: &[],
-        coverage: Coverage::Excluded {
-            reason: REFUSED_BY_SERIALIZER,
+        opcodes: &[crate::ops::render::OPCODE_SET_PRIMITIVE_RESTART],
+        coverage: Coverage::Covered {
+            module: "ops::render",
         },
     },
     Entry {
@@ -2582,9 +2581,7 @@ pub const MANIFEST: &[Entry] = &[
             module: "ops::tile",
         },
     },
-    // The three MSAA resolve targets, the clip plane, the indexed
-    // primitive-restart form and the transform-feedback state: all refused by
-    // the serializer.
+    // OpenGL-compatibility state. Restart is driven at a version that emits it.
     Entry {
         class: "PGSerializerRenderCommandEncoder",
         selector: "setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex:",
@@ -2620,9 +2617,9 @@ pub const MANIFEST: &[Entry] = &[
     Entry {
         class: "PGSerializerRenderCommandEncoder",
         selector: "setPrimitiveRestartEnabled:index:",
-        opcodes: &[],
-        coverage: Coverage::Excluded {
-            reason: REFUSED_BY_SERIALIZER,
+        opcodes: &[crate::ops::render::OPCODE_SET_PRIMITIVE_RESTART],
+        coverage: Coverage::Covered {
+            module: "ops::render",
         },
     },
     Entry {

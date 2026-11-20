@@ -1067,6 +1067,14 @@ pub const LEDGER: &[Op] = &[
     },
     Op {
         rail: Rail::Render,
+        opcode: Some(reims_vgpu_wire::ops::render::OPCODE_SET_PRIMITIVE_RESTART),
+        selector: "setPrimitiveRestartEnabled:; setPrimitiveRestartEnabled:index:",
+        closure: Closure::Implemented {
+            evidence: "both setters replace the encoder's restart state; indexed draws resolve it against their own index width and topology",
+        },
+    },
+    Op {
+        rail: Rail::Render,
         opcode: Some(0x0099),
         selector: "setVertexAmplificationMode:value:",
         closure: Closure::Unresolved {

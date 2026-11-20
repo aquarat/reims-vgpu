@@ -2518,6 +2518,7 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
         fill_mode: None,
         depth_clip_mode: None,
         line_width: None,
+        primitive_restart: Default::default(),
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -2627,6 +2628,7 @@ fn nometal_draw_falls_back_to_backing_clear() {
         fill_mode: None,
         depth_clip_mode: None,
         line_width: None,
+        primitive_restart: Default::default(),
         depth_bias: None,
         depth_stencil_ref: 0,
         stencil_ref: None,
@@ -4885,6 +4887,71 @@ fn a_line_width_reaches_the_stream_state_and_a_draw() {
     assert_eq!(req.line_width, Some(2.5));
 }
 
+#[test]
+fn restart_changes_apply_only_to_following_draws_in_this_encoder() {
+    use reims_vgpu_core::topology::PrimitiveRestart::*;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut acc = StreamAccum::default();
+    let mut out = ExecResult::default();
+    let op = wire_render::OPCODE_SET_PRIMITIVE_RESTART;
+    let before = acc.bind_snapshot().unwrap();
+    let mut set = |acc: &mut StreamAccum, enabled: u32| {
+        let bytes = [
+            op,
+            wire_render::SET_PRIMITIVE_RESTART_TOTAL_LEN,
+            enabled,
+            0xffff,
+        ]
+        .map(u32::to_le_bytes)
+        .concat();
+        handle_render_record(&mut state, &host, 1, op, &bytes, &mut out, acc);
+        acc.bind_snapshot().unwrap()
+    };
+    let on = set(&mut acc, 1);
+    let off = set(&mut acc, 0);
+    for (snapshot, expected) in [
+        (before, MetalDefault),
+        (on, Enabled(0xffff)),
+        (off, Disabled),
+    ] {
+        let mut req = draw::DrawEncodeRequest::default();
+        fill_draw_binds_from_pending(&mut req, &snapshot);
+        assert_eq!(req.primitive_restart, expected);
+    }
+}
+
+#[test]
+fn restart_survives_a_continuation_but_not_a_new_render_encoder() {
+    use reims_vgpu_core::topology::PrimitiveRestart::{Disabled, MetalDefault};
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum {
+        primitive_restart: Disabled,
+        ..Default::default()
+    };
+    let mut sink = StreamSink {
+        state: &mut state,
+        host: &mut host,
+        task_id: 1,
+        out: &mut out,
+        acc: &mut acc,
+        compute: None,
+    };
+    sink.begin_segment(
+        SegmentKind::Render,
+        SegmentLifetime {
+            continues_previous: true,
+            continues_into_next: false,
+        },
+    );
+    assert_eq!(sink.acc.primitive_restart, Disabled);
+    sink.end_segment();
+    sink.begin_segment(SegmentKind::Render, SegmentLifetime::SELF_CONTAINED);
+    assert_eq!(sink.acc.primitive_restart, MetalDefault);
+}
+
 /// Every command buffer the submission declares is visited, however many
 /// there are.
 ///
@@ -6738,6 +6805,7 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
             fill_mode,
             depth_clip_mode,
             line_width,
+            primitive_restart,
             depth_bias,
             depth_stencil_ref,
             stencil_ref,
@@ -6772,6 +6840,7 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
             ("fill_mode", format!("{fill_mode:?}")),
             ("depth_clip_mode", format!("{depth_clip_mode:?}")),
             ("line_width", format!("{line_width:?}")),
+            ("primitive_restart", format!("{primitive_restart:?}")),
             ("depth_bias", format!("{depth_bias:?}")),
             ("depth_stencil_ref", format!("{depth_stencil_ref:?}")),
             ("stencil_ref", format!("{stencil_ref:?}")),
@@ -6902,6 +6971,15 @@ fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
                 &f32s(&[0.25, 1.5, 2.25]),
             ),
             "depth_bias",
+        ),
+        (
+            "setPrimitiveRestartEnabled:index:",
+            record(
+                wire_r::OPCODE_SET_PRIMITIVE_RESTART,
+                wire_r::SET_PRIMITIVE_RESTART_TOTAL_LEN,
+                &[1, 0, 0, 0, 0x12, 0x34, 0, 0],
+            ),
+            "primitive_restart",
         ),
         (
             "setLineWidth:",
@@ -7672,9 +7750,9 @@ fn a_segment_opened_over_an_open_compute_segment_commits_it_and_says_so() {
         acc: &mut acc,
         compute: None,
     };
-    sink.begin_segment(SegmentKind::Compute);
+    sink.begin_segment(SegmentKind::Compute, SegmentLifetime::SELF_CONTAINED);
     assert!(sink.compute.is_some(), "a compute segment opens an encoder");
-    sink.begin_segment(SegmentKind::Render);
+    sink.begin_segment(SegmentKind::Render, SegmentLifetime::SELF_CONTAINED);
     assert!(
         sink.compute.is_none(),
         "the unended compute segment is committed rather than carried into the render one"

@@ -16,27 +16,28 @@
 //! [`TopologyClass`] unless the device also reports
 //! `VkPhysicalDeviceExtendedDynamicState3PropertiesEXT::dynamicPrimitiveTopologyUnrestricted`.
 //! So the capability has three rungs and they produce three different cache
-//! keys, which is what [`key`] returns. Nothing else in this module decides a
-//! pipeline's identity, and nothing outside it re-derives one.
+//! topology scopes. [`key`] and [`indexed_key`] combine scope and restart into a
+//! pipeline's identity, and nothing outside this module re-derives one.
 //!
 //! Getting that wrong is not a validation error on this host — a driver that
 //! happens to allow a cross-class change will run it — which is exactly why
 //! the rung is asked for structurally rather than assumed.
 //!
-//! # Metal has no primitive restart
+//! # Restart is indexed-draw state
 //!
-//! There is no restart index in Metal: an index equal to `0xFFFF` or
-//! `0xFFFFFFFF` is a vertex like any other. `primitiveRestartEnable` is
-//! therefore false for every plan here, including the strips — which are the
-//! only topologies it would have affected, and the only ones where leaving it
-//! on would silently cut a strip the guest expected continuous.
+//! Metal's `drawIndexedPrimitives` contract cuts indexed strips at the largest
+//! value of the bound index type. Render record `0x91` replaces that default
+//! with an explicit enable and comparison index. Vulkan fixes the comparison
+//! index to the type maximum; lists additionally require `primitiveTopologyListRestart`.
+//! Restart is baked even when topology is dynamic, so it partitions every rung.
 //!
 //! # Planned, not created
 //!
 //! Nothing here builds a pipeline. Every mapping is tested with no GPU.
 
 use ash::vk;
-use reims_vgpu_core::topology::{PrimitiveType, TopologyClass};
+use reims_vgpu_core::render::IndexType;
+use reims_vgpu_core::topology::{PrimitiveRestart, PrimitiveType, TopologyClass};
 
 /// What this host offers for changing topology without a rebuild.
 ///
@@ -79,7 +80,7 @@ pub const fn topology(guest: PrimitiveType) -> vk::PrimitiveTopology {
 /// key on. Comparing two keys answers "can this pipeline serve that draw"
 /// without anybody re-reading the cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TopologyKey {
+enum Scope {
     /// The baseline: one pipeline per primitive type.
     Exact(PrimitiveType),
     /// Dynamic within a class: one pipeline serves a list and its strip.
@@ -88,23 +89,71 @@ pub enum TopologyKey {
     Any,
 }
 
-/// The key a pipeline drawing `guest` is cached under on this host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TopologyKey {
+    scope: Scope,
+    restart: bool,
+}
+
+/// The key for a draw with no index buffer.
 #[must_use]
 pub const fn key(guest: PrimitiveType, cell: TopologyCell) -> TopologyKey {
-    if !cell.dynamic {
-        TopologyKey::Exact(guest)
+    let scope = if !cell.dynamic {
+        Scope::Exact(guest)
     } else if cell.unrestricted {
-        TopologyKey::Any
+        Scope::Any
     } else {
-        TopologyKey::Class(guest.class())
+        Scope::Class(guest.class())
+    };
+    TopologyKey {
+        scope,
+        restart: false,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestartRefusal {
+    CustomIndex { index: u32, width: IndexType },
+    ListRestart { topology: PrimitiveType },
+}
+
+impl RestartRefusal {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::CustomIndex { .. } => "vk_primitive_restart_custom_index",
+            Self::ListRestart { .. } => "vk_primitive_restart_list_unsupported",
+        }
+    }
+}
+
+/// Resolve the effective enable before cache lookup; the index type selects
+/// the comparator at bind time and doesn't itself distinguish two pipelines.
+pub fn indexed_key(
+    guest: PrimitiveType,
+    cell: TopologyCell,
+    width: IndexType,
+    state: PrimitiveRestart,
+    list_restart: bool,
+) -> Result<TopologyKey, RestartRefusal> {
+    let index = state.index(guest, width);
+    if let Some(index) = index {
+        if index != width.maximum() {
+            return Err(RestartRefusal::CustomIndex { index, width });
+        }
+        if !guest.is_strip() && !list_restart {
+            return Err(RestartRefusal::ListRestart { topology: guest });
+        }
+    }
+    Ok(TopologyKey {
+        restart: index.is_some(),
+        ..key(guest, cell)
+    })
 }
 
 /// A pipeline's input-assembly state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputAssemblyPlan {
     pub topology: vk::PrimitiveTopology,
-    /// Always false. See the module doc.
     pub primitive_restart_enable: bool,
     /// Whether `vkCmdSetPrimitiveTopology` supplies the topology per draw, in
     /// which case the field above is the pipeline's declared one and the draw
@@ -136,7 +185,7 @@ impl InputAssemblyPlan {
             p_next: core::ptr::null(),
             flags: vk::PipelineInputAssemblyStateCreateFlags::empty(),
             topology: self.topology,
-            primitive_restart_enable: vk::FALSE,
+            primitive_restart_enable: self.primitive_restart_enable as vk::Bool32,
             _marker: core::marker::PhantomData,
         }
     }
@@ -153,17 +202,16 @@ impl TopologyKey {
     /// would otherwise declare different topologies while claiming to be the
     /// same cache entry.
     ///
-    /// `Class` declares [`TopologyClass::list`] — the class's one non-strip
-    /// member, which exists for exactly this. `Any` declares a triangle list;
-    /// under `dynamicPrimitiveTopologyUnrestricted` the declared topology
-    /// constrains nothing, so the only thing that matters is that every `Any`
-    /// pipeline picks the same one.
+    /// A dynamic key with restart off can declare a list. With restart on,
+    /// it declares a strip of the appropriate class wherever possible: a
+    /// list stand-in would itself need list-restart support at creation time.
+    /// Only an admitted list-restart draw can reach the point class with restart on.
     #[must_use]
     pub const fn input_assembly(self) -> InputAssemblyPlan {
         InputAssemblyPlan {
             topology: topology(self.declares()),
-            primitive_restart_enable: false,
-            dynamic: !matches!(self, Self::Exact(_)),
+            primitive_restart_enable: self.restart,
+            dynamic: !matches!(self.scope, Scope::Exact(_)),
         }
     }
 
@@ -174,10 +222,14 @@ impl TopologyKey {
     /// topology is always in the class the encoder may move within.
     #[must_use]
     pub const fn declares(self) -> PrimitiveType {
-        match self {
-            Self::Exact(guest) => guest,
-            Self::Class(class) => class.list(),
-            Self::Any => PrimitiveType::Triangle,
+        match self.scope {
+            Scope::Exact(guest) => guest,
+            Scope::Class(TopologyClass::Line) if self.restart => PrimitiveType::LineStrip,
+            Scope::Class(TopologyClass::Triangle) | Scope::Any if self.restart => {
+                PrimitiveType::TriangleStrip
+            }
+            Scope::Class(class) => class.list(),
+            Scope::Any => PrimitiveType::Triangle,
         }
     }
 }
@@ -206,22 +258,27 @@ pub fn serves(built: PrimitiveType, wanted: PrimitiveType, cell: TopologyCell) -
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
-
-    const STATIC: TopologyCell = TopologyCell {
+pub(crate) mod fixture {
+    use super::TopologyCell;
+    pub const STATIC: TopologyCell = TopologyCell {
         dynamic: false,
         unrestricted: false,
     };
-    const CLASSED: TopologyCell = TopologyCell {
+    pub const CLASSED: TopologyCell = TopologyCell {
         dynamic: true,
         unrestricted: false,
     };
-    const FREE: TopologyCell = TopologyCell {
+    pub const FREE: TopologyCell = TopologyCell {
         dynamic: true,
         unrestricted: true,
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::*;
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn every_primitive_type_maps_to_a_distinct_topology() {
@@ -252,16 +309,46 @@ mod tests {
         assert_eq!(vk::PrimitiveTopology::TRIANGLE_FAN.as_raw(), 5);
     }
 
-    /// Metal has no restart index, so a strip is never cut. This is the one
-    /// place it could have been turned on and the one topology it would have
-    /// affected.
     #[test]
-    fn no_plan_enables_primitive_restart_including_the_strips() {
+    fn only_indexed_strips_restart_by_default_at_both_index_widths() {
         for guest in PrimitiveType::ALL {
             for cell in [STATIC, CLASSED, FREE] {
-                let plan = key(guest, cell).input_assembly();
-                assert!(!plan.primitive_restart_enable);
-                assert_eq!(plan.native().primitive_restart_enable, vk::FALSE);
+                let plain = key(guest, cell);
+                assert_eq!(
+                    plain.input_assembly().native().primitive_restart_enable,
+                    vk::FALSE
+                );
+                for (width, max) in [(IndexType::Uint16, 0xffff), (IndexType::Uint32, u32::MAX)] {
+                    let resolve = |state, list| indexed_key(guest, cell, width, state, list);
+                    let default = resolve(PrimitiveRestart::MetalDefault, false).unwrap();
+                    assert_eq!(default != plain, guest.is_strip());
+                    assert_eq!(
+                        default.input_assembly().native().primitive_restart_enable,
+                        u32::from(guest.is_strip())
+                    );
+                    if guest.is_strip() {
+                        assert!(default.declares().is_strip());
+                    }
+                    assert_eq!(resolve(PrimitiveRestart::Disabled, false), Ok(plain));
+                    assert_eq!(
+                        resolve(PrimitiveRestart::Enabled(max - 1), true),
+                        Err(RestartRefusal::CustomIndex {
+                            index: max - 1,
+                            width
+                        })
+                    );
+                    let on = resolve(PrimitiveRestart::Enabled(max), true).unwrap();
+                    assert_ne!(on, plain);
+                    assert!(on.input_assembly().primitive_restart_enable);
+                    assert_eq!(
+                        resolve(PrimitiveRestart::Enabled(max), false),
+                        if guest.is_strip() {
+                            Ok(default)
+                        } else {
+                            Err(RestartRefusal::ListRestart { topology: guest })
+                        }
+                    );
+                }
             }
         }
         // Non-vacuous: two of those five were strips.
@@ -322,7 +409,7 @@ mod tests {
     fn an_unrestricted_host_needs_one_pipeline() {
         let keys: BTreeSet<TopologyKey> =
             PrimitiveType::ALL.iter().map(|p| key(*p, FREE)).collect();
-        assert_eq!(keys, BTreeSet::from([TopologyKey::Any]));
+        assert_eq!(keys, BTreeSet::from([key(PrimitiveType::Point, FREE)]));
         for a in PrimitiveType::ALL {
             for b in PrimitiveType::ALL {
                 assert!(serves(a, b, FREE));
@@ -340,8 +427,8 @@ mod tests {
             unrestricted: true,
         };
         assert_eq!(
-            key(PrimitiveType::Line, confused),
-            TopologyKey::Exact(PrimitiveType::Line)
+            key(PrimitiveType::Line, confused).scope,
+            Scope::Exact(PrimitiveType::Line)
         );
         assert!(!serves(
             PrimitiveType::Line,
@@ -358,11 +445,18 @@ mod tests {
 
     #[test]
     fn the_native_state_carries_the_plan() {
-        let native = TopologyKey::Exact(PrimitiveType::TriangleStrip)
-            .input_assembly()
-            .native();
+        let native = indexed_key(
+            PrimitiveType::TriangleStrip,
+            STATIC,
+            IndexType::Uint16,
+            PrimitiveRestart::MetalDefault,
+            false,
+        )
+        .unwrap()
+        .input_assembly()
+        .native();
         assert_eq!(native.topology, vk::PrimitiveTopology::TRIANGLE_STRIP);
-        assert_eq!(native.primitive_restart_enable, vk::FALSE);
+        assert_eq!(native.primitive_restart_enable, vk::TRUE);
         assert_eq!(
             native.s_type,
             vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO

@@ -765,6 +765,9 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     if icb_ref == 0 {
         return EncodeStatus::BadArgs("icb_exec_ref_zero");
     }
+    if req.primitive_restart != reims_vgpu_core::topology::PrimitiveRestart::MetalDefault {
+        return EncodeStatus::MetalFailed("metal_icb_primitive_restart_override_unsupported");
+    }
     let color_list: Vec<ColorRtRequest> = req.colors.clone();
     if color_list.is_empty() {
         return EncodeStatus::BadArgs("icb_exec_no_color_target");

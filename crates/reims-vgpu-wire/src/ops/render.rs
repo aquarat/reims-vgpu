@@ -568,6 +568,29 @@ pub fn set_front_facing<'a>(op: &Op<'a>) -> Result<&'a ModeState, WireError> {
     view::<ModeState>(op.payload)
 }
 
+// --- Primitive restart -----------------------------------------------------
+
+pub const OPCODE_SET_PRIMITIVE_RESTART: u32 = 0x91;
+pub const SET_PRIMITIVE_RESTART_TOTAL_LEN: u32 = 16;
+
+/// Both restart selectors write one record. Toggling the BOOL moves the
+/// first word between zero and one; changing the index from 0x11223344 to
+/// 0x89abcdef moves only the second. The one-argument form writes u32::MAX.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PrimitiveRestart {
+    pub enabled: U32le,
+    pub index: U32le,
+}
+
+// SAFETY: two align-1, all-bit-patterns-valid little-endian scalars.
+unsafe impl Wire for PrimitiveRestart {}
+
+pub fn primitive_restart<'a>(op: &Op<'a>) -> Result<&'a PrimitiveRestart, WireError> {
+    debug_assert_eq!(op.opcode(), OPCODE_SET_PRIMITIVE_RESTART);
+    view(op.payload)
+}
+
 // --- One-`float` state records ---------------------------------------------
 
 pub const OPCODE_SET_LINE_WIDTH: u32 = 0x88;
@@ -2090,6 +2113,10 @@ mod tests {
     /// padding, which would be a claim that nothing is ever there.
     #[test]
     fn a_record_either_fits_its_view_exactly_or_leaves_two_unwritten_bytes() {
+        assert_eq!(
+            size_of::<PrimitiveRestart>() + OP_HEADER_LEN,
+            SET_PRIMITIVE_RESTART_TOTAL_LEN as usize
+        );
         for (name, total, body) in RECORDS {
             let slack = *total as usize - OP_HEADER_LEN - body;
             assert!(

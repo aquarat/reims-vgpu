@@ -2032,7 +2032,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     let before = engine::counter_snapshot();
     let mut req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     req.indexed = Some(IndexedDrawResource {
-        index_type: IndexType::U16,
+        index_type: IndexType::Uint16,
         index_count: 3,
         vertex_offset: 0,
         content: BufferContent::GuestRuns(source),

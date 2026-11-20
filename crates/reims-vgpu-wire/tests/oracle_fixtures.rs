@@ -112,6 +112,7 @@ fn record_len_for(opcode: u32) -> Option<u32> {
         r::OPCODE_SET_VIEWPORT => r::SET_VIEWPORT_TOTAL_LEN,
         r::OPCODE_SET_BLEND_COLOR => r::SET_BLEND_COLOR_TOTAL_LEN,
         r::OPCODE_SET_STENCIL_REFERENCE => r::SET_STENCIL_REFERENCE_TOTAL_LEN,
+        r::OPCODE_SET_PRIMITIVE_RESTART => r::SET_PRIMITIVE_RESTART_TOTAL_LEN,
         r::OPCODE_SET_DEPTH_BIAS => r::SET_DEPTH_BIAS_TOTAL_LEN,
         r::OPCODE_SET_VISIBILITY_RESULT_MODE => r::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN,
         r::OPCODE_DRAW_PATCHES => r::DRAW_PATCHES_TOTAL_LEN,
@@ -2529,6 +2530,16 @@ fn every_render_fixture_reads_back_what_metal_was_asked_for() {
                     "{name}: this case exists to tell the two fields apart and its \
                      two values are equal again"
                 );
+            }
+            render::OPCODE_SET_PRIMITIVE_RESTART => {
+                let r = render::primitive_restart(&o).expect("restart state");
+                assert_eq!(r.enabled.get(), u32::from(case["expect"]["enabled"].as_bool().unwrap()));
+                let index = match selector {
+                    "setPrimitiveRestartEnabled:" => u64::from(u32::MAX),
+                    "setPrimitiveRestartEnabled:index:" => expect_u64(case, "index"),
+                    _ => panic!("unexpected restart selector {selector}"),
+                };
+                assert_eq!(u64::from(r.index.get()), index, "{name}");
             }
             render::OPCODE_SET_STENCIL_REFERENCE => {
                 let s = render::set_stencil_reference(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
