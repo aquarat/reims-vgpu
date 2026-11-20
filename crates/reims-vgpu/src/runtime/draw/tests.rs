@@ -2759,6 +2759,20 @@ fn a8_sample_preserves_alpha_coverage() {
 /// qemu-shim: guest Load with unresolvable mapper-ref-texture pages still encodes
 /// (archive NULL seed / Metal Clear invent) — does not drop the pass.
 #[test]
+fn a_secondary_gva_load_cannot_replace_the_primary_seed_decision() {
+    for primary_current in [false, true] {
+        let mut request = DrawEncodeRequest::default();
+        assert_eq!(
+            request.elide_next_gva_seed(|| primary_current),
+            primary_current
+        );
+        request.colors.push(ColorRtRequest::default());
+        assert!(!request.elide_next_gva_seed(|| panic!("no secondary resident LOAD rail")));
+        assert_eq!(request.gva_load_from_resident, primary_current);
+    }
+}
+
+#[test]
 fn mrt_draw_request_load_seed_miss_still_encodes() {
     use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::host::FakeHost;

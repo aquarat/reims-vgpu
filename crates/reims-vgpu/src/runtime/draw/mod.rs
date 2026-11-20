@@ -2428,6 +2428,19 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     })
 }
 
+impl DrawEncodeRequest {
+    /// Only the first attached colour can use the GVA resident LOAD rail.
+    /// A later attachment needs its own seed and cannot revise the choice
+    /// already made for the primary.
+    fn elide_next_gva_seed(&mut self, resident_current: impl FnOnce() -> bool) -> bool {
+        if !self.colors.is_empty() {
+            return false;
+        }
+        self.gva_load_from_resident = resident_current();
+        self.gva_load_from_resident
+    }
+}
+
 /// Build an MRT draw request from pass color slots (same dimensions required).
 #[allow(
     clippy::too_many_arguments,
@@ -2452,12 +2465,18 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     // policy and before this request is cloned by either encoder.
     let pipeline_sample_count =
         crate::backend::selected().pipeline_raster_sample_count(state, host, task_id, pipeline_ref);
-    let mut colors = Vec::new();
+    let mut request = DrawEncodeRequest {
+        task_id,
+        pipeline_ref,
+        vertex_count: draw.vertex_count,
+        instance_count: draw.instance_count,
+        primitive_type: draw.primitive_type,
+        first_vertex: draw.first_vertex,
+        base_instance: draw.base_instance,
+        ..Default::default()
+    };
     let mut base_w = 0u32;
     let mut base_h = 0u32;
-    // Colour0's LOAD seed was skipped in favour of the engine resident. Declared
-    // out here because it belongs to the request, not to the slot that set it.
-    let mut gva_load_from_resident = false;
     for &(slot, att) in color_slots {
         if att.texture_ref == 0 {
             // An empty colour slot is the guest declining to attach one, not a
@@ -2619,7 +2638,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 HostTarget::Heap => "mrt_slot_heap",
                 HostTarget::TwoPlane => "mrt_slot_two_plane",
             });
-            colors.push(ColorRtRequest {
+            request.colors.push(ColorRtRequest {
                 slot,
                 texture_ref: target_ref,
                 mapping_id: 0,
@@ -2796,27 +2815,21 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 // block on that same Store's writeback — the device's largest
                 // remaining wait. See `draw::vulkan::gva_resident_if_current`;
                 // the encode side honours the flag or re-seeds.
-                let elided = crate::backend::selected().gva_load_seed_elidable(
-                    state,
-                    host,
-                    task_id,
-                    GvaSpan {
-                        texture_ref: att.texture_ref,
-                        gva,
-                        row_stride: bpr,
-                        width: mw,
-                        height: mh,
-                        format: mfmt,
-                    },
-                );
-                // Only colour0. `gva_chain_identity` names the first attachment
-                // and the chain rail carries that one, so a second slot whose
-                // seed was skipped would reach the pass with nothing to load.
-                // `colors.is_empty()` is "this push becomes `colors[0]`", taken
-                // from the vector the identity will read rather than from the
-                // slot number, which is the guest's and need not start at zero.
-                let elided = elided && colors.is_empty();
-                gva_load_from_resident = elided;
+                let elided = request.elide_next_gva_seed(|| {
+                    crate::backend::selected().gva_load_seed_elidable(
+                        state,
+                        host,
+                        task_id,
+                        GvaSpan {
+                            texture_ref: att.texture_ref,
+                            gva,
+                            row_stride: bpr,
+                            width: mw,
+                            height: mh,
+                            format: mfmt,
+                        },
+                    )
+                });
                 if !elided {
                     seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
                     if seed.is_none() {
@@ -2828,7 +2841,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                 }
             }
         }
-        colors.push(ColorRtRequest {
+        request.colors.push(ColorRtRequest {
             slot,
             texture_ref: target_ref,
             mapping_id,
@@ -2846,21 +2859,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             host_only: None,
         });
     }
-    if colors.is_empty() {
-        return None;
-    }
-    Some(DrawEncodeRequest {
-        task_id,
-        pipeline_ref,
-        vertex_count: draw.vertex_count,
-        instance_count: draw.instance_count,
-        primitive_type: draw.primitive_type,
-        first_vertex: draw.first_vertex,
-        base_instance: draw.base_instance,
-        colors,
-        gva_load_from_resident,
-        ..Default::default()
-    })
+    (!request.colors.is_empty()).then_some(request)
 }
 
 /// Archive `apple_pv_gpu_write_gva_rgba`: tight RGBA8 → native rows at GVA.
