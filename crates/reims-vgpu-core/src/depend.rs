@@ -162,8 +162,7 @@ impl DependencyGraph {
         // before returning, so the next admission finds the capacity this one
         // grew. Both are cleared here rather than at the end, because a
         // panicking assertion above must not leave stale contents behind.
-        if self.retired >= COMPACT_RETIRED_FLOOR
-            && self.retired > self.entries.len() - self.retired
+        if self.retired >= COMPACT_RETIRED_FLOOR && self.retired > self.entries.len() - self.retired
         {
             self.compact();
         }
