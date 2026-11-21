@@ -5548,6 +5548,20 @@ mod more_tests {
         w
     }
 
+    /// An accepted module is not evidence that a validator is installed:
+    /// `validate` deliberately accepts when the tool is absent. Probe the
+    /// same configured executable (including tool-path overrides) instead.
+    fn validator_available() -> bool {
+        match metal2vulkan::tools::run("spirv-val", &["--version"]) {
+            Ok(_) => true,
+            Err(why) if why.starts_with("cannot run spirv-val") && why.contains("No such file") => {
+                eprintln!("SKIP SPIR-V validator test: {why}");
+                false
+            }
+            Err(why) => panic!("configured spirv-val probe failed: {why}"),
+        }
+    }
+
     /// The gate that stands between a guest's shader and undefined behaviour
     /// inside a driver.
     ///
@@ -5559,11 +5573,11 @@ mod more_tests {
     /// specified to accept: an absent instrument is not a verdict.
     #[test]
     fn a_module_a_validator_rejects_never_reaches_a_driver() {
-        let good = minimal_compute_module();
-        if validate(&good) != SpirvValidation::Accepted {
-            eprintln!("skip: no usable spirv-val, or it rejects the minimal module");
+        if !validator_available() {
             return;
         }
+        let good = minimal_compute_module();
+        assert_eq!(validate(&good), SpirvValidation::Accepted);
         // Point the function's return type at the function id instead of at
         // %void, which is a type error no driver has to survive.
         let mut bad = good.clone();
@@ -5591,11 +5605,10 @@ mod more_tests {
     /// the test could not fail.
     #[test]
     fn concurrent_validations_do_not_collide() {
-        let good = minimal_compute_module();
-        if validate(&good) != SpirvValidation::Accepted {
-            eprintln!("skip: no usable spirv-val");
+        if !validator_available() {
             return;
         }
+        let good = minimal_compute_module();
         let verdicts: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
