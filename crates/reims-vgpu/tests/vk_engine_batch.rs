@@ -57,13 +57,16 @@ fn engine_device() -> &'static reims_vgpu::model::DeviceState {
     })
 }
 
-fn engine_test_lock() -> &'static Mutex<()> {
+fn engine_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| {
         // Never share the live product logs with a concurrent boot.
         reims_vgpu::observe::redirect_logs_for_tests();
         Mutex::new(())
     })
+    .lock()
+    // This lock serializes tests; it protects no suite data of its own.
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn fixtures() -> PathBuf {
@@ -140,7 +143,7 @@ fn heartbeat_retires_a_guest_alias_after_its_fence_without_another_draw() {
         }
     }
 
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_499,
@@ -249,7 +252,7 @@ fn half_scissor(left: bool) -> ScissorResource {
 /// intra-CB pass boundary.
 #[test]
 fn batched_draws_compose_and_flush_on_read() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_101,
@@ -317,7 +320,7 @@ fn batched_draws_compose_and_flush_on_read() {
 /// optimized recording honest.
 #[test]
 fn one_metal_encoder_continues_one_vulkan_render_pass() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_102,
@@ -373,7 +376,7 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
 /// finally closes the Vulkan pass and resolves it.
 #[test]
 fn one_multisample_encoder_resolves_after_its_last_draw() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_103,
@@ -435,7 +438,7 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
 /// an implicit resolve or a linear image-to-buffer copy.
 #[test]
 fn stored_multisample_target_survives_for_a_later_encoder() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_104,
@@ -511,7 +514,7 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
 /// existed, on a rail where that refusal alone was 26 % of all draws.
 #[test]
 fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let a = TargetIdentity::Surface {
         id: 990_201,
@@ -591,7 +594,7 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
 /// copy would be queued ahead of the batched draws producing the content.
 #[test]
 fn prefetch_arm_flushes_open_batch() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_301,
@@ -636,7 +639,7 @@ fn prefetch_arm_flushes_open_batch() {
 /// is visible.
 #[test]
 fn the_window_publish_flushes_the_open_batch_before_it_vouches() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_501,
@@ -714,7 +717,7 @@ fn the_window_publish_flushes_the_open_batch_before_it_vouches() {
 /// and is not a steady-state draw.
 #[test]
 fn a_warm_repeat_draw_does_not_enter_the_allocator() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_601,
@@ -834,7 +837,7 @@ fn a_warm_repeat_draw_does_not_enter_the_allocator() {
 /// would report the same zero for the wrong reason.
 #[test]
 fn a_warm_repeat_draw_that_binds_descriptors_and_vertex_buffers_does_not_allocate() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_701,
@@ -948,7 +951,7 @@ fn a_warm_repeat_draw_that_binds_descriptors_and_vertex_buffers_does_not_allocat
 /// environment; a copied constant would test the wrong boundary on one arm.
 #[test]
 fn batch_length_cap_flushes_and_reopens() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_401,
@@ -1006,7 +1009,7 @@ fn batch_length_cap_flushes_and_reopens() {
 /// backing can even be dropped before the flush.
 #[test]
 fn batched_guest_runs_buffer_snapshots_at_record() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_401,
@@ -1100,7 +1103,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
 /// case would pass with the offset arithmetic broken.
 #[test]
 fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let identity = TargetIdentity::Surface {
@@ -1263,7 +1266,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_407,
@@ -1457,7 +1460,7 @@ fn the_gathered_window_reaches_the_shader_with_every_stretch_at_its_window_offse
     // indices: the shader reads the first word of each.
     const WORDS_PER_STRETCH: usize = (STRETCH / 4) as usize;
 
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
 
     // Only the fragment stage is ours. `render_tri.air` already puts a triangle
     // over the target from `vertex_count: 3` with no vertex buffers, and a
@@ -1645,7 +1648,7 @@ fn a_wide_window_is_gathered_by_the_gpu_and_still_lands_the_right_bytes() {
     // test fails the moment anyone puts a region ceiling back.
     const RUNS: u64 = 65;
 
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
 
     let vert = translate_words("render_tri.air", Stage::Vertex);
     let Some(frag) = glsl_words(
@@ -1819,7 +1822,7 @@ fn a_single_stretch_window_is_bound_in_place_and_the_shader_reads_the_guest_byte
     const WORDS_PER_STRETCH: usize = (STRETCH / 4) as usize;
     const WINDOW: u64 = STRETCH * 3;
 
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
 
     let vert = translate_words("render_tri.air", Stage::Vertex);
     let Some(frag) = glsl_words(
@@ -1963,7 +1966,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     use reims_vgpu::runtime::guest_ram::{granularity, GuestRamImport, GuestRamRegion, GuestRef};
     use reims_vgpu::runtime::guest_ram_map::GuestWindowRun;
 
-    let _guard = engine_test_lock().lock().unwrap();
+    let _guard = engine_test_lock();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 990_411,

@@ -3797,7 +3797,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     // The framebuffer's attachment views in attachment order, kept for the
     // framebuffer-fetch descriptors: input N is attachment N's view.
-    let mut attachment_views: Vec<vk::ImageView> = Vec::new();
+    let mut ad_hoc_views = None;
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
@@ -3865,7 +3865,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                attachment_views.clone_from(&views);
+                ad_hoc_views = Some(views);
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
@@ -3902,7 +3902,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                attachment_views.clone_from(&views);
+                ad_hoc_views = Some(views);
                 if let Some(d) = depth_attachment.as_ref() {
                     transient_depth = Some((d.owned, fb));
                 }
@@ -4433,9 +4433,9 @@ pub(crate) unsafe fn execute_draw_inner(
     // Framebuffer fetch: the input attachment IS the color target's view;
     // derive the same layout as the subpass reference. A draw that also
     // samples the target upgrades both from GENERAL to the feedback layout.
-    if attachment_views.is_empty() {
-        attachment_views.push(target_view);
-    }
+    let attachment_views = ad_hoc_views
+        .as_deref()
+        .unwrap_or(std::slice::from_ref(&target_view));
     let color_inputs: Vec<(u32, vk::ImageView, vk::ImageLayout)> = (0..u8::BITS as usize)
         .filter(|&index| pass_key.color_input(index))
         .filter_map(|index| {
