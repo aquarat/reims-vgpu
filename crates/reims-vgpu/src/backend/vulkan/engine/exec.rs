@@ -3151,7 +3151,26 @@ pub(crate) unsafe fn execute_draw_inner(
     // The second question used to have no representation here, so both answers
     // resolved to `CLEAR` and an unseeded preserving pass was cleared to a
     // colour the guest never supplied. See [`Color0Load`].
-    let color0_load = if load_uses_gpu_content
+    let color0_load = if req.multisample_resolve {
+        // The load op belongs to the *source*. Neither the resolved image nor
+        // a linear guest seed contains the individual samples.
+        use reims_vgpu_protocol::pass_action::LoadAction;
+        if req.continues_render_pass {
+            Color0Load::Preserve
+        } else {
+            match req.color0_declared {
+                Some(LoadAction::Load) => {
+                    return Err(DrawError::Unsupported(
+                        super::reason::DrawReason::MultisampleLoadActionUnsupported {
+                            load_action: reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_LOAD,
+                        },
+                    ))
+                }
+                Some(LoadAction::DontCare) => Color0Load::Undefined,
+                Some(LoadAction::Clear) | None => Color0Load::Clear,
+            }
+        }
+    } else if load_uses_gpu_content
         || seed_bytes.is_some()
         || req.target_guest_seed.is_some()
         || req.seed_from_target.is_some()
@@ -3843,36 +3862,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     },
                 ));
             }
-            let primary_image = t.image;
-            let primary_view = attachment_view;
-            let primary_access = t.access;
-            let primary_slot_fb = t.framebuffer;
-            if ordinary_ad_hoc_framebuffer {
-                let views = ad_hoc_attachment_views(
-                    ctx,
-                    pools,
-                    counters,
-                    req,
-                    primary_view,
-                    depth_attachment.as_ref().map(|d| d.view),
-                    &mut mrt_secondaries,
-                )?;
-                let fb = pools.ensure_ad_hoc_framebuffer(
-                    ctx,
-                    render_pass,
-                    &views,
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
-                attachment_views.clone_from(&views);
-                if let Some(d) = depth_attachment.as_ref() {
-                    transient_depth = Some((d.owned, fb));
-                }
-                (primary_image, fb, primary_access, primary_view)
-            } else {
-                (primary_image, primary_slot_fb, primary_access, primary_view)
-            }
+            (t.image, t.framebuffer, t.access, attachment_view)
         } else {
             let target_key = TargetKey {
                 width: req.width,
@@ -3883,67 +3873,50 @@ pub(crate) unsafe fn execute_draw_inner(
             // its cached framebuffer), and build the draw's own framebuffer under
             // `render_pass` whenever the two pass shapes differ.
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
-            let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
-            if ordinary_ad_hoc_framebuffer {
-                let views = ad_hoc_attachment_views(
-                    ctx,
-                    pools,
-                    counters,
-                    req,
-                    pool_view,
-                    depth_attachment.as_ref().map(|d| d.view),
-                    &mut mrt_secondaries,
-                )?;
-                let fb = pools.ensure_ad_hoc_framebuffer(
-                    ctx,
-                    render_pass,
-                    &views,
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
-                attachment_views.clone_from(&views);
-                if let Some(d) = depth_attachment.as_ref() {
-                    transient_depth = Some((d.owned, fb));
-                }
-                (
-                    pool_image,
-                    fb,
-                    super::pools::ResidentAccess::Untouched,
-                    pool_view,
-                )
-            } else {
-                (
-                    pool_image,
-                    pool_fb,
-                    super::pools::ResidentAccess::Untouched,
-                    pool_view,
-                )
-            }
+            (
+                t.image,
+                t.framebuffer,
+                super::pools::ResidentAccess::Untouched,
+                t.view,
+            )
         };
-    let _multisample_source_image = if req.multisample_resolve {
-        let (image, _view, framebuffer) = pools.acquire_multisample_target(
+    if ad_hoc_framebuffer {
+        attachment_views = ad_hoc_attachment_views(
             ctx,
-            super::pools::MultisampleTargetKey {
-                width: req.width,
-                height: req.height,
-                format: color0_format,
-                samples: raster_sample_count,
-                compatibility: pass_key.framebuffer_compatibility(),
-                resolve_view: target_view,
-                depth_view: depth_attachment.as_ref().map(|depth| depth.view),
-                transient_depth: depth_attachment
-                    .as_ref()
-                    .is_some_and(|depth| depth.owned.is_some()),
-            },
+            pools,
+            counters,
+            req,
+            target_view,
+            depth_attachment.as_ref().map(|d| d.view),
+            &mut mrt_secondaries,
+        )?;
+        if req.multisample_resolve {
+            let source = pools.acquire_multisample_target(
+                ctx,
+                super::pools::MultisampleTargetKey {
+                    width: req.width,
+                    height: req.height,
+                    format: color0_format,
+                    samples: raster_sample_count,
+                },
+                req.continues_render_pass.then_some(target_view),
+                counters,
+            )?;
+            attachment_views.insert(0, source);
+        }
+        target_fb = pools.ensure_ad_hoc_framebuffer(
+            ctx,
             render_pass,
+            pass_key.compatibility(),
+            &attachment_views,
+            req.width,
+            req.height,
             counters,
         )?;
-        target_fb = framebuffer;
-        Some(image)
-    } else {
-        None
-    };
+        if let Some(d) = depth_attachment.as_ref() {
+            transient_depth = Some((d.owned, target_fb));
+        }
+    }
     // A guest-page LOAD is fallback material for an ordinary resident, not a
     // second source beside an imported attachment. Target admission has to run
     // first because only the admitted resource can answer which one this draw
@@ -5676,6 +5649,9 @@ pub(crate) unsafe fn execute_draw_inner(
         && batch_eligible
         && !pass_churn_probe_enabled()
         && !layout_churn_probe_enabled();
+    if req.multisample_resolve && req.render_pass_continues {
+        pools.retain_multisample_samples(target_view);
+    }
     if keep_pass_open {
         crate::runtime::drain::note_store_route("pass_left_open");
     } else {
@@ -6399,6 +6375,11 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
         })?;
     }
     if let Some(d) = &req.depth {
+        if req.multisample_resolve {
+            // The resolve destination precedes depth in the framebuffer. Its
+            // load op ignores this placeholder, but depth still needs its index.
+            clear.push(vk::ClearValue::default())?;
+        }
         clear.push(vk::ClearValue {
             depth_stencil: vk::ClearDepthStencilValue {
                 depth: d.clear_value,

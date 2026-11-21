@@ -1955,6 +1955,7 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         render_pass: vk::RenderPass,
+        compatibility: super::PassCompatibilityKey,
         views: &[vk::ImageView],
         width: u32,
         height: u32,
@@ -1962,7 +1963,7 @@ impl ResourcePools {
     ) -> Result<vk::Framebuffer, DrawError> {
         use ash::vk::Handle;
         let key = super::AdHocFramebufferKey {
-            render_pass: render_pass.as_raw(),
+            compatibility,
             views: views.iter().map(|v| v.as_raw()).collect(),
             width,
             height,

@@ -373,6 +373,15 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
 /// finally closes the Vulkan pass and resolves it.
 #[test]
 fn one_multisample_encoder_resolves_after_its_last_draw() {
+    check_multisample_chain(false);
+}
+
+#[test]
+fn multisample_samples_survive_a_depth_framebuffer_change_within_the_encoder() {
+    check_multisample_chain(true);
+}
+
+fn check_multisample_chain(split: bool) {
     let _guard = engine_test_lock().lock().unwrap();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
@@ -406,6 +415,18 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
     second.color_sample_count = 4;
     second.multisample_resolve = true;
     second.continues_render_pass = true;
+    second.color0_declared = Some(reims_vgpu_protocol::pass_action::LoadAction::Load);
+    if split {
+        second.depth = Some(DepthState {
+            identity: None,
+            test_enable: true,
+            write_enable: false,
+            compare: SamplerCompareFunction::LessEqual,
+            clear_value: 1.0,
+            load: false,
+            stencil: None,
+        });
+    }
     engine::execute_draw_request(engine_device(), &second)
         .expect("multisample encoder second draw");
 
@@ -415,8 +436,9 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
         .expect("an eight-bit colour readback");
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        delta.render_pass_continuations, 1,
-        "the resolve must occur after both draws in one pass: {delta:?}"
+        delta.render_pass_continuations,
+        u64::from(!split),
+        "the host pass can continue only with compatible attachments: {delta:?}"
     );
     for y in [0u32, H / 2, H - 1] {
         for x in [W / 4, 3 * W / 4] {
@@ -428,6 +450,14 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
             );
         }
     }
+    second.continues_render_pass = false;
+    let err = engine::execute_draw_request(engine_device(), &second)
+        .err()
+        .expect("a new encoder cannot load discarded samples");
+    assert_eq!(
+        reims_vgpu::observe::Decline::slug(&err),
+        "multisample_load_action_unsupported"
+    );
 }
 
 /// A stored multisample texture is itself the resource. It remains resident

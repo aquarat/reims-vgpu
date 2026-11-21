@@ -2142,7 +2142,15 @@ impl ObjectCaches {
         // second spelling here would make that skip a missing transition the
         // first time somebody changed one of them.
         let color0_final = key.color_final_layout(0);
-        let (load_op, initial) = key.color0_load.ops(color0_final);
+        // In a resolve pass the multisample scratch and the guest-visible
+        // destination are different images. Only the latter can be imported;
+        // its placement must not change the scratch's layout across draws.
+        let source_final = if key.multisample_resolve {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            color0_final
+        };
+        let (load_op, initial) = key.color0_load.ops(source_final);
         // Slot 0 (primary) and the secondary attachments (slot 1..) now exit the
         // same way, at [`color0_pass_exit_layout`], and for the same reason: a
         // consumer's barrier is what establishes the dependency, so leaving the
@@ -2161,7 +2169,7 @@ impl ObjectCaches {
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(initial)
-            .final_layout(color0_final)];
+            .final_layout(source_final)];
         // Framebuffer fetch: when attachment 0 is also a subpass input, BOTH
         // references must use GENERAL (same-attachment color+input requires it);
         // the pass still transitions initial→GENERAL→final automatically.
@@ -2208,7 +2216,7 @@ impl ObjectCaches {
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                     .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-                    .initial_layout(color0_layout)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
                     .final_layout(color0_final),
             );
             resolve_ref.push(
