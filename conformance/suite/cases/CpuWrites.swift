@@ -16,22 +16,6 @@ import IOSurface
 // distinction a screenshot cannot draw.
 // ---------------------------------------------------------------------------
 
-let quadVerts: [Float] = [
-    // x, y, u, v -- a triangle strip covering the whole target
-    -1, -1, 0, 1,
-     1, -1, 1, 1,
-    -1,  1, 0, 0,
-     1,  1, 1, 0,
-]
-
-func makeRenderPipeline(_ fragment: String, _ fmt: MTLPixelFormat) -> MTLRenderPipelineState? {
-    let d = MTLRenderPipelineDescriptor()
-    d.vertexFunction = library.makeFunction(name: "quad_vs")
-    d.fragmentFunction = library.makeFunction(name: fragment)
-    d.colorAttachments[0].pixelFormat = fmt
-    return try? dev.makeRenderPipelineState(descriptor: d)
-}
-
 func renderTargetCases() {
     let w = 64, h = 64
     let fmt = MTLPixelFormat.bgra8Unorm

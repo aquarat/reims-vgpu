@@ -65,8 +65,6 @@ func fragmentAliasCase(_ f: Fmt, _ w: Int, _ h: Int, pitch: Pitch) {
     }
 }
 
-let texPipeline = makeRenderPipeline("tex_fs", .rgba8Unorm)
-
 // ---------------------------------------------------------------------------
 // F2. The same alias, filled so that every byte names its own offset.
 //
@@ -195,8 +193,6 @@ func targetWidthCase(_ w: Int, _ h: Int) {
                        : "\(bad.count)/\(w * h) wrong zero=\(zero) still_clear=\(cleared) "
                          + "alignUp(w,8)-w=\(pad) \(badMap(bad, w, h))")
 }
-
-let solidPipeline = makeRenderPipeline("solid_fs", .rgba8Unorm)
 
 // ---------------------------------------------------------------------------
 // F4. `dispatchThreads` must run the grid it is given and not one thread more.
