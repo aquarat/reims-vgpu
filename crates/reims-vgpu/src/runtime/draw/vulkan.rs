@@ -5263,6 +5263,8 @@ fn native_uploads_asking_host() -> NativeUploads {
         // filter by mandate. So this one is genuinely a per-host answer and the
         // conjunction above would hide it.
         float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
+        rgba16_unorm: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Unorm),
+        rg11b10_float: engine::supports_sampled_layout_linear_filter(TexelLayout::Rg11b10Float),
         ..NativeUploads::BGRA8
     }
 }
@@ -9297,7 +9299,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // A wide GVA attachment is seeded with its own texel from
                     // the guest's pages: the RGBA8 seed below would clamp a
                     // half-float frame to [0, 1] before this pass loads it.
-                    let native_seed = (c0.target_seed_rgba.is_some() && c0.target_gva != 0)
+                    let native_seed = ((declared == LoadAction::Load
+                        || c0.target_seed_rgba.is_some())
+                        && c0.target_gva != 0)
                         .then(|| native_gva_seed(state, host, req.task_id, c0, w, h))
                         .flatten();
                     if let Some((bytes, layout)) = native_seed {
