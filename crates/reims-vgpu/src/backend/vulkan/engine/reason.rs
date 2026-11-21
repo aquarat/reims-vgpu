@@ -421,6 +421,28 @@ impl crate::observe::Decline for DrawReason {
             Self::SwapchainSurface(refusal) => refusal.slug(),
         }
     }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::UsedBindingAbsentFromLayout { binding, fragment } => vec![
+                ("binding", binding.to_string()),
+                (
+                    "stage",
+                    if *fragment { "fragment" } else { "vertex" }.into(),
+                ),
+            ],
+            Self::MultisampleResolveShapeUnsupported {
+                color_targets,
+                depth,
+                color_input,
+            } => vec![
+                ("color_targets", color_targets.to_string()),
+                ("depth", u8::from(*depth).to_string()),
+                ("color_input", u8::from(*color_input).to_string()),
+            ],
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Display for DrawReason {
@@ -430,9 +452,12 @@ impl std::fmt::Display for DrawReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "reason={}", self.slug())?;
         match self {
-            Self::UsedBindingAbsentFromLayout { binding, fragment } => {
-                let stage = if *fragment { "fragment" } else { "vertex" };
-                write!(f, " binding={binding} stage={stage}")
+            Self::UsedBindingAbsentFromLayout { .. }
+            | Self::MultisampleResolveShapeUnsupported { .. } => {
+                for (key, value) in self.fields() {
+                    write!(f, " {key}={value}")?;
+                }
+                Ok(())
             }
             Self::ResidentSampledNot2d { binding }
             | Self::GuestRunSampledNot2d { binding }
@@ -484,16 +509,6 @@ impl std::fmt::Display for DrawReason {
             Self::MultisampleLoadActionUnsupported { load_action } => {
                 write!(f, " load_action={load_action}")
             }
-            Self::MultisampleResolveShapeUnsupported {
-                color_targets,
-                depth,
-                color_input,
-            } => write!(
-                f,
-                " color_targets={color_targets} depth={} color_input={}",
-                u8::from(*depth),
-                u8::from(*color_input)
-            ),
             Self::ColorAttachmentFormat(reason)
             | Self::VertexFormat(reason)
             | Self::VisibilityResultMode(reason) => {
