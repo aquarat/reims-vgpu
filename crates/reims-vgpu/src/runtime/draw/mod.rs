@@ -2835,7 +2835,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
                     seed = seed_color_load(state, host, task_id, att.texture_ref, gva, mw, mh);
                     if seed.is_none() {
                         crate::observe::fail(format!(
-                            "color LOAD seed miss ref={} {}x{} fmt={:#x} gva={:#x} (archive: still encode)",
+                            "color LOAD has no RGBA8 seed ref={} {}x{} fmt={:#x} gva={:#x} (native attachment seed may still be available)",
                             att.texture_ref, mw, mh, mfmt, gva
                         ));
                     }

@@ -7621,14 +7621,28 @@ fn note_draw_shape(req: &DrawEncodeRequest) {
 /// is that layout and the engine can stage the bytes as they are; and only
 /// when the loader hands the frame back in that layout at the attachment's
 /// extent.
-fn native_gva_seed<M: HostMemory + HostOps>(
+pub(super) fn native_gva_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     c0: &ColorRtRequest,
-    width: u32,
-    height: u32,
+    extent: (u32, u32),
+    action: reims_vgpu_protocol::pass_action::LoadAction,
+    uploads: impl FnOnce() -> NativeUploads,
 ) -> Option<(Vec<u8>, TexelLayout)> {
+    // A LOAD requires the prior texels even when they have no RGBA8 loader
+    // (R16Float, for example). The converted fallback is not the authority
+    // for that requirement. Keep seedless DontCare free of a guest read.
+    use reims_vgpu_protocol::pass_action::LoadAction;
+    let load = match action {
+        LoadAction::Load => true,
+        LoadAction::DontCare => c0.target_seed_rgba.is_some(),
+        LoadAction::Clear => false,
+    };
+    if !load || c0.target_gva == 0 {
+        return None;
+    }
+    let (width, height) = extent;
     let layout = crate::runtime::render_writeback::vulkan::stored_texel_layout(c0.format).filter(
         |&layout| crate::runtime::render_writeback::vulkan::eight_bit_store_loses(layout),
     )?;
@@ -7643,7 +7657,7 @@ fn native_gva_seed<M: HostMemory + HostOps>(
         host,
         task_id,
         c0.texture_ref,
-        native_uploads_asking_host(),
+        uploads(),
         crate::runtime::render_writeback::SettleSite::LinearTextureSeed,
     )?;
     let fits = loaded.format.layout() == layout
@@ -9295,9 +9309,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // A wide GVA attachment is seeded with its own texel from
                     // the guest's pages: the RGBA8 seed below would clamp a
                     // half-float frame to [0, 1] before this pass loads it.
-                    let native_seed = (c0.target_seed_rgba.is_some() && c0.target_gva != 0)
-                        .then(|| native_gva_seed(state, host, req.task_id, c0, w, h))
-                        .flatten();
+                    let native_seed = native_gva_seed(
+                        state,
+                        host,
+                        req.task_id,
+                        c0,
+                        (w, h),
+                        declared,
+                        native_uploads_asking_host,
+                    );
                     if let Some((bytes, layout)) = native_seed {
                         seed_door = "color_seed_native";
                         target_rgba8 = Some(std::sync::Arc::new(bytes));

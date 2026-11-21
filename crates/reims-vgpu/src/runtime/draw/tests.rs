@@ -8453,6 +8453,43 @@ fn put_linear_texture(
     u64::from(handle) << RESOURCE_PAGE_SHIFT
 }
 
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn native_gva_load_preserves_r16_texels_without_an_rgba8_fallback() {
+    use crate::protocol::pass_action::LoadAction;
+    use crate::protocol::pixel_format::{TexelLayout, MTL_FORMAT_R16_FLOAT};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+    assert!(state.set_object_list(1, 0, 256));
+    let gva = put_linear_texture(&mut state, &mut host, 199, (2, 2, 8), MTL_FORMAT_R16_FLOAT);
+    let row = [0x00, 0xbc, 0x55, 0x35]; // -1 and a non-unorm8 half
+    for offset in [0, 8] {
+        write_task_gva_arm64e(&mut host, &state.tasks[1], gva + offset, &row);
+    }
+    let target = ColorRtRequest {
+        texture_ref: 199,
+        target_gva: gva,
+        row_stride: 8,
+        width: 2,
+        height: 2,
+        format: MTL_FORMAT_R16_FLOAT,
+        ..Default::default()
+    };
+    let mut seed = |action| {
+        native_gva_seed(&mut state, &mut host, 1, &target, (2, 2), action, || {
+            NativeUploads::ALL
+        })
+    };
+    assert_eq!(
+        seed(LoadAction::Load),
+        Some((row.repeat(2), TexelLayout::R16Float))
+    );
+    assert_eq!(seed(LoadAction::Clear), None);
+    assert_eq!(seed(LoadAction::DontCare), None);
+}
+
 /// A fragment storage texture resolves to the resident a colour pass into the
 /// same texture renders into — the GVA identity of its own pages, in the format
 /// the primary attachment rail gives that texture (`gva_resident_format`) — and
