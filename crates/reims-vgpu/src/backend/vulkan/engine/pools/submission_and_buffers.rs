@@ -859,7 +859,7 @@ impl ResourcePools {
 
     /// Free `(set, owning_pool)` pairs back to their allocating blocks.
     pub(crate) unsafe fn free_descriptor_sets(
-        &self,
+        &mut self,
         device: &ash::Device,
         sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
     ) {
