@@ -3384,12 +3384,13 @@ mod tests {
             );
         };
         let create = |l: &mut Lifecycle, task| {
-            let _ = l.apply(&LifecycleOp::CreateResource {
-                task,
-                slot: ObjectListRef(88),
-                storage: Storage::NoBytes,
-            })
-            .expect("declares");
+            let _ = l
+                .apply(&LifecycleOp::CreateResource {
+                    task,
+                    slot: ObjectListRef(88),
+                    storage: Storage::NoBytes,
+                })
+                .expect("declares");
         };
         use crate::resolve::TaskNamespaces as _;
         define(&mut l, TaskId(1));
@@ -3400,7 +3401,11 @@ mod tests {
         let two = l.resource(TaskId(2), 88).expect("named");
         assert_eq!(one.slot, two.slot);
         assert_ne!(one, two, "one slot in two tasks is two objects");
-        assert_eq!(one.generation, SlotGeneration(1), "the first task mints what it always has");
+        assert_eq!(
+            one.generation,
+            SlotGeneration(1),
+            "the first task mints what it always has"
+        );
 
         let _ = l
             .apply(&LifecycleOp::DefineTask {

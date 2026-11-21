@@ -2139,8 +2139,14 @@ fn a_waiting_vcpu_ends_the_tranche_at_the_next_packet() {
         0,
         "the rest of the ring stays queued on its channel"
     );
-    assert!(state.pending.lock_yield, "the stop is recorded for device_drain");
-    assert!(!state.pending.host_action_yield, "and is not a present yield");
+    assert!(
+        state.pending.lock_yield,
+        "the stop is recorded for device_drain"
+    );
+    assert!(
+        !state.pending.host_action_yield,
+        "and is not a present yield"
+    );
 
     // device_drain clears the flag when it hands the lock over; the vCPU drops
     // its count once it holds the lock.
@@ -2148,7 +2154,11 @@ fn a_waiting_vcpu_ends_the_tranche_at_the_next_packet() {
     state.gfx.vcpu_lock_wanted.store(0, Ordering::Release);
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), ring.len() as u32);
-    assert_eq!(host.get_u32(stamp_gpa + 4), 33, "every packet still completes, in order");
+    assert_eq!(
+        host.get_u32(stamp_gpa + 4),
+        33,
+        "every packet still completes, in order"
+    );
     assert!(!state.pending.lock_yield);
 }
 
@@ -2176,9 +2186,10 @@ fn pending_channels_are_drained_in_turns() {
     state.gfx.root_page = root_pfn;
     state.gfx.fifo_base_page = stamp_pfn;
     let mut heads = Vec::new();
-    for (channel, list_pfn, ring_pfn, words) in
-        [(3u32, 0x20u32, 0x30u32, vec![10u32, 30]), (5, 0x21, 0x31, vec![20])]
-    {
+    for (channel, list_pfn, ring_pfn, words) in [
+        (3u32, 0x20u32, 0x30u32, vec![10u32, 30]),
+        (5, 0x21, 0x31, vec![20]),
+    ] {
         let list_gpa = state.pfn_gpa(list_pfn);
         let ring_gpa = state.pfn_gpa(ring_pfn);
         host.map_range(list_gpa, page_size, 0);
@@ -2201,7 +2212,11 @@ fn pending_channels_are_drained_in_turns() {
 
     drain_pending(&mut state, &mut host);
     for (regs_gpa, len) in heads {
-        assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), len, "every ring drained");
+        assert_eq!(
+            host.get_u32(regs_gpa + CHILD_REG_HEAD),
+            len,
+            "every ring drained"
+        );
     }
     assert_eq!(state.pending.child_mask, 0);
     assert_eq!(

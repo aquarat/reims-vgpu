@@ -38,6 +38,16 @@ if CommandLine.arguments.contains("--indexed-draw-only") {
     finish()
 }
 
+if CommandLine.arguments.contains("--iosurface-only") {
+    _ = library
+    report("shader_compile", true, "runtime library built")
+    for width in [16, 60] {
+        iosurfaceCases(width, 16)
+        cpuWriteThenSampleCase(width, 16, iosurface: true)
+    }
+    finish()
+}
+
 // Shaderless by construction. A mismatch in either case is driver-owned, and
 // still runs if a later shader-library build exposes a translator failure.
 integerClearCases()

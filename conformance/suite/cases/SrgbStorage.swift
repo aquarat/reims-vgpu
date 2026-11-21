@@ -244,14 +244,13 @@ func srgbReadCase(_ backing: SrgbBacking, _ w: Int, _ h: Int) {
             let at = (y * w + x) * 4
             let b = Int(fill[at]), g = Int(fill[at + 1]), r = Int(fill[at + 2]), a = Int(fill[at + 3])
             // `read_texels` reports round(value * 255) per channel, RGBA.
-            let want = [srgbDecode(r), srgbDecode(g), srgbDecode(b)].map {
+            let want: [Int] = [srgbDecode(r), srgbDecode(g), srgbDecode(b)].map {
                 Int(($0 * 255.0).rounded())
             } + [a]
             let v = got[y * w + x]
             let have = [Int(v & 0xFF), Int((v >> 8) & 0xFF), Int((v >> 16) & 0xFF), Int(v >> 24)]
-            let ok = (0..<4).allSatisfy { c in
-                c == 3 ? have[c] == want[c] : abs(have[c] - want[c]) <= 1
-            }
+            let rgbOK = (0..<3).allSatisfy { c in abs(have[c] - want[c]) <= 1 }
+            let ok = rgbOK && have[3] == want[3]
             if !ok {
                 bad.append((x, y))
                 if firstDetail.isEmpty {

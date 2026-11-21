@@ -127,19 +127,14 @@ pub(crate) struct MultisampleTargetKey {
     pub height: u32,
     pub format: vk::Format,
     pub samples: u32,
-    pub compatibility: FramebufferCompatibilityKey,
-    pub resolve_view: vk::ImageView,
-    pub depth_view: Option<vk::ImageView>,
-    /// The depth view dies with this draw and therefore cannot make the cached
-    /// framebuffer reusable, even if the driver later recycles its raw handle.
-    pub transient_depth: bool,
 }
 
 pub(crate) struct MultisampleTargetSlot {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
     pub view: vk::ImageView,
-    pub framebuffer: vk::Framebuffer,
+    /// Only a non-final draw leaves samples for its successor in this encoder.
+    pub continuation: Option<vk::ImageView>,
     pub key: MultisampleTargetKey,
 }
 
@@ -751,11 +746,12 @@ pub(crate) struct PassEcho {
 /// from the first — except that it is a *different handle*, which is precisely
 /// what [`PassEcho`] compares.
 ///
-/// Handles are keyed by their raw `u64` rather than by the ash newtype, matching
-/// how `targets` already keys a render pass.
+/// A pass's load actions do not participate in framebuffer compatibility.
+/// Keying on the handle would rebuild the framebuffer on every clear-to-load
+/// transition, preventing an otherwise legal continuation of the open pass.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AdHocFramebufferKey {
-    pub(crate) render_pass: u64,
+    pub(crate) compatibility: PassCompatibilityKey,
     pub(crate) views: Vec<u64>,
     pub(crate) width: u32,
     pub(crate) height: u32,

@@ -70,6 +70,8 @@ static id gStagingBuffer;
 @interface CaptureCommandStream : NSObject
 @end
 
+static unsigned long long gNextTraceID;
+
 @implementation CaptureCommandStream
 - (id<MTLDevice>)device { return gDevice; }
 - (NSString *)label { return @"reims-wire-oracle"; }
@@ -108,8 +110,7 @@ static id gStagingBuffer;
 - (void)beginContinuation {}
 - (void)merge:(id)o {}
 - (unsigned long long)getNextTraceID {
-  static unsigned long long t = 1;
-  return t++;
+  return gNextTraceID++;
 }
 
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {

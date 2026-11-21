@@ -382,6 +382,7 @@ pub enum StorageImageSelector {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampledClass {
+    Rg11b10Float,
     A8Unorm,
     R8Unorm,
     Rg8Unorm,
@@ -813,6 +814,7 @@ impl TexelLayout {
                 | Self::Rgba16Float
                 | Self::Bgr10a2Unorm
                 | Self::Rgb10a2Unorm
+                | Self::Rg11b10Float
                 | Self::Rg16Uint
         )
     }
@@ -1808,6 +1810,7 @@ pub fn is_srgb(format: u16) -> bool {
 /// again not a capability claim.
 pub fn sampled_class(format: u16) -> Option<SampledClass> {
     Some(match format {
+        MTL_FORMAT_RG11B10_FLOAT => SampledClass::Rg11b10Float,
         MTL_FORMAT_A8_UNORM => SampledClass::A8Unorm,
         MTL_FORMAT_R8_UNORM => SampledClass::R8Unorm,
         MTL_FORMAT_RG8_UNORM => SampledClass::Rg8Unorm,
@@ -2052,7 +2055,8 @@ pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
         | MTL_FORMAT_R16_FLOAT
         | MTL_FORMAT_R8_UNORM
         | MTL_FORMAT_BGR10A2_UNORM
-        | MTL_FORMAT_RGB10A2_UNORM => ColorNumericType::Float,
+        | MTL_FORMAT_RGB10A2_UNORM
+        | MTL_FORMAT_RG11B10_FLOAT => ColorNumericType::Float,
         MTL_FORMAT_RG16_UINT => ColorNumericType::Uint,
         _ => return None,
     })
@@ -2111,6 +2115,7 @@ pub fn render_target_numeric_type(format: u16) -> Option<ColorNumericType> {
 /// how they are stored, and only the storage matters to a copy.
 pub fn store_texel_order(format: u16) -> Option<TexelLayout> {
     Some(match format {
+        MTL_FORMAT_RG11B10_FLOAT => TexelLayout::Rg11b10Float,
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => TexelLayout::Rgba8,
         MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => TexelLayout::Bgra8,
         MTL_FORMAT_RGBA16_FLOAT => TexelLayout::Rgba16Float,
@@ -2311,6 +2316,9 @@ pub fn solid_clear_image(
 ) -> Option<ClearImage> {
     let numeric = render_target_numeric_type(format)?;
     match numeric.clear_components(*clear) {
+        ClearComponents::Float(c) if format == MTL_FORMAT_RG11B10_FLOAT => {
+            solid_native_clear_image(format, width, height, &pack_rg11b10(c).to_le_bytes())
+        }
         ClearComponents::Float(_) => {
             let row_bytes = width.checked_mul(RGBA8_BPP)?;
             let pixels = solid_rgba8(width, height, clear);
@@ -2609,6 +2617,54 @@ fn rgb10a2_word_to_rgba8(word: u32) -> [u8; COMPONENT_COUNT] {
     swap_red_blue(bgr10a2_word_to_rgba8(word))
 }
 
+/// Unsigned 5-bit exponent with bias 15, and either 6 (R,G) or 5 (B)
+/// fraction bits. Round once from the clear carrier, including subnormals;
+/// passing through binary16 here would double-round at mantissa boundaries.
+fn small_ufloat(value: f32, fraction_bits: u32) -> u32 {
+    let infinity = 31 << fraction_bits;
+    if value.is_nan() {
+        return infinity | 1;
+    }
+    if value <= 0.0 {
+        return 0;
+    }
+    if value.is_infinite() {
+        return infinity;
+    }
+    let bits = value.to_bits();
+    let exponent = ((bits >> 23) & 255) as i32 - 127 + 15;
+    if exponent >= 31 {
+        return infinity - 1;
+    }
+    let shift = 23 - fraction_bits + (1 - exponent).max(0) as u32;
+    if shift > 24 {
+        return 0;
+    }
+    let significand = (1 << 23) | (bits & 0x7fffff);
+    let rounded = (significand + (1 << (shift - 1)) - 1 + ((significand >> shift) & 1)) >> shift;
+    ((((exponent - 1).max(0) as u32) << fraction_bits) + rounded).min(infinity - 1)
+}
+
+fn pack_rg11b10(c: [f32; 4]) -> u32 {
+    small_ufloat(c[0], 6) | (small_ufloat(c[1], 6) << 11) | (small_ufloat(c[2], 5) << 22)
+}
+
+fn rgba8_to_rg11b10(rgba: [u8; 4]) -> u32 {
+    pack_rg11b10(rgba.map(|u| f32::from(u) / 255.0))
+}
+
+fn rg11b10_to_rgba8(word: u32) -> [u8; 4] {
+    // Same exponent field as binary16: padding the fraction on the right
+    // widens even an infinity, NaN or subnormal exactly.
+    let lut = f16_to_unorm8_lut();
+    [
+        lut[((word & 0x7ff) << 4) as usize],
+        lut[(((word >> 11) & 0x7ff) << 4) as usize],
+        lut[((word >> 22) << 5) as usize],
+        255,
+    ]
+}
+
 /// Restate a semantic-RGBA8 frame as `layout`'s own texels.
 ///
 /// The render-target seed's counterpart to [`convert_rgba8_to_row`], keyed on a
@@ -2751,8 +2807,10 @@ pub fn expand_rgba8_to_texel(
         | TexelLayout::Rg16Unorm
         | TexelLayout::Rg16Uint
         | TexelLayout::Rgba32Float
-        | TexelLayout::Rgba16Unorm
-        | TexelLayout::Rg11b10Float => return false,
+        | TexelLayout::Rgba16Unorm => return false,
+        TexelLayout::Rg11b10Float => {
+            return Rgba8ToRow::Rg11b10Float.convert(src_rgba, pixels, dst)
+        }
         // A BC layout is never a render target, so it never has a `Load` seed to
         // widen. `render_target_bpp` has no arm for any BC format, which is what
         // makes that a fact rather than an expectation.
@@ -2881,8 +2939,17 @@ pub fn narrow_texel_to_rgba8(
         | TexelLayout::Rg16Unorm
         | TexelLayout::Rg16Uint
         | TexelLayout::Rgba32Float
-        | TexelLayout::Rgba16Unorm
-        | TexelLayout::Rg11b10Float => return false,
+        | TexelLayout::Rgba16Unorm => return false,
+        TexelLayout::Rg11b10Float => {
+            for (s, d) in src[..src_len]
+                .chunks_exact(4)
+                .zip(dst_rgba.chunks_exact_mut(4))
+            {
+                d.copy_from_slice(&rg11b10_to_rgba8(u32::from_le_bytes([
+                    s[0], s[1], s[2], s[3],
+                ])));
+            }
+        }
         // Nothing reads a BC resident back: there is no BC render target to read
         // back from, and a sampled BC image is never the source of a readback.
         TexelLayout::Bc1Rgba
@@ -2974,6 +3041,7 @@ pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
         return false;
     }
     match format {
+        MTL_FORMAT_RG11B10_FLOAT => dst[..4].copy_from_slice(&rgba8_to_rg11b10(rgba).to_le_bytes()),
         MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => {
             dst[..4].copy_from_slice(&rgba);
         }
@@ -3336,6 +3404,7 @@ pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut
 /// function by a test rather than to the other direction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rgba8ToRow {
+    Rg11b10Float,
     /// Four bytes already in R,G,B,A order — the row is a `copy_from_slice`.
     Rgba8,
     /// Four bytes in B,G,R,A order — the row is a four-byte shuffle.
@@ -3359,6 +3428,7 @@ impl Rgba8ToRow {
     /// it.
     pub fn for_format(format: u16) -> Option<Self> {
         Some(match format {
+            MTL_FORMAT_RG11B10_FLOAT => Self::Rg11b10Float,
             MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => Self::Rgba8,
             MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => Self::Bgra8,
             MTL_FORMAT_R8_UNORM => Self::R8,
@@ -3374,6 +3444,7 @@ impl Rgba8ToRow {
     /// Bytes one destination texel occupies.
     pub fn destination_bytes_per_pixel(self) -> u32 {
         match self {
+            Self::Rg11b10Float => 4,
             Self::R8 => 1,
             Self::R16Float => RG8_BPP,
             Self::Rgba8 | Self::Bgra8 | Self::Rg16Float | Self::Bgr10A2 | Self::Rgb10A2 => {
@@ -3454,6 +3525,11 @@ impl Rgba8ToRow {
                     let mut texel = [0u8; 4];
                     texel.copy_from_slice(s);
                     d.copy_from_slice(&rgba8_to_rgb10a2_word(texel).to_le_bytes());
+                }
+            }
+            Self::Rg11b10Float => {
+                for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                    d.copy_from_slice(&rgba8_to_rg11b10([s[0], s[1], s[2], s[3]]).to_le_bytes());
                 }
             }
         }
@@ -3850,7 +3926,7 @@ mod tests {
         }
         // A guard on the walk itself: an admission set that silently emptied
         // would satisfy every assertion above.
-        assert_eq!(admitted, 11, "the admitted colour render target formats");
+        assert_eq!(admitted, 12, "the admitted colour render target formats");
     }
 
     /// An integer texel has no semantic eight-bit solid colour.
@@ -3900,7 +3976,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("render target {format:#x} cannot publish its clear"));
             assert_eq!(image.pixels().len(), image.row_bytes() as usize * 2);
         }
-        assert_eq!(admitted, 11, "the admitted colour render target formats");
+        assert_eq!(admitted, 12, "the admitted colour render target formats");
 
         let integer = solid_clear_image(MTL_FORMAT_RG16_UINT, 2, 2, &clear)
             .expect("RG16Uint is an admitted render target");
@@ -4033,6 +4109,7 @@ mod tests {
                 SampledClass::Rg16Float => TexelLayout::Rg16Float,
                 SampledClass::Bgr10a2Unorm => TexelLayout::Bgr10a2Unorm,
                 SampledClass::Rgb10a2Unorm => TexelLayout::Rgb10a2Unorm,
+                SampledClass::Rg11b10Float => TexelLayout::Rg11b10Float,
                 SampledClass::Rg16Uint => TexelLayout::Rg16Uint,
                 SampledClass::Rgba32Float => TexelLayout::Rgba32Float,
             });
@@ -4062,6 +4139,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn packed_float_target_clear_preserves_hdr_and_rounds_at_each_channels_precision() {
+        let c = solid_clear_image(
+            MTL_FORMAT_RG11B10_FLOAT,
+            2,
+            1,
+            &[2.0, 0.5, 1.0 + 1.0 / 64.0, 0.0],
+        )
+        .unwrap();
+        let expected = (16u32 << 6) | ((14 << 6) << 11) | ((15 << 5) << 22);
+        assert_eq!(c.pixels(), expected.to_le_bytes().repeat(2));
+        assert_eq!(rg11b10_to_rgba8(expected), [255, 128, 255, 255]);
+        assert_eq!(small_ufloat(1.0 / (1 << 20) as f32, 6), 1);
+        assert_eq!(small_ufloat(-1.0, 5), 0);
+        assert_eq!(small_ufloat(f32::INFINITY, 5), 31 << 5);
     }
 
     /// RG16Float MRT slots (vibrancy UI tile masks) must admit as color RTs so
@@ -4915,6 +5009,7 @@ mod tests {
                     TexelLayout::Rgba16Float => SampledClass::Rgba16Float,
                     TexelLayout::Bgr10a2Unorm => SampledClass::Bgr10a2Unorm,
                     TexelLayout::Rgb10a2Unorm => SampledClass::Rgb10a2Unorm,
+                    TexelLayout::Rg11b10Float => SampledClass::Rg11b10Float,
                     TexelLayout::Rg16Uint => SampledClass::Rg16Uint,
                     // Named rather than defaulted. This arm used to be
                     // `_ => SampledClass::Bgra8Unorm`, which was true only while

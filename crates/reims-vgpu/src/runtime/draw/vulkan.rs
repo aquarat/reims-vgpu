@@ -5263,6 +5263,8 @@ fn native_uploads_asking_host() -> NativeUploads {
         // filter by mandate. So this one is genuinely a per-host answer and the
         // conjunction above would hide it.
         float32: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba32Float),
+        rgba16_unorm: engine::supports_sampled_layout_linear_filter(TexelLayout::Rgba16Unorm),
+        rg11b10_float: engine::supports_sampled_layout_linear_filter(TexelLayout::Rg11b10Float),
         ..NativeUploads::BGRA8
     }
 }
@@ -9287,7 +9289,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // `passbegin_clear` ran exactly `color0_declared_dontcare` above
             // the clears the guest actually asked for.
             match declared {
-                LoadAction::Load | LoadAction::DontCare if chain_load_from_target => {
+                LoadAction::Load | LoadAction::DontCare
+                    if chain_load_from_target || c0.multisample_source_ref != 0 =>
+                {
                     // Resident target carries the chain; no CPU seed bytes.
                 }
                 LoadAction::Clear => {
@@ -9534,13 +9538,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 return Err(DrawError::Unsupported(
                     crate::backend::vulkan::engine::reason::DrawReason::MultisampleStoreActionUnsupported {
                         store_action: color.store_action,
-                    },
-                ));
-            }
-            if color.load_action == MTL_LOAD_ACTION_LOAD {
-                return Err(DrawError::Unsupported(
-                    crate::backend::vulkan::engine::reason::DrawReason::MultisampleLoadActionUnsupported {
-                        load_action: color.load_action,
                     },
                 ));
             }

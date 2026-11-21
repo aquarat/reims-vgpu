@@ -357,18 +357,29 @@ mod tests {
         // SAFETY: just created, not owned elsewhere.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         // SAFETY: our fd.
-        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) }, 0);
+        assert_eq!(
+            unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) },
+            0
+        );
         let mut ram = GuestRam::default();
         ram.set_table(vec![(0x1_0000_0000, size, 0, fd)]).unwrap();
         let hva = ram.regions()[0].hva as usize;
-        assert!(vm_flags(hva).split_whitespace().any(|f| f == "dd"), "{}", vm_flags(hva));
+        assert!(
+            vm_flags(hva).split_whitespace().any(|f| f == "dd"),
+            "{}",
+            vm_flags(hva)
+        );
 
         // Pages out of order make a packed view rather than a direct pointer.
         let view = ram
             .map_pages(&[0x1_0000_0000 + 3 * page, 0x1_0000_0000], page)
             .unwrap() as usize;
         assert_ne!(view, hva);
-        assert!(vm_flags(view).split_whitespace().any(|f| f == "dd"), "{}", vm_flags(view));
+        assert!(
+            vm_flags(view).split_whitespace().any(|f| f == "dd"),
+            "{}",
+            vm_flags(view)
+        );
         ram.unmap_pages(view as *mut u8);
     }
 }

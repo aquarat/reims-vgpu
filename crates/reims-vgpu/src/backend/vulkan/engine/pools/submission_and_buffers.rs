@@ -859,7 +859,7 @@ impl ResourcePools {
 
     /// Free `(set, owning_pool)` pairs back to their allocating blocks.
     pub(crate) unsafe fn free_descriptor_sets(
-        &self,
+        &mut self,
         device: &ash::Device,
         sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
     ) {
@@ -4015,16 +4015,23 @@ impl ResourcePools {
         &mut self,
         ctx: &DeviceContext,
         key: MultisampleTargetKey,
-        render_pass: vk::RenderPass,
+        load: Option<vk::ImageView>,
         counters: &EngineCounters,
-    ) -> Result<(vk::Image, vk::ImageView, vk::Framebuffer), DrawError> {
-        if let Some(slot) = self.multisample_target.as_ref() {
-            if slot.key == key && !key.transient_depth {
-                return Ok((slot.image, slot.view, slot.framebuffer));
+    ) -> Result<vk::ImageView, DrawError> {
+        if let Some(slot) = self.multisample_target.as_mut() {
+            let prior = slot.continuation.take();
+            if slot.key == key && (load.is_none() || load == prior) {
+                return Ok(slot.view);
             }
         }
+        if load.is_some() {
+            return Err(DrawError::Unsupported(
+                super::super::reason::DrawReason::MultisampleLoadActionUnsupported {
+                    load_action: reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_LOAD,
+                },
+            ));
+        }
         if let Some(old) = self.multisample_target.take() {
-            self.dispose(&ctx.device, DeferredHandle::Framebuffer(old.framebuffer));
             self.dispose(
                 &ctx.device,
                 DeferredHandle::Image {
@@ -4085,34 +4092,20 @@ impl ResourcePools {
                 DrawError::VkCall(VkCall::new(VkOp::PoolsCreateTargetView, e))
             })?;
         counters.note_create(CreateSite::TargetImageView);
-        let mut attachments = vec![view, key.resolve_view];
-        attachments.extend(key.depth_view);
-        let framebuffer = ctx
-            .device
-            .create_framebuffer(
-                &vk::FramebufferCreateInfo::default()
-                    .render_pass(render_pass)
-                    .attachments(&attachments)
-                    .width(key.width)
-                    .height(key.height)
-                    .layers(1),
-                None,
-            )
-            .map_err(|e| {
-                ctx.device.destroy_image_view(view, None);
-                ctx.device.destroy_image(image, None);
-                self.free_image_slab(&ctx.device, image);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsCreateFramebuffer, e))
-            })?;
-        counters.note_create(CreateSite::TargetFramebuffer);
         self.multisample_target = Some(MultisampleTargetSlot {
             image,
             memory,
             view,
-            framebuffer,
+            continuation: None,
             key,
         });
-        Ok((image, view, framebuffer))
+        Ok(view)
+    }
+
+    pub(crate) fn retain_multisample_samples(&mut self, resolve_view: vk::ImageView) {
+        if let Some(slot) = self.multisample_target.as_mut() {
+            slot.continuation = Some(resolve_view);
+        }
     }
 
     pub(crate) unsafe fn acquire_sampled(

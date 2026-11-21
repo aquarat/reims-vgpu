@@ -6444,6 +6444,7 @@ static NSArray *onePass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL re
   gPoison = poison;
   gRecordOutcomes = record;
   gNextRef = 1;
+  gNextTraceID = 1;
   id ser = ((id (*)(id, SEL, id, id))objc_msgSend)(
       [objc_getClass("PGSerializer") alloc],
       sel_getUid("initWithDevice:objectRefAllocator:"), dev,
@@ -6838,7 +6839,7 @@ int main(int argc, char **argv) {
     gMulti = savedMulti;
 
     NSDictionary *root = @{
-      @"schema" : @3,
+      @"schema" : @4, // per-pass ref and trace-ID counters
       @"provenance" : provenance(),
       @"host_gpu" : dev.name ?: @"(unknown)",
       // What every capability flag reads on an untouched serializer. A `false`

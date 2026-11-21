@@ -2036,6 +2036,8 @@ fn a_four_channel_float_sampled_texture_is_native_or_refused() {
 #[test]
 fn the_host_gated_sampled_formats_are_the_ones_whose_bind_the_host_decides() {
     for gated in [
+        pixel_format::MTL_FORMAT_RGBA16_UNORM,
+        pixel_format::MTL_FORMAT_RG11B10_FLOAT,
         pixel_format::MTL_FORMAT_RGBA32_FLOAT,
         pixel_format::MTL_FORMAT_RGBA16_FLOAT,
         pixel_format::MTL_FORMAT_RG16_FLOAT,
@@ -2077,6 +2079,30 @@ fn tight_rgba_linear_load_preserves_native_bytes() {
     .expect("tight RGBA sample loads");
     assert_eq!(fmt.layout(), TexelLayout::Rgba8);
     assert_eq!(rgba, native);
+}
+
+#[test]
+fn linear_hdr_samples_keep_the_guest_word_and_stride() {
+    for (format, layout) in [
+        (
+            pixel_format::MTL_FORMAT_RGBA16_UNORM,
+            TexelLayout::Rgba16Unorm,
+        ),
+        (
+            pixel_format::MTL_FORMAT_RG11B10_FLOAT,
+            TexelLayout::Rg11b10Float,
+        ),
+    ] {
+        let src: Vec<u8> = (0..(3 * 2 * layout.bytes_per_texel()) as u8).collect();
+        let (bytes, actual) =
+            load_tight_linear_rgba_with(3, 2, 1, format, NativeUploads::ALL, "test", |dst| {
+                dst.copy_from_slice(&src);
+                true
+            })
+            .expect("native filtered sample");
+        assert_eq!((bytes, actual.layout()), (src, layout));
+        assert!(linear_native_upload_format(format, NativeUploads::NONE).is_none());
+    }
 }
 
 /// **The sRGB regression gate for the CPU upload rails.** These paths reach a

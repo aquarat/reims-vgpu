@@ -26,13 +26,13 @@
 //!
 //! `max_sets` and the per-type descriptor counts are not equally real. Measured
 //! on the NVIDIA proprietary driver this repository's Linux host runs:
-//! `max_sets` is enforced exactly — `arena_grows_on_exhaustion_and_frees_route_correctly`
-//! drives past it and gets `ERROR_OUT_OF_POOL_MEMORY`, which is what makes that
-//! test's growth assertion real — while the per-type counts are not enforced at
+//! `max_sets` is enforced exactly, while the per-type counts are not enforced at
 //! all. A pool declaring 64 `STORAGE_BUFFER` serves a set asking for 65, and for
 //! 65 536, and a pool declaring no `UNIFORM_BUFFER` whatsoever still serves one:
 //! descriptors come from a general heap. Mesa's RADV and ANV do account per
-//! type.
+//! type. Other implementations can allocate beyond `max_sets` as well. The
+//! arena therefore owns the set-slot budget; driver exhaustion can still
+//! force growth earlier.
 //!
 //! So [`DESC_BLOCK_PER_TYPE`] binds nothing on this host and cannot be measured
 //! here, and the module's own "each sampled image consumes one of the 64
@@ -127,7 +127,12 @@ const _: () = assert!(DESC_BLOCK_PER_TYPE >= MAX_SET_DESCRIPTORS_PER_TYPE);
 /// A growable set of same-sized descriptor-pool blocks. `blocks[0]` is created
 /// eagerly at engine init; later blocks appear only on allocation exhaustion.
 pub(crate) struct DescriptorArena {
-    blocks: Vec<vk::DescriptorPool>,
+    blocks: Vec<Block>,
+}
+
+struct Block {
+    pool: vk::DescriptorPool,
+    live_sets: u32,
 }
 
 impl DescriptorArena {
@@ -146,7 +151,7 @@ impl DescriptorArena {
     ) -> Result<(), DrawError> {
         debug_assert!(self.blocks.is_empty(), "arena already initialized");
         let pool = Self::create_block(device)?;
-        self.blocks.push(pool);
+        self.blocks.push(Block { pool, live_sets: 0 });
         Ok(())
     }
 
@@ -190,12 +195,19 @@ impl DescriptorArena {
         dsl: vk::DescriptorSetLayout,
     ) -> Result<(vk::DescriptorSet, vk::DescriptorPool, bool), DrawError> {
         let layouts = [dsl];
-        for &pool in self.blocks.iter().rev() {
+        for block in self.blocks.iter_mut().rev() {
+            if block.live_sets == DESC_BLOCK_MAX_SETS {
+                continue;
+            }
+            let pool = block.pool;
             let info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(pool)
                 .set_layouts(&layouts);
             match device.allocate_descriptor_sets(&info) {
-                Ok(sets) => return Ok((sets[0], pool, false)),
+                Ok(sets) => {
+                    block.live_sets += 1;
+                    return Ok((sets[0], pool, false));
+                }
                 Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY)
                 | Err(vk::Result::ERROR_FRAGMENTED_POOL) => continue,
                 Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::DescArenaAllocSets, e))),
@@ -209,7 +221,7 @@ impl DescriptorArena {
             .set_layouts(&layouts);
         match device.allocate_descriptor_sets(&info) {
             Ok(sets) => {
-                self.blocks.push(pool);
+                self.blocks.push(Block { pool, live_sets: 1 });
                 Ok((sets[0], pool, true))
             }
             Err(error) => {
@@ -242,19 +254,23 @@ impl DescriptorArena {
     /// Free a batch of `(set, owning_pool)` pairs, grouping by owning pool so
     /// each `vkFreeDescriptorSets` targets the pool the set was allocated from.
     pub(crate) unsafe fn free(
-        &self,
+        &mut self,
         device: &ash::Device,
         sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
     ) {
         if sets.is_empty() {
             return;
         }
-        for (pool, group) in group_by_pool(&self.blocks, sets) {
+        for block in &mut self.blocks {
+            let pool = block.pool;
+            let group = sets_owned_by(pool, sets);
             if !group.is_empty() {
                 if let Err(error) = free_sets_call(device.free_descriptor_sets(pool, &group)) {
                     crate::observe::Emit::decline("desc_arena_free", &error)
                         .field("sets", group.len())
                         .fail_once(pool.as_raw());
+                } else {
+                    block.live_sets -= group.len() as u32;
                 }
             }
         }
@@ -267,30 +283,20 @@ impl DescriptorArena {
     }
 
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
-        for pool in self.blocks.drain(..) {
-            device.destroy_descriptor_pool(pool, None);
+        for block in self.blocks.drain(..) {
+            device.destroy_descriptor_pool(block.pool, None);
         }
     }
 }
 
-/// Group `(set, owning_pool)` pairs by owning pool, in `blocks` order. A pair
-/// whose pool is not among `blocks` is dropped (cannot happen for arena-owned
-/// sets; guards against a stale handle rather than freeing to a wrong pool).
-/// Pure (no Vulkan calls) so the free-routing invariant is unit-testable.
-fn group_by_pool(
-    blocks: &[vk::DescriptorPool],
+/// Only free handles allocated from this block; Vulkan forbids cross-pool frees.
+fn sets_owned_by(
+    pool: vk::DescriptorPool,
     sets: &[(vk::DescriptorSet, vk::DescriptorPool)],
-) -> Vec<(vk::DescriptorPool, Vec<vk::DescriptorSet>)> {
-    blocks
-        .iter()
-        .map(|&block| {
-            let owned: Vec<vk::DescriptorSet> = sets
-                .iter()
-                .filter(|(_, p)| *p == block)
-                .map(|(s, _)| *s)
-                .collect();
-            (block, owned)
-        })
+) -> Vec<vk::DescriptorSet> {
+    sets.iter()
+        .filter(|(_, p)| *p == pool)
+        .map(|(s, _)| *s)
         .collect()
 }
 
@@ -315,17 +321,13 @@ mod tests {
             (set(12), pool(1)),
             (set(13), pool(2)),
         ];
-        let groups = group_by_pool(&blocks, &sets);
-        assert_eq!(groups.len(), 2, "one group per block");
-        assert_eq!(groups[0].0, pool(1));
         assert_eq!(
-            groups[0].1,
+            sets_owned_by(blocks[0], &sets),
             vec![set(10), set(12)],
             "block-1 sets, in order"
         );
-        assert_eq!(groups[1].0, pool(2));
         assert_eq!(
-            groups[1].1,
+            sets_owned_by(blocks[1], &sets),
             vec![set(11), set(13)],
             "block-2 sets, in order"
         );
@@ -335,20 +337,20 @@ mod tests {
     fn single_block_groups_all_together() {
         let blocks = [pool(7)];
         let sets = [(set(1), pool(7)), (set(2), pool(7))];
-        let groups = group_by_pool(&blocks, &sets);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].1, vec![set(1), set(2)]);
+        assert_eq!(sets_owned_by(blocks[0], &sets), vec![set(1), set(2)]);
     }
 
     #[test]
     fn set_from_unknown_pool_is_dropped_not_misrouted() {
         // A set whose pool is not a live block must never be freed to a
-        // different block (that is UB). group_by_pool simply omits it.
+        // different block (that is UB).
         let blocks = [pool(1)];
         let sets = [(set(10), pool(1)), (set(99), pool(42))];
-        let groups = group_by_pool(&blocks, &sets);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].1, vec![set(10)], "only the block-1 set is freed");
+        assert_eq!(
+            sets_owned_by(blocks[0], &sets),
+            vec![set(10)],
+            "only the block-1 set is freed"
+        );
     }
 
     #[test]
@@ -476,8 +478,7 @@ mod device_tests {
         unsafe { arena.create_first_block(&ctx.device) }.expect("first block");
         assert_eq!(arena.block_count(), 1, "one block before any growth");
 
-        // Allocate two blocks' worth to guarantee at least one growth even if the
-        // driver holds a few extra sets per pool beyond max_sets.
+        // Allocate two blocks' worth, even on a driver that over-admits sets.
         let n = (DESC_BLOCK_MAX_SETS as usize) * 2;
         let mut sets = Vec::with_capacity(n);
         let mut grew_seen = false;
@@ -507,6 +508,11 @@ mod device_tests {
 
         // Route every set back to its owning block; a misroute would fault here.
         unsafe { arena.free(&ctx.device, &sets) };
+        for _ in 0..n {
+            let (_, _, grew) =
+                unsafe { arena.allocate(&ctx.device, dsl) }.expect("reuse freed slot");
+            assert!(!grew, "free must return the slot to its allocating block");
+        }
         unsafe {
             ctx.device.destroy_descriptor_set_layout(dsl, None);
             arena.destroy(&ctx.device);

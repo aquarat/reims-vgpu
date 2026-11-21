@@ -872,6 +872,10 @@ pub(crate) struct NativeUploads {
     /// `SAMPLED_IMAGE_FILTER_LINEAR`, so the filter is measured rather than
     /// assumed.
     pub float32: bool,
+    /// These layouts have no RGBA8 conversion. Their host format features
+    /// are independent even though both take the same tight-row copy rail.
+    pub rgba16_unorm: bool,
+    pub rg11b10_float: bool,
 }
 
 impl NativeUploads {
@@ -882,6 +886,8 @@ impl NativeUploads {
         float16: false,
         block_compressed: false,
         float32: false,
+        rgba16_unorm: false,
+        rg11b10_float: false,
     };
 
     /// Native BGRA8 only — the answer this parameter carried when it was a
@@ -895,9 +901,7 @@ impl NativeUploads {
     #[cfg(any(feature = "backend-vulkan", test))]
     pub const BGRA8: Self = Self {
         bgra8: true,
-        float16: false,
-        block_compressed: false,
-        float32: false,
+        ..Self::NONE
     };
 
     /// Every native layout the loaders can produce — every gate open at once.
@@ -922,6 +926,8 @@ impl NativeUploads {
         float16: true,
         block_compressed: true,
         float32: true,
+        rgba16_unorm: true,
+        rg11b10_float: true,
     };
 }
 
@@ -982,6 +988,9 @@ pub(crate) fn linear_native_upload_format(
     if sample_format == pixel_format::MTL_FORMAT_R16_FLOAT {
         return native.float16.then_some(TexelLayout::R16Float);
     }
+    if sample_format == pixel_format::MTL_FORMAT_RGBA16_UNORM {
+        return native.rgba16_unorm.then_some(TexelLayout::Rgba16Unorm);
+    }
     // The decode contract's sampled class is the one rule for "which channel
     // order and width is this"; it folds each sRGB format onto its linear
     // sibling's layout, which is right — they share a layout. The qualifier is
@@ -1009,6 +1018,7 @@ pub(crate) fn linear_native_upload_format(
         // to fall back to (the channels are not byte-aligned). The iOS
         // simulator samples linear `RGB10A2Unorm` textures.
         SampledClass::Rgb10a2Unorm => TexelLayout::Rgb10a2Unorm,
+        SampledClass::Rg11b10Float if native.rg11b10_float => TexelLayout::Rg11b10Float,
         _ => return None,
     })
 }

@@ -4718,7 +4718,7 @@ unsafe fn plan_padded_guest_scatter(
     }
     let scratch = unsafe { pools.acquire_guest_gather(ctx, dst.window_bytes(), counters) }?;
     let Some(groups) =
-        (unsafe { scatter_groups(ctx, pools, counters, &grouped, dst.window_bytes(), &scratch) }?)
+        unsafe { scatter_groups(ctx, pools, counters, &grouped, dst.window_bytes(), &scratch) }?
     else {
         return Ok(None);
     };
