@@ -1687,6 +1687,14 @@ pub const LEDGER: &[Op] = &[
     },
     Op {
         rail: Rail::Info,
+        opcode: Some(0x01c8),
+        selector: "mapPhysicalToScreenCoordinateMultiple:forPhysicalCoordinates:forLayer:toScreenCoordinates:count:",
+        closure: Closure::Unresolved {
+            question: "the guest requested an array of mapped coordinates; the device has not written that reply",
+        },
+    },
+    Op {
+        rail: Rail::Info,
         opcode: Some(0x01c9),
         selector: "renderPipelineStateInfo:info:",
         closure: Closure::Unresolved {
