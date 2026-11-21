@@ -804,7 +804,7 @@ struct TaskResourceLifetime {
 impl TaskResourceLifetime {
     fn new() -> Self {
         let id = NEXT_TASK_RESOURCE_LIFETIME
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |id| id.checked_add(1),
