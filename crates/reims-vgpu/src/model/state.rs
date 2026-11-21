@@ -426,10 +426,18 @@ impl Default for GfxRegs {
             fifo_start: 0,
             root_page: 0,
             fifo_base_page: 0,
-            interrupt_status_disp: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::IntrStatusDisp),
-            interrupt_status_gpu: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::IntrStatusGpu),
-            interrupt_fault: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::IntrFault),
-            child_doorbell_rung: super::hot_word::HotWord::for_slot(super::hot_word::HotSlot::ChildDoorbellRung),
+            interrupt_status_disp: super::hot_word::HotWord::for_slot(
+                super::hot_word::HotSlot::IntrStatusDisp,
+            ),
+            interrupt_status_gpu: super::hot_word::HotWord::for_slot(
+                super::hot_word::HotSlot::IntrStatusGpu,
+            ),
+            interrupt_fault: super::hot_word::HotWord::for_slot(
+                super::hot_word::HotSlot::IntrFault,
+            ),
+            child_doorbell_rung: super::hot_word::HotWord::for_slot(
+                super::hot_word::HotSlot::ChildDoorbellRung,
+            ),
             vcpu_lock_wanted: Arc::new(AtomicU32::new(0)),
             efi_display: 0,
             efi_mode_select: 0,
@@ -796,7 +804,7 @@ struct TaskResourceLifetime {
 impl TaskResourceLifetime {
     fn new() -> Self {
         let id = NEXT_TASK_RESOURCE_LIFETIME
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |id| id.checked_add(1),

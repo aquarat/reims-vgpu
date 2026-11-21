@@ -351,7 +351,7 @@ impl PipelineObjectIdentity {
 
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let raw = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .expect("retained pipeline identity space exhausted");

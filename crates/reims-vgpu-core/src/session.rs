@@ -822,7 +822,11 @@ impl SessionModel {
     /// channel is outstanding, and nothing otherwise.
     #[must_use = "what the channel published is what the guest may now read"]
     pub fn refused_word(&mut self, domain: ChannelId, stamp: CompletionStamp) -> Vec<Release> {
-        let released: Vec<Release> = self.publisher.refused_word(domain, stamp).into_iter().collect();
+        let released: Vec<Release> = self
+            .publisher
+            .refused_word(domain, stamp)
+            .into_iter()
+            .collect();
         for release in &released {
             if let Some(stamp) = release.stamp {
                 self.scheduler.publish(stamp);

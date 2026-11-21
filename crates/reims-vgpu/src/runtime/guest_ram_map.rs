@@ -1125,8 +1125,14 @@ mod tests {
             assert_eq!(runs.len(), 3, "one piece per chunk the object touches");
             let mut want = 0u64;
             for (i, r) in runs.iter().enumerate() {
-                assert_eq!(r.window_offset, want, "piece {i} does not continue the last");
-                assert!(r.guest.import().len() <= CHUNK, "an import longer than a udmabuf");
+                assert_eq!(
+                    r.window_offset, want,
+                    "piece {i} does not continue the last"
+                );
+                assert!(
+                    r.guest.import().len() <= CHUNK,
+                    "an import longer than a udmabuf"
+                );
                 want += r.guest.requested();
             }
             assert_eq!(want, len, "the pieces do not cover the object");

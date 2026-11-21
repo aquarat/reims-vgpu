@@ -839,6 +839,9 @@ fn info_query_route(opcode: u32) -> &'static str {
         w::OPCODE_COPY_RATE_PARAMETER_BUFFER => "info_unanswered_rate_parameter_buffer",
         w::OPCODE_MAP_SCREEN_TO_PHYSICAL => "info_unanswered_map_screen_to_physical",
         w::OPCODE_MAP_PHYSICAL_TO_SCREEN => "info_unanswered_map_physical_to_screen",
+        w::OPCODE_MAP_PHYSICAL_TO_SCREEN_MULTIPLE => {
+            "info_unanswered_map_physical_to_screen_multiple"
+        }
         w::OPCODE_RENDER_PIPELINE_STATE_INFO => "info_unanswered_render_pipeline_state",
         w::OPCODE_RENDER_PIPELINE_IMAGEBLOCK => "info_unanswered_render_pipeline_imageblock",
         w::OPCODE_COMPUTE_PIPELINE_IMAGEBLOCK => "info_unanswered_compute_pipeline_imageblock",
@@ -854,9 +857,7 @@ fn info_query_route(opcode: u32) -> &'static str {
             "info_unanswered_compute_pipeline_host_resource"
         }
         w::OPCODE_DEPTH_STENCIL_HOST_RESOURCE_INFO => "info_unanswered_depth_stencil_host_resource",
-        // Not a bucket standing in for a known opcode: the eighteen above are
-        // the whole declared info space, so a nineteenth is an opcode this
-        // project has not seen and the counter says so by name.
+        // Only opcodes outside the declared info space belong here.
         _ => "info_unanswered_undeclared_opcode",
     }
 }

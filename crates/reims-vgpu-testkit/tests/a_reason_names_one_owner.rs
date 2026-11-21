@@ -36,6 +36,9 @@ fn crates_dir() -> PathBuf {
 /// new word is really a classification, because everything else in the
 /// workspace answers this by carrying its owner's prefix.
 const CLASSIFICATIONS: &[&str] = &[
+    // `protocol::iosurface_pages::MapperKextLayout`
+    "legacy",
+    "macos26",
     // `vulkan::memory::MemoryTopology`
     "unified",
     "discrete",

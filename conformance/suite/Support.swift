@@ -31,6 +31,37 @@ let levelPipe = pipeline("read_level")
 
 let fetchLevelPipe = pipeline("fetch_level")
 
+let quadVerts: [Float] = [
+    // x, y, u, v -- a triangle strip covering the whole target
+    -1, -1, 0, 1,
+     1, -1, 1, 1,
+    -1,  1, 0, 0,
+     1,  1, 1, 0,
+]
+
+func makeRenderPipeline(_ fragment: String, _ fmt: MTLPixelFormat) -> MTLRenderPipelineState? {
+    let d = MTLRenderPipelineDescriptor()
+    d.vertexFunction = library.makeFunction(name: "quad_vs")
+    d.fragmentFunction = library.makeFunction(name: fragment)
+    d.colorAttachments[0].pixelFormat = fmt
+    return try? dev.makeRenderPipelineState(descriptor: d)
+}
+
+let texPipeline = makeRenderPipeline("tex_fs", .rgba8Unorm)
+let solidPipeline = makeRenderPipeline("solid_fs", .rgba8Unorm)
+
+func sharedRenderTarget(_ w: Int, _ h: Int, _ label: String) -> MTLTexture? {
+    let rd = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
+    rd.usage = [.renderTarget, .shaderRead]
+    rd.storageMode = .shared
+    guard let rt = dev.makeTexture(descriptor: rd) else {
+        report(label, false, "makeTexture nil for a shared \(w)x\(h) render target")
+        return nil
+    }
+    return rt
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

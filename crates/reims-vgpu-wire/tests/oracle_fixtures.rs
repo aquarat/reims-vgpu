@@ -1232,6 +1232,49 @@ fn every_fixture_carries_a_measured_written_mask() {
     }
 }
 
+const PLURAL_MAPPER: &str = "info_map_physical_to_screen_multiple";
+
+/// Earlier captures did not rewind every counter between passes. The mapper's
+/// byte at +12 numbered the passes: 1 and 2 at default (so their XOR produces
+/// a false hole), 3 for the sweep and 4 onward for each single-flag pass. Check
+/// that *entire* signature before attributing either reading to pass order;
+/// neither an arbitrary changed byte nor a delta under just one flag qualifies.
+fn has_mapper_pass_serial(root: &Value) -> bool {
+    if root["schema"] != 3 {
+        return false;
+    }
+    let deltas: Vec<_> = root["capability_content_deltas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["name"] == PLURAL_MAPPER)
+        .collect();
+    if deltas.is_empty() {
+        return false;
+    }
+    let flags = std::iter::once("(every flag)").chain(
+        root["capability_attribution"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["flag"].as_str().unwrap()),
+    );
+    assert_eq!(
+        deltas.len(),
+        flags.clone().count(),
+        "incomplete mapper pass sequence"
+    );
+    for (i, (d, flag)) in deltas.iter().zip(flags).enumerate() {
+        assert_eq!(d["flag"], flag);
+        assert_eq!(d["kind"], "bytes");
+        assert_eq!(d["differing_bytes"], 1);
+        assert_eq!(d["first_offset"], 12);
+        assert_eq!(d["default_byte"], 1);
+        assert_eq!(d["forced_byte"], 3 + i);
+    }
+    true
+}
+
 #[test]
 #[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn no_view_reads_a_bit_the_serializer_never_wrote() {
@@ -1247,7 +1290,14 @@ fn no_view_reads_a_bit_the_serializer_never_wrote() {
         if bytes.len() < 8 {
             continue;
         }
-        let mask = unhex(case["written_mask"].as_str().expect("written_mask"));
+        let mut mask = unhex(case["written_mask"].as_str().expect("written_mask"));
+        if case["name"] == PLURAL_MAPPER && has_mapper_pass_serial(&root) {
+            // ~(1 ^ 2), not a bitfield left at the poison fill. Keep checking
+            // every other bit in this record against the usual hole map.
+            assert_eq!(bytes[12], 1);
+            assert_eq!(mask[12], !(1u8 ^ 2));
+            mask[12] = 0xff;
+        }
         let key = (
             case["class"].as_str().expect("class").to_string(),
             record_key(
@@ -1531,6 +1581,25 @@ fn every_excluded_row_that_claims_a_refusal_still_gets_one() {
         claimed.insert(e.selector);
     }
 
+    // A version-dependent refusal is neither a universal exclusion nor an
+    // excuse for the case to go missing. Require exactly one measured outcome.
+    let mapper = manifest::MANIFEST
+        .iter()
+        .find(|e| {
+            e.class == "PGSerializerInfoCommandEncoder"
+                && e.opcodes
+                    .contains(&reims_vgpu_wire::ops::info::OPCODE_MAP_PHYSICAL_TO_SCREEN_MULTIPLE)
+        })
+        .unwrap();
+    let mapped = root["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == PLURAL_MAPPER);
+    assert_ne!(mapped, refused.contains(mapper.selector));
+    if !mapped {
+        claimed.insert(mapper.selector);
+    }
     for selector in &refused {
         assert!(
             claimed.contains(selector),
@@ -1896,10 +1965,14 @@ fn no_capability_changes_what_a_record_contains() {
         std::collections::BTreeSet::new();
     let mut sweep: Vec<(String, String)> = Vec::new();
 
+    let mapper_serial = has_mapper_pass_serial(&root);
     for d in deltas {
         let flag = d["flag"].as_str().expect("flag");
         let kind = d["kind"].as_str().expect("kind");
         let name = d["name"].as_str().expect("name");
+        if name == PLURAL_MAPPER && mapper_serial {
+            continue;
+        }
         if flag == "(every flag)" {
             sweep.push((kind.to_string(), name.to_string()));
             continue;
@@ -4160,6 +4233,7 @@ fn info_record_len_for(opcode: u32) -> Option<u32> {
     use reims_vgpu_wire::ops::info as i;
     Some(match opcode {
         i::OPCODE_RATE_MAP_INFO => i::RATE_MAP_INFO_TOTAL_LEN,
+        i::OPCODE_MAP_PHYSICAL_TO_SCREEN_MULTIPLE => i::MAP_COORDINATE_MULTIPLE_TOTAL_LEN,
         i::OPCODE_COPY_RATE_PARAMETER_BUFFER => i::COPY_RATE_PARAMETER_BUFFER_TOTAL_LEN,
         i::OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN => {
             i::HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_TOTAL_LEN
@@ -4288,6 +4362,12 @@ fn every_info_fixture_reads_back_what_metal_was_asked_for() {
         );
 
         match o.opcode() {
+            info::OPCODE_MAP_PHYSICAL_TO_SCREEN_MULTIPLE => {
+                let m = info::map_coordinate_multiple(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
+                eq!(m.rate_map_ref.get(), "object_ref");
+                eq!(m.layer.get(), "layer");
+                eq!(m.count.get(), "count");
+            }
             info::OPCODE_RATE_MAP_INFO => {
                 let r = info::rate_map_info(&o).unwrap_or_else(|e| panic!("{name}: {e}"));
                 eq!(r.rate_map_ref.get(), "object_ref");

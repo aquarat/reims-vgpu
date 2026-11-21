@@ -39,7 +39,8 @@ case "$CONFORMANCE_MODE" in
   topology) CONFORMANCE_ARG="--topology-only" ;;
   float-sampling) CONFORMANCE_ARG="--float-sampling-only" ;;
   indexed-draw) CONFORMANCE_ARG="--indexed-draw-only" ;;
-  *) echo "conformance: CONFORMANCE_MODE must be full, integer-clear, topology, float-sampling, or indexed-draw" >&2; exit 2 ;;
+  iosurface) CONFORMANCE_ARG="--iosurface-only" ;;
+  *) echo "conformance: CONFORMANCE_MODE must be full, integer-clear, topology, float-sampling, indexed-draw, or iosurface" >&2; exit 2 ;;
 esac
 if [ "$CONFORMANCE_MODE" = "full" ]; then
   PROBE_TIMEOUT="${CONFORMANCE_TIMEOUT:-600}"

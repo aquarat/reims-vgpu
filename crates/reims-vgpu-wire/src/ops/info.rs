@@ -404,6 +404,31 @@ pub fn map_coordinate<'a>(op: &Op<'a>) -> Result<&'a MapCoordinate, WireError> {
     view::<MapCoordinate>(op.payload)
 }
 
+pub const OPCODE_MAP_PHYSICAL_TO_SCREEN_MULTIPLE: u32 = 0x1c8;
+pub const MAP_COORDINATE_MULTIPLE_TOTAL_LEN: u32 = 40;
+
+/// The plural mapper takes coordinate arrays by pointer, unlike the singular
+/// mapper's inline float pair. The two-point case names the caller's rate map,
+/// layer and count. It does not carry either point inline.
+#[repr(C)]
+pub struct MapCoordinateMultiple {
+    pub rate_map_ref: U32le,
+    /// Not the singular mapper's reply pair. The first byte changes with the
+    /// capture pass, even between the two default passes. To identify the
+    /// remaining bytes, vary the input and reply staging allocations separately.
+    unidentified_bytes: [u8; 20],
+    pub layer: U32le,
+    pub count: U32le,
+}
+
+// SAFETY: align-1 all-bytes-valid le scalars and a byte array.
+unsafe impl Wire for MapCoordinateMultiple {}
+
+pub fn map_coordinate_multiple<'a>(op: &Op<'a>) -> Result<&'a MapCoordinateMultiple, WireError> {
+    debug_assert_eq!(op.opcode(), OPCODE_MAP_PHYSICAL_TO_SCREEN_MULTIPLE);
+    view(op.payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +458,11 @@ mod tests {
                 "MapCoordinate",
                 size_of::<MapCoordinate>(),
                 MAP_COORDINATE_TOTAL_LEN,
+            ),
+            (
+                "MapCoordinateMultiple",
+                size_of::<MapCoordinateMultiple>(),
+                MAP_COORDINATE_MULTIPLE_TOTAL_LEN,
             ),
         ] {
             assert_eq!(

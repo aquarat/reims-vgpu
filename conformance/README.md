@@ -202,7 +202,10 @@ For a fast, shaderless gate of the integer-clear contract, use
 point, line, line-strip, and triangle raster contract, or
 `CONFORMANCE_MODE=float-sampling` for the `RGBA32Float` compute/vertex sampling
 contract. Use `CONFORMANCE_MODE=indexed-draw` for UInt16/UInt32 index offsets,
-signed base vertex, and base instance. The default is the
+signed base vertex, and base instance. `CONFORMANCE_MODE=iosurface` runs the
+IOSurface draw, load, scissor, glyph-blend and CPU-write-then-sample cases at
+16×16 and 60×16. Build the same `suite/*.swift suite/cases/*.swift` in focused
+modes as in the full run; the executable selects cases at run time. The default is the
 complete battery. Focused guest runs require `NATIVE` to name the matching
 focused oracle output; this prevents a partial run from being scored against
 the full baseline. Every run writes `manifest.txt`, hashes the live QEMU through

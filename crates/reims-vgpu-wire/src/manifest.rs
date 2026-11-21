@@ -950,15 +950,15 @@ pub const MANIFEST: &[Entry] = &[
             module: "ops::info",
         },
     },
-    // Asserts inside Apple's encoder; its singular siblings do not.
+    // Some serializers refuse this call, but an emitting one names the array query.
     Entry {
         class: "PGSerializerInfoCommandEncoder",
         selector: "mapPhysicalToScreenCoordinateMultiple:\
                    forPhysicalCoordinates:forLayer:toScreenCoordinates:\
                    count:",
-        opcodes: &[],
-        coverage: Coverage::Excluded {
-            reason: REFUSED_BY_SERIALIZER,
+        opcodes: &[crate::ops::info::OPCODE_MAP_PHYSICAL_TO_SCREEN_MULTIPLE],
+        coverage: Coverage::Covered {
+            module: "ops::info",
         },
     },
     Entry {
